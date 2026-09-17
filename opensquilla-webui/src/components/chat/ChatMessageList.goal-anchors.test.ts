@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick, type App } from 'vue'
 import i18n from '@/i18n'
 import type { GoalSnapshot } from '@/composables/chat/useChatGoals'
@@ -102,6 +102,7 @@ async function mountList(
       text: 'A later ordinary reply.',
     }),
   ],
+  overrides: Record<string, unknown> = {},
 ) {
   const host = document.createElement('div')
   document.body.appendChild(host)
@@ -124,6 +125,7 @@ async function mountList(
     toolSecondaryText: () => '',
     copyMessage: async () => true,
     downloadAttachment: async () => true,
+    ...overrides,
   })
   app.use(i18n)
   app.mount(host)
@@ -141,7 +143,7 @@ describe('ChatMessageList Goal anchors', () => {
     expect(assistants).toHaveLength(3)
     expect(assistants[0]?.querySelector('.msg-goal-outcome')).toBeNull()
     expect(assistants[1]?.querySelector('.msg-goal-outcome')?.textContent)
-      .toContain('Goal achieved · 1m 03s active')
+      .toContain('Goal achieved · 1 turns · 15 tokens')
     expect(assistants[2]?.querySelector('.msg-goal-outcome')).toBeNull()
   })
 
@@ -157,6 +159,42 @@ describe('ChatMessageList Goal anchors', () => {
       executionState: 'queued',
     }))
     expect(queued.querySelector('.msg-goal-outcome')).toBeNull()
+  })
+
+  it('forwards removal of the anchored outcome with its Goal identity', async () => {
+    const goal = completedGoal()
+    const onGoalClear = vi.fn()
+    const host = await mountList(goal, undefined, { goalRemovable: true, onGoalClear })
+    const buttons = host.querySelectorAll<HTMLButtonElement>('.msg-goal-outcome button')
+
+    expect(buttons).toHaveLength(1)
+    expect(buttons[0]?.textContent).toContain('Remove goal')
+    buttons[0]?.click()
+    expect(onGoalClear).toHaveBeenCalledExactlyOnceWith(goal)
+  })
+
+  it('disables inline removal during a pending Goal mutation', async () => {
+    const onGoalClear = vi.fn()
+    const host = await mountList(completedGoal(), undefined, {
+      goalRemovable: true,
+      goalBusy: true,
+      onGoalClear,
+    })
+    const button = host.querySelector<HTMLButtonElement>('.msg-goal-outcome button')
+
+    expect(button?.disabled).toBe(true)
+    button?.click()
+    expect(onGoalClear).not.toHaveBeenCalled()
+  })
+
+  it('keeps shared outcomes visible without exposing removal', async () => {
+    const host = await mountList(completedGoal(), undefined, {
+      goalRemovable: true,
+      shareMode: true,
+    })
+
+    expect(host.querySelector('.msg-goal-outcome')).not.toBeNull()
+    expect(host.querySelector('.msg-goal-outcome button')).toBeNull()
   })
 
   it('does not guess anchors when an older backend omits identities', async () => {
@@ -176,7 +214,7 @@ describe('ChatMessageList Goal anchors', () => {
 
     expect(host.querySelector('.msg-user-goal-origin')?.textContent).toContain('已作为目标发送')
     expect(host.querySelector('.msg-goal-outcome')?.textContent)
-      .toContain('目标已完成 · 活跃用时 1m 03s')
+      .toContain('目标已完成 · 1 轮 · 15 个令牌')
   })
 
 })

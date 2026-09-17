@@ -5,10 +5,14 @@ import os
 import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from opensquilla.skills.loader import MAX_SKILL_FILE_BYTES, SkillLoader
+from opensquilla.skills import file_hash
+from opensquilla.skills import loader as skill_loader_module
+from opensquilla.skills.file_hash import _TreeChangedDuringHashError
+from opensquilla.skills.loader import MAX_SKILL_FILE_BYTES, PinnedSkillLoader, SkillLoader
 
 
 def _write_skill(root: Path, name: str, description: str = "description") -> Path:
@@ -26,6 +30,24 @@ def _write_skill(root: Path, name: str, description: str = "description") -> Pat
 
 def _loader(root: Path, tmp_path: Path) -> SkillLoader:
     return SkillLoader(workspace_dir=root, snapshot_path=tmp_path / "snapshot.json")
+
+
+def _inject_transient_tree_hash_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[int]:
+    original_compute_tree_sha256 = skill_loader_module.compute_tree_sha256
+    calls = [0]
+
+    def fail_first_tree_hash(path: Path) -> str:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise _TreeChangedDuringHashError(
+                f"Skill tree entry changed while hashing {path}: metadata changed"
+            )
+        return original_compute_tree_sha256(path)
+
+    monkeypatch.setattr(skill_loader_module, "compute_tree_sha256", fail_first_tree_hash)
+    return calls
 
 
 def test_loader_normalizes_crlf_before_parsing_yaml_block_scalars(tmp_path: Path) -> None:
@@ -195,9 +217,20 @@ def test_local_non_utf8_supporting_filename_does_not_break_catalog(tmp_path: Pat
     assert loader.snapshot().errors == ()
 
 
-def test_rejected_verified_reload_never_replaces_visible_catalog(tmp_path: Path) -> None:
+def test_rejected_verified_reload_never_replaces_visible_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monotonic_now = [10.0]
+    monkeypatch.setattr(
+        skill_loader_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: monotonic_now[0]),
+    )
     root = tmp_path / "skills"
-    _write_skill(root, "alpha", "old")
+    skill_file = _write_skill(root, "alpha", "old")
+    original_bytes = skill_file.read_bytes()
+    original_stat = skill_file.stat()
     loader = _loader(root, tmp_path)
     loader.load_all()
     old = loader.snapshot()
@@ -212,9 +245,24 @@ def test_rejected_verified_reload_never_replaces_visible_catalog(tmp_path: Path)
         assert result.success is False
         assert result.generation == old.generation
         assert loader.snapshot() is old
+        monotonic_now[0] += skill_loader_module._COMPAT_PROBE_INTERVAL_SECONDS
+        assert loader.get_by_name("alpha").description == "old"  # type: ignore[union-attr]
 
+        # A rejected management transaction restores the prior files before
+        # its publication barrier closes. Model that rollback exactly: leaving
+        # the rejected bytes in place would make a later ordinary hot-reload a
+        # legitimate external edit, which is a different contract.
+        skill_file.write_bytes(original_bytes)
+        os.utime(
+            skill_file,
+            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+        )
+
+    post_rollback = loader.refresh_if_changed("post-rollback probe")
+    assert post_rollback.changed is False
+    assert post_rollback.generation == old.generation
     assert loader.snapshot() is old
-    assert loader.get_by_name("alpha").description == "old"  # type: ignore[union-attr]
+    assert loader.snapshot().get_by_name("alpha").description == "old"  # type: ignore[union-attr]
 
 
 def test_concurrent_reload_cannot_report_provisional_generation(tmp_path: Path) -> None:
@@ -301,6 +349,45 @@ def test_invalid_new_is_ignored_and_invalid_existing_keeps_last_good(tmp_path: P
     repaired = loader.refresh_if_changed("test")
     assert repaired.partial is True  # the unrelated broken source remains
     assert loader.get_by_name("alpha").description == "repaired"  # type: ignore[union-attr]
+
+
+def test_unreadable_payload_is_a_per_skill_partial_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "skills"
+    blocked_skill = _write_skill(root, "blocked").parent
+    blocked_payload = blocked_skill / "payload.bin"
+    blocked_payload.write_bytes(b"unreadable payload")
+    _write_skill(root, "valid")
+    original_open = file_hash.os.open
+    original_read_chunk = file_hash._read_chunk
+    denied_descriptors: set[int] = set()
+
+    def track_payload_descriptor(path: Path, flags: int) -> int:
+        descriptor = original_open(path, flags)
+        if Path(path) == blocked_payload:
+            denied_descriptors.add(descriptor)
+        return descriptor
+
+    def deny_payload_read(descriptor: int, size: int) -> bytes:
+        if descriptor in denied_descriptors:
+            denied_descriptors.remove(descriptor)
+            raise PermissionError("stable payload denial")
+        return original_read_chunk(descriptor, size)
+
+    monkeypatch.setattr(file_hash.os, "open", track_payload_descriptor)
+    monkeypatch.setattr(file_hash, "_read_chunk", deny_payload_read)
+    loader = _loader(root, tmp_path)
+
+    result = loader.refresh_if_changed("cold start")
+
+    assert result.success is True
+    assert result.partial is True
+    assert [skill.name for skill in loader.snapshot().skills] == ["valid"]
+    assert len(result.errors) == 1
+    assert result.errors[0].name == "blocked"
+    assert result.errors[0].kept_previous is False
 
 
 @pytest.mark.parametrize("invalid_name", ["[bad]", "{bad: value}", "null", "123", "''"])
@@ -544,6 +631,11 @@ def test_manifest_change_during_scan_retries_once(tmp_path: Path, monkeypatch) -
 
 
 def test_twice_unstable_scan_keeps_last_known_good(tmp_path: Path, monkeypatch) -> None:
+    # Assert publication separately from the later compatibility auto-probe.
+    # Slow filesystems must not let get_by_name cross the 250 ms probe window
+    # halfway through this one logical observation.
+    clock = [1.0]
+    monkeypatch.setattr(skill_loader_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     root = tmp_path / "skills"
     _write_skill(root, "alpha", "last known good")
     loader = _loader(root, tmp_path)
@@ -570,6 +662,9 @@ def test_twice_unstable_scan_keeps_last_known_good(tmp_path: Path, monkeypatch) 
     assert result.success is False
     assert result.generation == generation
     assert loader.get_by_name("alpha").description == "last known good"  # type: ignore[union-attr]
+    clock[0] += skill_loader_module._COMPAT_PROBE_INTERVAL_SECONDS + 0.01
+    assert loader.get_by_name("alpha").description == "third candidate"  # type: ignore[union-attr]
+    assert loader.snapshot().generation > generation
 
 
 def test_mutation_guard_hides_in_progress_write_until_next_access(tmp_path: Path) -> None:
@@ -592,6 +687,12 @@ def test_mutation_guard_hides_in_progress_write_until_next_access(tmp_path: Path
 def test_load_all_compatibility_probe_is_monotonic_throttled(
     tmp_path: Path, monkeypatch
 ) -> None:
+    monotonic_now = 10.0
+    monkeypatch.setattr(
+        skill_loader_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: monotonic_now),
+    )
     root = tmp_path / "skills"
     _write_skill(root, "alpha")
     loader = _loader(root, tmp_path)
@@ -610,7 +711,7 @@ def test_load_all_compatibility_probe_is_monotonic_throttled(
     loader.load_all()
     assert calls == 0
 
-    loader._last_probe_at = 0.0
+    monotonic_now += skill_loader_module._COMPAT_PROBE_INTERVAL_SECONDS
     loader.load_all()
     assert calls == 1
 
@@ -655,6 +756,69 @@ def test_global_scan_failure_keeps_last_known_good(tmp_path: Path, monkeypatch) 
     assert [skill.name for skill in loader.snapshot().skills] == ["alpha"]
 
 
+def test_cold_start_tree_hash_race_retries_without_manifest_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "skills"
+    _write_skill(root, "alpha")
+    snapshot_path = tmp_path / "snapshot.json"
+    loader = SkillLoader(workspace_dir=root, snapshot_path=snapshot_path)
+    calls = _inject_transient_tree_hash_race(monkeypatch)
+
+    failed = loader.refresh_if_changed("metadata-only race")
+
+    assert failed.success is False
+    assert failed.generation == 0
+    assert failed.errors[0].kept_previous is False
+    assert loader.snapshot().generation == 0
+    assert loader.snapshot().skills == ()
+    assert loader._initialized is False
+    assert not snapshot_path.exists()
+
+    recovered = loader.refresh_if_changed("next ordinary access")
+
+    assert recovered.success is True
+    assert recovered.added == ("alpha",)
+    assert loader.snapshot().generation == 1
+    assert loader.get_by_name("alpha") is not None
+    assert loader._initialized is True
+    assert calls == [2]
+
+
+def test_warm_tree_hash_race_keeps_lkg_until_next_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "skills"
+    _write_skill(root, "alpha", "last known good")
+    loader = _loader(root, tmp_path)
+    loader.load_all()
+    old = loader.snapshot()
+    _write_skill(root, "alpha", "new candidate")
+    calls = _inject_transient_tree_hash_race(monkeypatch)
+
+    failed = loader.refresh_if_changed("metadata-only race")
+
+    assert failed.success is False
+    assert failed.generation == old.generation
+    assert failed.errors[0].kept_previous is True
+    assert loader.snapshot() is old
+    old_skill = loader.snapshot().get_by_name("alpha")
+    assert old_skill is not None
+    assert old_skill.description == "last known good"
+
+    recovered = loader.refresh_if_changed("next ordinary access")
+
+    assert recovered.success is True
+    assert recovered.modified == ("alpha",)
+    assert loader.snapshot().generation == old.generation + 1
+    recovered_skill = loader.snapshot().get_by_name("alpha")
+    assert recovered_skill is not None
+    assert recovered_skill.description == "new candidate"
+    assert calls == [2]
+
+
 def test_publish_writes_snapshot_without_reentering_loader(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -673,7 +837,7 @@ def test_publish_writes_snapshot_without_reentering_loader(
     assert [skill.name for skill in loader.snapshot().skills] == ["alpha"]
 
 
-def test_snapshot_v12_is_invalid_and_v15_round_trips_atomically(tmp_path: Path) -> None:
+def test_snapshot_v12_is_invalid_and_v16_round_trips_atomically(tmp_path: Path) -> None:
     root = tmp_path / "skills"
     _write_skill(root, "alpha")
     snapshot_path = tmp_path / "snapshot.json"
@@ -684,7 +848,7 @@ def test_snapshot_v12_is_invalid_and_v15_round_trips_atomically(tmp_path: Path) 
     loader.load_all()
     loader.save_snapshot()
     data = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    assert data["version"] == 15
+    assert data["version"] == 16
     assert all("mtime_ns" in entry for entry in data["manifest"].values())
     assert all("tree_state" in entry for entry in data["manifest"].values())
     assert data["skills"][0]["tree_digest"]
@@ -694,6 +858,48 @@ def test_snapshot_v12_is_invalid_and_v15_round_trips_atomically(tmp_path: Path) 
     restored_skills = restored.load_snapshot() or []
     assert [skill.name for skill in restored_skills] == ["alpha"]
     assert restored_skills[0].tree_digest == data["skills"][0]["tree_digest"]
+
+
+def test_legacy_snapshot_normalizes_triggers_without_recompiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "skills"
+    skill_file = _write_skill(root, "alpha")
+    skill_file.write_text(
+        "---\nname: alpha\ndescription: Synthetic trigger fixture\n"
+        "triggers: [123, [nested, list], dubbing]\n---\nbody",
+        encoding="utf-8",
+    )
+    snapshot_path = tmp_path / "snapshot.json"
+    loader = SkillLoader(workspace_dir=root, snapshot_path=snapshot_path)
+    loader.load_all()
+    loader.save_snapshot()
+
+    data = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    for key in ("skills", "candidates"):
+        assert data[key]
+        for skill in data[key]:
+            skill["triggers"] = [123, ["nested", "list"], "dubbing"]
+    snapshot_path.write_text(json.dumps(data), encoding="utf-8")
+
+    restored = SkillLoader(workspace_dir=root, snapshot_path=snapshot_path)
+
+    def unexpected_rebuild(*args: object, **kwargs: object) -> None:
+        pytest.fail("unchanged Skill sources should reuse the existing snapshot")
+
+    monkeypatch.setattr(restored, "_build_catalog", unexpected_rebuild)
+    expected = ["123", "['nested', 'list']", "dubbing"]
+    snapshot_skills = restored.load_snapshot()
+    assert snapshot_skills is not None
+    assert [skill.triggers for skill in snapshot_skills] == [expected]
+    assert [skill.triggers for skill in restored.load_all()] == [expected]
+    catalog = restored.snapshot()
+    assert [skill.triggers for skill in catalog.skills] == [expected]
+    assert [skill.triggers for skill in catalog.candidates] == [expected]
+    pinned = PinnedSkillLoader(catalog, restored)
+    for matcher in (restored, pinned):
+        for query in ("DUBBING", "123", "['nested', 'list']"):
+            assert [skill.name for skill in matcher.find_by_trigger(query)] == ["alpha"]
 
 
 def test_description_zh_is_parsed_and_survives_snapshot_round_trip(tmp_path: Path) -> None:

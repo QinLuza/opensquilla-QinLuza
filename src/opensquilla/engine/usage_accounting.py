@@ -37,6 +37,7 @@ from opensquilla.usage_reasons import (
 
 _NANOS_PER_USD = Decimal("1000000000")
 _CANCELLED_USAGE_TERMINAL_GRACE_SECONDS = 0.25
+_PROVIDER_STREAM_CLOSE_TIMEOUT_SECONDS = 0.25
 log = structlog.get_logger(__name__)
 
 
@@ -49,6 +50,36 @@ class UsageAccountingUnavailableError(RuntimeError):
 
     code = "usage_accounting_unavailable"
     retryable = True
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_ms: int | None = None,
+        usage_call_index: int | None = None,
+        no_prior_provider_dispatch: bool = False,
+        replay_safe: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_ms = retry_after_ms
+        self.usage_call_index = usage_call_index
+        self.no_prior_provider_dispatch = no_prior_provider_dispatch
+        self.replay_safe = replay_safe
+
+    def bind_usage_call(self, call: UsageCallStart) -> None:
+        """Attach fail-closed evidence from the rejected provider admission."""
+
+        call_index = max(1, int(call.call_index))
+        self.usage_call_index = call_index
+        self.no_prior_provider_dispatch = call_index == 1
+
+    def bind_replay_safety(self, *, no_prior_irreversible_effect: bool) -> None:
+        """Prove whole-turn replay safety without weakening retryability."""
+
+        self.replay_safe = (
+            self.no_prior_provider_dispatch
+            and no_prior_irreversible_effect
+        )
 
 
 class UsageAccountingBusyError(UsageAccountingUnavailableError):
@@ -247,6 +278,9 @@ async def start_usage_call(
     start_task = asyncio.create_task(scope.sink.start(call))
     try:
         await asyncio.shield(start_task)
+    except UsageAccountingUnavailableError as exc:
+        exc.bind_usage_call(call)
+        raise
     except asyncio.CancelledError:
         # Cancellation raced the fail-closed barrier.  Resolve the durable
         # decision before unwinding; a committed row is explicitly closed.
@@ -376,6 +410,7 @@ async def account_provider_stream(
     *,
     provider: str,
     model: str,
+    close_timeout: float | None = _PROVIDER_STREAM_CLOSE_TIMEOUT_SECONDS,
 ) -> AsyncGenerator[Any, None]:
     """Account exactly one physical ``provider.chat`` invocation.
 
@@ -385,16 +420,25 @@ async def account_provider_stream(
 
     scope = current_usage_accounting_scope()
     if scope is None:
-        async for event in stream_factory():
-            yield event
+        unaccounted_stream = stream_factory()
+        try:
+            async for event in unaccounted_stream:
+                yield event
+        finally:
+            await _close_accounted_provider_stream(
+                unaccounted_stream,
+                timeout=close_timeout,
+            )
         return
 
     call = await start_usage_call(scope, provider=provider, model=model)
+    stream: AsyncIterator[Any] | None = None
     terminal = False
     cancelled = False
     unknown_reason = "provider_stream_ended_without_usage"
     try:
-        async for event in stream_factory():
+        stream = stream_factory()
+        async for event in stream:
             kind = str(getattr(event, "kind", "") or "")
             if kind == "done" and not terminal:
                 # Preserve the physical deployment for compatibility rollups
@@ -420,15 +464,49 @@ async def account_provider_stream(
         unknown_reason = "provider_exception"
         raise
     finally:
-        if not terminal:
-            if cancelled:
-                await _mark_usage_call_unknown_after_cancellation(
-                    scope,
-                    call,
-                    unknown_reason,
-                )
-            else:
-                await mark_usage_call_unknown(scope, call, unknown_reason)
+        try:
+            if not terminal:
+                if cancelled:
+                    await _mark_usage_call_unknown_after_cancellation(
+                        scope,
+                        call,
+                        unknown_reason,
+                    )
+                else:
+                    await mark_usage_call_unknown(scope, call, unknown_reason)
+        finally:
+            if stream is not None:
+                await _close_accounted_provider_stream(stream, timeout=close_timeout)
+
+
+async def _close_accounted_provider_stream(
+    stream: AsyncIterator[Any],
+    *,
+    timeout: float | None,
+) -> None:
+    """Close the physical stream when the accounting wrapper stops early."""
+
+    if timeout is not None:
+        from opensquilla.engine.repetition_guard import close_async_iterator_bounded
+
+        await close_async_iterator_bounded(
+            stream,
+            timeout=timeout,
+            event_prefix="usage_accounting.provider_stream",
+        )
+        return
+    aclose = getattr(stream, "aclose", None)
+    if not callable(aclose):
+        return
+    try:
+        await aclose()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - cleanup must preserve provider outcome
+        log.warning(
+            "usage_accounting.provider_stream_close_failed",
+            error_type=type(exc).__name__,
+        )
 
 
 def _usage_int(value: Any) -> int:
@@ -470,7 +548,11 @@ def _row_value(
 def _breakdown_reconciles(event: object, rows: list[dict[str, Any]]) -> bool:
     """Return whether every additive Done envelope field equals its rows."""
 
-    is_error = str(getattr(event, "kind", "") or "") == "error"
+    event_kind = str(getattr(event, "kind", "") or "")
+    is_error = event_kind == "error" or (
+        event_kind == "provider_generation_reset"
+        and bool(getattr(event, "terminal", False))
+    )
     additive_keys = (
         ("input_tokens", ("input_tokens", "inputTokens")),
         ("output_tokens", ("output_tokens", "outputTokens")),

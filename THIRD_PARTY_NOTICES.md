@@ -24,8 +24,9 @@ It covers:
 ## Web UI dependencies and bundled fonts
 
 OpenSquilla builds the Vue Control UI from npm dependencies and locally bundled
-fonts. Release artifacts contain the generated browser assets under
-`src/opensquilla/gateway/static/dist/`; the dependency sources and exact
+fonts. Release artifacts contain the generated browser assets from the
+source-owned `opensquilla-webui/dist/` tree (staged into
+`src/opensquilla/gateway/static/dist/` for Python packages); the dependency sources and exact
 resolved versions are recorded by `opensquilla-webui/package.json` and
 `opensquilla-webui/package-lock.json`.
 
@@ -33,6 +34,7 @@ resolved versions are recorded by `opensquilla-webui/package.json` and
 |---|---|---|
 | Vue.js (`vue`, `@vue/reactivity`, `@vue/runtime-core`, `@vue/runtime-dom`, `@vue/shared`) | Vue runtime in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2018-present, Yuxi (Evan) You. |
 | Pinia (`pinia`) | State-management runtime in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2019-present Eduardo San Martin Morote. |
+| Vue Devtools API (`@vue/devtools-api`; [vuejs/devtools](https://github.com/vuejs/devtools)) | Explicit Pinia devtools peer; integration code where retained in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2023 webfansplz. |
 | Vue Router (`vue-router`) | Client-side routing runtime in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2019-present Eduardo San Martin Morote. |
 | Vue I18n (`vue-i18n`, `@intlify/core-base`, `@intlify/message-compiler`, `@intlify/shared`) | Localization runtime in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2020 kazuya kawaguchi. |
 | html-to-image (`html-to-image`) | Image-export runtime in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2017-2025 W.Y. |
@@ -326,13 +328,8 @@ in a package-local provenance file.
 
 - Component: SKILL.md frontmatter and instruction text for these bundled skills:
   - `sub-agent`
-- `cron`
   - `github`
-  - `nano-pdf`
   - `skill-creator`
-  - `summarize`
-  - `tmux`
-  - `weather`
 - Upstream project: https://github.com/openclaw/openclaw
 - License: MIT
 - Copyright notice: Copyright (c) 2025 Peter Steinberger
@@ -375,72 +372,41 @@ SOFTWARE.
 These bundled skill descriptors are authored and maintained by OpenSquilla and
 are released under OpenSquilla's repository license (Apache-2.0; see `LICENSE`):
 
-- `cron`
 - `code-task`
 - `AwesomeWebpageMetaSkill`
 - `awesome-webpage-image-download`
 - `awesome-webpage-research`
 - `deep-research`
 - `docx`
-- `git-diff`
 - `github`
 - `history-explorer`
-- `html-to-pdf`
-- `http-fetch`
-- `latex-compile`
-- `memory`
 - `meta-kid-project-planner`
 - `meta-paper-write`
 - `meta-short-drama`
 - `meta-skill-creator`
 - `multi-search-engine`
-- `nano-pdf`
 - `openrouter-video-generator`
-- `paper-abstract-author`
 - `paper-artifact-runtime`
 - `paper-citation-integrity-gate`
-- `paper-citation-planner`
 - `paper-delivery-summary`
-- `paper-experiment-stub`
 - `paper-latex-sanitizer`
 - `paper-length-gate`
-- `paper-outline-author`
-- `paper-plot-stub`
-- `paper-preference-planner`
 - `paper-quality-gate`
 - `paper-refbib-stub`
-- `paper-revision-author`
 - `paper-section-author`
 - `paper-source-readiness-gate`
-- `paper-source-curator`
 - `pdf-toolkit`
 - `pptx`
 - `skill-creator`
-- `skill-creator-linter`
-- `skill-creator-proposals`
-- `skill-creator-smoke-test`
 - `short-drama-delivery-audit`
 - `short-drama-review-normalizer`
-- `stack-trace-generic-probe`
-- `stack-trace-go-probe`
-- `stack-trace-js-probe`
-- `stack-trace-python-probe`
-- `stack-trace-rust-probe`
 - `sub-agent`
 - `srt-from-script`
 - `subtitle-burner`
-- `summarize`
 - `text-file-read`
 - `title-card-image`
-- `tmux`
 - `video-still-animator`
-- `weather`
 - `xlsx`
-- `advanced-dubbing-studio`
-- `music-and-singing-studio`
-- `voice-clone-lab`
-- `voice-conversion-studio`
-- `voiceover-studio`
 
 ## tokenjuice adapted reduction rules
 
@@ -524,7 +490,6 @@ SOFTWARE.
   - `deep-research`
   - `docx`
   - `html-coder`
-  - `html-to-pdf`
   - `multi-search-engine`
   - `nano-banana-pro`
   - `nano-banana-pro-openrouter`

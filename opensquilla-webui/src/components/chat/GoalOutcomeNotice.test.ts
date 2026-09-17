@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createApp, h } from 'vue'
 import { createI18n } from 'vue-i18n'
 import type { GoalSnapshot } from '@/composables/chat/useChatGoals'
@@ -10,7 +10,7 @@ import GoalOutcomeNotice from './GoalOutcomeNotice.vue'
 const apps: ReturnType<typeof createApp>[] = []
 const i18n = createI18n({ legacy: false, locale: 'en', messages: { en } })
 
-function completedGoal(): GoalSnapshot {
+function completedGoal(overrides: Partial<GoalSnapshot> = {}): GoalSnapshot {
   return {
     goalId: 'goal-complete',
     sessionKey: 'agent:main:webchat:test',
@@ -45,6 +45,7 @@ function completedGoal(): GoalSnapshot {
     createdAt: 1,
     updatedAt: 2,
     finishedAt: 2,
+    ...overrides,
   }
 }
 
@@ -82,8 +83,73 @@ describe('GoalOutcomeNotice', () => {
   it('uses the compact achieved label when embedded in the assistant footer', () => {
     const host = mountNotice({ inline: true })
 
-    expect(host.textContent).toContain('Goal achieved · 1m 03s active')
+    expect(host.textContent).toContain(
+      'Goal achieved · 2 turns · 15 tokens',
+    )
+    expect(host.textContent).not.toContain('1m 03s active')
     expect(host.querySelector('.goal-outcome--inline')).not.toBeNull()
     expect(host.querySelector('button')).toBeNull()
+  })
+
+  it.each([false, true])('emits the settled Goal when removed (inline: %s)', (inline) => {
+    const goal = completedGoal()
+    const onClear = vi.fn()
+    const host = mountNotice({ goal, inline, removable: true, onClear })
+    const button = host.querySelector('button')!
+
+    expect(button.textContent).toContain('Remove goal')
+    expect(button.type).toBe('button')
+    expect(button.disabled).toBe(false)
+    button.click()
+
+    expect(onClear).toHaveBeenCalledExactlyOnceWith(goal)
+    expect(onClear.mock.calls[0]![0]).toBe(goal)
+  })
+
+  it('disables removal while a Goal operation is pending', () => {
+    const onClear = vi.fn()
+    const host = mountNotice({ removable: true, busy: true, onClear })
+    const button = host.querySelector('button')!
+
+    expect(button.disabled).toBe(true)
+    button.click()
+    // Synthetic events can bypass a disabled button; the handler must guard too.
+    button.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+
+    expect(onClear).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { activeTaskId: 'task-settling', executionState: 'working' as const },
+    { activeTaskId: 'task-settling', executionState: 'idle' as const },
+    { executionState: 'queued' as const },
+    { status: 'active' as const },
+  ])('hides removal before the terminal outcome has settled (%j)', (overrides) => {
+    const host = mountNotice({ removable: true, goal: completedGoal(overrides) })
+
+    expect(host.querySelector('button')).toBeNull()
+  })
+
+  it('omits zero accounting values from the inline achieved label', () => {
+    const host = mountNotice({
+      inline: true,
+      goal: completedGoal({
+        turnsStarted: 0,
+        turnsSettled: 0,
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          reasoningTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          totalTokens: 0,
+        },
+      }),
+    })
+
+    expect(host.textContent).toContain('Goal achieved')
+    expect(host.textContent).not.toContain('1m 03s active')
+    expect(host.textContent).not.toContain('turns')
+    expect(host.textContent).not.toContain('tokens')
   })
 })

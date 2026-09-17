@@ -3,6 +3,13 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { parseMetaCommandInvocation, useChatSlashCommands } from './useChatSlashCommands'
 import type { RpcCallOptions } from '@/lib/rpc'
+import type { MetaRunCenter } from '@/modules/metaRunCenter'
+import type { SessionMaintenance } from '@/modules/sessionMaintenance'
+import { usageReportingDouble } from '@/testing/usage.test-helper'
+import type { MetaSetupReadiness } from '@/types/metaSetup'
+import {
+  commandCatalogFromTestRpc,
+} from '@/testing/conversationAncillary.test-helper'
 
 function deferred() {
   let resolve!: () => void
@@ -14,14 +21,43 @@ function deferred() {
 
 function harness(
   planModeAvailable: boolean,
-  commands: Array<Record<string, unknown>> = [],
-  waitForConnection: Promise<void> = Promise.resolve(),
+  commands: unknown = [],
+  ready: Promise<void> = Promise.resolve(),
   catalogCallOptions?: RpcCallOptions,
 ) {
   const inputText = ref('')
+  const call = vi.fn(async (
+    _method: string,
+    _params?: Record<string, unknown>,
+    _options?: RpcCallOptions,
+  ): Promise<unknown> => {
+    await ready
+    return { commands }
+  })
   const rpc = {
-    waitForConnection: vi.fn(() => waitForConnection),
-    call: vi.fn().mockResolvedValue({ commands }),
+    ready: vi.fn(() => ready),
+    call,
+  }
+  const metaRunCenter: MetaRunCenter = {
+    launch: vi.fn(async input => {
+      const raw = await rpc.call('meta.run', input) as Record<string, unknown>
+      return {
+        ok: raw.ok === true,
+        error: typeof raw.error === 'string' ? raw.error : undefined,
+        drafted: raw.drafted === true,
+        setupRequired: raw.setup_required === true,
+        readiness: raw.readiness as MetaSetupReadiness | undefined,
+      }
+    }),
+    listDrafts: vi.fn(async () => ({ drafts: [], durable: true })),
+    discardDraft: vi.fn(async () => ({ discarded: true, accepted: false })),
+    recover: vi.fn(async () => null),
+    confirmPreflight: vi.fn(async () => ({})),
+    replay: vi.fn(async () => ({})),
+    setupPlan: vi.fn(async () => { throw new Error('Setup planning is not configured') }),
+    setupStatus: vi.fn(async () => { throw new Error('Setup polling is not configured') }),
+    setupInstall: vi.fn(async () => { throw new Error('Installation is not configured') }),
+    subscribe: vi.fn(() => ({ close: vi.fn() })),
   }
   const activatePlanMode = vi.fn(async () => true)
   const codingModeEnabled = ref(false)
@@ -39,8 +75,30 @@ function harness(
   const goalPause = vi.fn(async () => true)
   const goalResume = vi.fn(async () => true)
   const goalClear = vi.fn(async () => true)
+  const sessionMaintenance: SessionMaintenance = {
+    reset: vi.fn(async command => ({
+      key: command.key,
+      reset: true as const,
+      rotated: true,
+      previousSessionId: 'before',
+      sessionId: 'after',
+      epoch: 1,
+    })),
+    compact: vi.fn(async command => ({
+      key: command.key,
+      compactionId: 'cmp-test',
+      status: 'started',
+      compacted: false,
+      applied: false,
+      durability: 'none',
+      userVisible: true,
+    })),
+  }
   const api = useChatSlashCommands({
-    rpc,
+    commandCatalog: commandCatalogFromTestRpc(rpc),
+    usageReporting: usageReportingDouble(),
+    sessionMaintenance,
+    metaRunCenter,
     catalogCallOptions,
     inputText,
     sessionKey: ref('agent:main:webchat:test'),
@@ -81,6 +139,7 @@ function harness(
     goalClear,
     notify,
     rpc,
+    sessionMaintenance,
     setCodingModeEnabled,
   }
 }
@@ -114,18 +173,15 @@ describe('useChatSlashCommands plan compatibility', () => {
       catalogCallOptions,
     )
     await api.loadSlashCommands()
-    expect(rpc.waitForConnection).toHaveBeenCalledWith(
-      2_000,
-      undefined,
-      {
-        timeoutAction: 'reconnect',
-        abortAction: 'reconnect',
-      },
-    )
     expect(rpc.call).toHaveBeenCalledWith(
       'commands.list_for_surface',
       { surface: 'web_chat' },
-      catalogCallOptions,
+      {
+        timeoutMs: 2_000,
+        signal: undefined,
+        timeoutAction: 'reject',
+        abortAction: 'reject',
+      },
     )
     inputText.value = '/pl'
     api.handleSlashInput()
@@ -151,6 +207,7 @@ describe('useChatSlashCommands plan compatibility', () => {
       name: '/planning',
       description: 'A different command',
       aliases: [],
+      execution: { action: 'plans.setMode' },
     }])
     await api.loadSlashCommands()
     inputText.value = '/plan'
@@ -377,20 +434,95 @@ describe('useChatSlashCommands Coding mode', () => {
 })
 
 describe('useChatSlashCommands recovery', () => {
-  it('keeps an unknown slash command in the composer and shows a visible hint', async () => {
+  it.each([
+    {},
+    { commands: null },
+    { commands: [{}] },
+    { commands: [null] },
+    {
+      commands: [{
+        name: '/goal',
+        aliases: [{}],
+        execution: { action: 'goal.set' },
+      }],
+    },
+    { commands: [{ name: '/foo', aliases: [], execution: {} }] },
+    {
+      commands: [{
+        name: '/reset',
+        aliases: [],
+        execution: { action: 'unsupported.action' },
+      }],
+    },
+  ])('keeps a malformed command catalog unavailable', async response => {
+    const { api, armGoal, notify, rpc } = harness(false)
+    rpc.call.mockResolvedValue(response)
+
+    await expect(api.classifySlashCommand('/goal')).resolves.toBe('unavailable')
+    await expect(api.executeSlashCommand('/goal')).resolves.toBe(true)
+
+    expect(armGoal).not.toHaveBeenCalled()
+    expect(notify).toHaveBeenCalledOnce()
+  })
+
+  it('keeps a legacy supported command without execution metadata registered', async () => {
+    const { api, sessionMaintenance } = harness(false, [{ name: '/reset', aliases: [] }])
+
+    await expect(api.classifySlashCommand('/reset')).resolves.toBe('registered')
+    await expect(api.executeSlashCommand('/reset', 'registered')).resolves.toBe(true)
+
+    expect(sessionMaintenance.reset).toHaveBeenCalledWith({
+      key: 'agent:main:webchat:test',
+    })
+  })
+
+  it('executes a legacy Goal command without execution metadata', async () => {
+    const { api, armGoal, goalStatus } = harness(false, [{
+      name: '/goal',
+      aliases: [],
+    }])
+
+    await expect(api.classifySlashCommand('/goal')).resolves.toBe('registered')
+    await expect(api.executeSlashCommand('/goal', 'registered')).resolves.toBe(true)
+    await Promise.resolve()
+
+    expect(goalStatus).toHaveBeenCalledTimes(1)
+    expect(armGoal).toHaveBeenCalledTimes(1)
+  })
+
+  it('falls through silently for unknown slash input', async () => {
     const {
       api,
       inputText,
       notify,
     } = harness(false)
-    inputText.value = '/codng'
+    inputText.value = '/gamemode creative'
 
     const handled = await api.executeSlashCommand(inputText.value)
 
+    expect(handled).toBe(false)
+    expect(notify).not.toHaveBeenCalled()
+    await expect(api.classifySlashCommand(inputText.value)).resolves.toBe('unknown')
+  })
+
+  it('still executes a registered slash command as a command', async () => {
+    const goalCommand = {
+      name: '/goal',
+      cmd: '/goal',
+      label: '/goal',
+      desc: 'Set a long-running goal for the agent to pursue.',
+      aliases: [],
+      execution: { action: 'goal.set' },
+    }
+    const { api, inputText, armGoal } = harness(false, [goalCommand])
+    inputText.value = '/goal'
+
+    const handled = await api.executeSlashCommand(inputText.value)
+    await Promise.resolve()
+
+    // Registered commands stay handled: they run as commands, not messages.
     expect(handled).toBe(true)
-    expect(inputText.value).toBe('/codng')
-    expect(notify).toHaveBeenCalledWith(expect.stringContaining('/codng'))
-    expect(notify).toHaveBeenCalledWith(expect.stringContaining('//'))
+    expect(armGoal).toHaveBeenCalledTimes(1)
   })
 })
 

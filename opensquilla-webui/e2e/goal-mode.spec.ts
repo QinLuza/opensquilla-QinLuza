@@ -1,17 +1,35 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 import { startRealGoalGateway } from './real-goal-gateway'
+import { test as isolatedGatewayTest } from './real-gateway.fixture'
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-goal-mode'
 const SESSION_ID = 'session-e2e-goal-mode'
 const GOAL_ID = 'goal-e2e-mocked-snapshots'
 const GOAL_SOURCE_MESSAGE_ID = 'message-goal-source'
+const GOAL_TERMINAL_TURN_ID = 'turn-goal-terminal'
+const GOAL_TERMINAL_REPLY = 'The synthetic Goal report is complete.'
 const OBJECTIVE = 'Produce and verify a deterministic release report'
 const REAL_FIRST_REPLY = 'The release inputs are inspected; final verification still remains.'
 const REAL_FINAL_REPLY = 'The deterministic release report is complete and verified.'
 const LIFECYCLE_FIRST_REPLY = 'Task one completed after the lifecycle checks.'
 const LIFECYCLE_SECOND_REPLY = 'Task two completed after Goal removal.'
+
+function expectNegotiatedGoalFlow(frames: Array<Record<string, unknown>>, enabled: boolean) {
+  const hello = frames.find(frame => frame.direction === 'received' && frame.type === 'hello-ok')
+  expect(hello).toBeTruthy()
+  const policy = hello?.policy as Record<string, unknown> | undefined
+  if (enabled) expect(policy?.transport_flow).toMatchObject({ delivery_epoch: expect.any(String) })
+  else expect(policy?.transport_flow).toBeUndefined()
+}
 
 type GoalProgress = {
   explanation: string | null
@@ -25,9 +43,11 @@ type GoalFixture = ReturnType<typeof goalSnapshot>
 
 type MockGoalGateway = {
   acceptGoal: () => void
+  acceptClear: () => void
   emitGoal: (goal: GoalFixture) => void
   methods: string[]
   setParams: Array<Record<string, unknown>>
+  clearParams: Array<Record<string, unknown>>
 }
 
 function response(id: string | number | undefined, payload: unknown) {
@@ -78,7 +98,7 @@ async function installStableHttpStubs(page: Page): Promise<void> {
   await page.route('**/api/approvals', route => route.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({ pending: [] }),
+    body: JSON.stringify({ mode: 'prompt', pending: [] }),
   }))
   await page.route('**/api/elevated-mode', route => route.fulfill({
     status: 200,
@@ -98,14 +118,24 @@ async function installStableHttpStubs(page: Page): Promise<void> {
   }))
 }
 
-async function installFakeGoalGateway(page: Page): Promise<MockGoalGateway> {
+async function installFakeGoalGateway(
+  page: Page,
+  options: {
+    sessionRouting?: boolean
+    goalRemoval?: boolean
+    history?: Array<Record<string, unknown>>
+  } = {},
+): Promise<MockGoalGateway> {
   const methods: string[] = []
   const setParams: Array<Record<string, unknown>> = []
+  const clearParams: Array<Record<string, unknown>> = []
   let sendFrame: ((frame: string) => void) | null = null
   let pendingGoalRequest: {
     id: string | number | undefined
     params: Record<string, unknown>
   } | null = null
+  let pendingClearRequest: { id: string | number | undefined } | null = null
+  let currentGoal: GoalFixture | null = null
   let streamSeq = 0
 
   await page.addInitScript(() => {
@@ -122,22 +152,39 @@ async function installFakeGoalGateway(page: Page): Promise<MockGoalGateway> {
       } catch {
         return
       }
+      if (frame.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong' }))
+        return
+      }
       if (frame.type !== 'req') return
       const method = String(frame.method || '')
       methods.push(method)
 
       if (method === 'connect') {
-        ws.send(JSON.stringify({
-          type: 'hello-ok',
-          protocol: 3,
+        ws.send(helloOkResponse({
           server: { version: 'e2e', conn_id: 'goal-mode-fake-gateway' },
           features: {
-            methods: ['goals.capabilities', 'goals.set'],
-            events: ['session.event.goal'],
+            methods: [
+              'goals.capabilities',
+              'goals.set',
+              ...(options.goalRemoval ? ['goals.clear'] : []),
+              ...(options.sessionRouting
+                ? ['sessions.routing.get', 'sessions.routing.set']
+                : []),
+            ],
+            events: [
+              'session.event.goal',
+              ...(options.sessionRouting ? ['sessions.routing.changed'] : []),
+            ],
           },
           snapshot: {},
           policy: { tick_interval_ms: 30_000 },
-          auth: { principal: { isOwner: true } },
+          auth: {
+            principal: {
+              isOwner: true,
+              ...(options.sessionRouting ? { authState: 'authenticated' } : {}),
+            },
+          },
         }))
         return
       }
@@ -152,14 +199,15 @@ async function installFakeGoalGateway(page: Page): Promise<MockGoalGateway> {
         }
         return
       }
+      if (method === 'goals.clear' && options.goalRemoval) {
+        clearParams.push(frame.params as Record<string, unknown>)
+        pendingClearRequest = { id: frame.id as string | number | undefined }
+        return
+      }
 
       const payloads: Record<string, unknown> = {
         'agents.list': { agents: [] },
-        'chat.history': {
-          messages: [],
-          has_more: false,
-          canonical_complete: true,
-        },
+        'chat.history': chatHistoryPayload(options.history),
         'commands.list_for_surface': {
           commands: [{
             name: '/goal',
@@ -180,37 +228,33 @@ async function installFakeGoalGateway(page: Page): Promise<MockGoalGateway> {
           executionEnabled: true,
           maxTurns: 50,
           runtimeBudgetSeconds: 3_600,
-          methods: ['goals.set'],
+          methods: ['goals.set', ...(options.goalRemoval ? ['goals.clear'] : [])],
         },
         'models.routing.get': { mode: 'direct' },
         'onboarding.status': { audioConfigured: false },
-        'sessions.list': { sessions: [], has_more: false },
-        'sessions.messages.snapshot': {
-          key: SESSION_KEY,
-          events: [],
-          current_stream_seq: 0,
-        },
-        'sessions.messages.subscribe': {
-          key: SESSION_KEY,
+        'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
+        'sessions.messages.snapshot': sessionMessagesSnapshotPayload(SESSION_KEY, {
+          current_stream_seq: options.goalRemoval ? streamSeq : 0,
+        }),
+        'sessions.messages.subscribe': sessionMessagesSubscribePayload(SESSION_KEY, {
           sessionId: SESSION_ID,
           epoch: 1,
-          subscribed: true,
+          current_stream_seq: options.goalRemoval ? streamSeq : 0,
           hydration_complete: false,
-          replay_complete: true,
-          current_stream_seq: 0,
-          run_status: 'idle',
           goal: null,
           goalSnapshotStreamSeq: null,
           deferred_fields: ['goal', 'goalSnapshotStreamSeq'],
-        },
-        'sessions.messages.hydrate': {
-          key: SESSION_KEY,
+        }),
+        'sessions.messages.hydrate': sessionMessagesHydratePayload(SESSION_KEY, {
           sessionId: SESSION_ID,
           epoch: 1,
-          hydration_complete: true,
-          run_status: 'idle',
-          goal: null,
-          goalSnapshotStreamSeq: 0,
+          goal: options.goalRemoval ? currentGoal : null,
+          goalSnapshotStreamSeq: options.goalRemoval ? streamSeq : 0,
+        }),
+        'sessions.routing.get': {
+          sessionKey: SESSION_KEY,
+          mode: 'direct',
+          revision: 0,
         },
         'usage.status': { sessions: [] },
       }
@@ -224,12 +268,14 @@ async function installFakeGoalGateway(page: Page): Promise<MockGoalGateway> {
   return {
     methods,
     setParams,
+    clearParams,
     acceptGoal() {
       if (!sendFrame || !pendingGoalRequest) {
         throw new Error('fake Goal gateway has no pending goals.set request')
       }
       const { id, params } = pendingGoalRequest
       pendingGoalRequest = null
+      currentGoal = goalSnapshot()
       sendFrame(response(id, {
         accepted: true,
         clientRequestId: params.clientRequestId,
@@ -239,11 +285,46 @@ async function installFakeGoalGateway(page: Page): Promise<MockGoalGateway> {
         taskId: 'task-goal-first-turn',
         userMessageId: GOAL_SOURCE_MESSAGE_ID,
         previousGoalId: null,
-        goal: goalSnapshot(),
+        goal: currentGoal,
+      }))
+    },
+    acceptClear() {
+      if (!sendFrame || !pendingClearRequest || !currentGoal) {
+        throw new Error('fake Goal gateway has no pending goals.clear request')
+      }
+      const { id } = pendingClearRequest
+      const previousGoal = currentGoal
+      pendingClearRequest = null
+      currentGoal = null
+      streamSeq += 1
+      sendFrame(JSON.stringify({
+        type: 'event',
+        event: 'session.event.goal',
+        payload: {
+          session_key: SESSION_KEY,
+          session_id: SESSION_ID,
+          epoch: 1,
+          stream_seq: streamSeq,
+          event_type: 'cleared',
+          state_revision: previousGoal.stateRevision + 1,
+          progress_revision: previousGoal.progressRevision,
+          previous_goal_id: previousGoal.goalId,
+          goal: null,
+        },
+      }))
+      sendFrame(response(id, {
+        accepted: true,
+        sessionKey: SESSION_KEY,
+        sessionId: SESSION_ID,
+        epoch: 1,
+        previousGoalId: previousGoal.goalId,
+        stateRevision: previousGoal.stateRevision + 1,
+        goal: null,
       }))
     },
     emitGoal(goal) {
       if (!sendFrame) throw new Error('fake Goal gateway is not connected')
+      currentGoal = goal
       streamSeq += 1
       sendFrame(JSON.stringify({
         type: 'event',
@@ -425,6 +506,312 @@ test('Goal mode renders mocked continuation snapshots without correctness pollin
   expect(gateway.methods.filter(method => forbiddenGoalMethods.includes(method))).toEqual([])
 })
 
+for (const placement of ['tail fallback', 'inline assistant outcome'] as const) {
+  test(`Completed Goal removal works from the ${placement}`, async ({ page }) => {
+    const inline = placement === 'inline assistant outcome'
+    const history = inline ? [
+      {
+        role: 'user',
+        text: OBJECTIVE,
+        id: GOAL_SOURCE_MESSAGE_ID,
+        message_id: GOAL_SOURCE_MESSAGE_ID,
+        timestamp: 1_800_000_000,
+        turn_context: { turn_id: GOAL_TERMINAL_TURN_ID },
+      },
+      {
+        role: 'assistant',
+        text: GOAL_TERMINAL_REPLY,
+        id: 'message-goal-terminal',
+        message_id: 'message-goal-terminal',
+        timestamp: 1_800_000_001,
+        turn_context: { turn_id: GOAL_TERMINAL_TURN_ID },
+      },
+    ] : []
+    const gateway = await installFakeGoalGateway(page, { goalRemoval: true, history })
+    await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.chat-textarea')).toBeEditable({ timeout: 10_000 })
+    if (inline) {
+      await expect(page.locator('.msg-ai').filter({ hasText: GOAL_TERMINAL_REPLY }))
+        .toHaveCount(1)
+    }
+
+    gateway.emitGoal(goalSnapshot())
+    const ribbon = page.locator('.goal-ribbon')
+    await expect(ribbon).toHaveAttribute('data-status', 'active')
+
+    // The model's completion decision arrives before the final task settles.
+    // Removal belongs to the settled outcome, not this transient ribbon.
+    gateway.emitGoal(goalSnapshot({ status: 'complete', stateRevision: 2 }))
+    await expect(ribbon).toHaveAttribute('data-status', 'complete')
+    await expect(page.locator('.goal-outcome')).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Remove goal', exact: true })).toHaveCount(0)
+
+    gateway.emitGoal(goalSnapshot({
+      status: 'complete',
+      stateRevision: 3,
+      activeTaskId: null,
+      executionState: 'idle',
+      turnsSettled: 1,
+      terminalTurnId: inline ? GOAL_TERMINAL_TURN_ID : null,
+      terminalReason: 'complete',
+      finishedAt: 4_000,
+    }))
+    await expect(ribbon).toHaveCount(0)
+    const outcome = page.locator(inline
+      ? '.msg-ai .goal-outcome--inline'
+      : '.goal-outcome:not(.goal-outcome--inline)')
+    await expect(page.locator('.goal-outcome')).toHaveCount(1)
+    await expect(outcome).toBeVisible()
+    const removeButton = outcome.getByRole('button', { name: 'Remove goal', exact: true })
+    await expect(removeButton).toBeEnabled()
+
+    // The inline footer also carries message actions. On narrow screens it
+    // must leave enough room for the complete removal label and touch target.
+    await page.setViewportSize({ width: 390, height: 844 })
+    await expect(removeButton).toBeInViewport()
+    await expect.poll(async () => removeButton.evaluate(button => {
+      const bounds = button.getBoundingClientRect()
+      const label = button.querySelector('span')!
+      const range = document.createRange()
+      range.selectNodeContents(label)
+      return {
+        fits: bounds.left >= 0 && bounds.right <= window.innerWidth,
+        touchTarget: bounds.width >= 44 && bounds.height >= 44,
+        labelLines: range.getClientRects().length,
+      }
+    })).toEqual({ fits: true, touchTarget: true, labelLines: 1 })
+
+    // Exercise keyboard access through the full ChatView confirmation path.
+    await removeButton.focus()
+    await page.keyboard.press('Enter')
+    const dialog = page.getByRole('dialog', { name: 'Remove this goal?' })
+    await expect(dialog).toBeVisible()
+    await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
+    await expect(dialog).toHaveCount(0)
+    await expect(outcome).toBeVisible()
+    expect(gateway.clearParams).toEqual([])
+
+    await removeButton.click()
+    await dialog.getByRole('button', { name: 'Remove goal', exact: true }).click()
+    await expect.poll(() => gateway.clearParams).toHaveLength(1)
+    expect(gateway.clearParams[0]).toMatchObject({
+      sessionKey: SESSION_KEY,
+      expectedGoalId: GOAL_ID,
+      expectedStateRevision: 3,
+    })
+    expect(gateway.clearParams[0]?.clientRequestId).toMatch(/^[0-9a-f-]{36}$/)
+    await expect(removeButton).toBeDisabled()
+
+    gateway.acceptClear()
+    await expect(page.locator('.goal-outcome')).toHaveCount(0)
+    await expect(ribbon).toHaveCount(0)
+    expect(gateway.methods.filter(method => method === 'goals.clear')).toHaveLength(1)
+    if (inline) {
+      await expect(page.locator('.msg-ai').filter({ hasText: GOAL_TERMINAL_REPLY }))
+        .toHaveCount(1)
+    }
+
+    // The mock retains the cleared authoritative state across the new socket.
+    // A fresh hydration must not revive the completed Goal or remove history.
+    const hydrateCount = gateway.methods.filter(method => method === 'sessions.messages.hydrate').length
+    await page.reload()
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect.poll(() => gateway.methods.filter(method => method === 'sessions.messages.hydrate').length)
+      .toBeGreaterThan(hydrateCount)
+    await expect(page.locator('.chat-textarea')).toBeEditable({ timeout: 10_000 })
+    await expect(page.locator('.goal-outcome')).toHaveCount(0)
+    await expect(ribbon).toHaveCount(0)
+    expect(gateway.clearParams).toHaveLength(1)
+    if (inline) {
+      await expect(page.locator('.msg-ai').filter({ hasText: GOAL_TERMINAL_REPLY }))
+        .toHaveCount(1)
+    }
+  })
+}
+
+test('Completed Goal removal confirmation cannot clear a replacement Goal', async ({ page }) => {
+  const gateway = await installFakeGoalGateway(page, { goalRemoval: true })
+  await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
+  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.chat-textarea')).toBeEditable({ timeout: 10_000 })
+  gateway.emitGoal(goalSnapshot({
+    status: 'complete',
+    stateRevision: 3,
+    activeTaskId: null,
+    executionState: 'idle',
+    turnsSettled: 1,
+    terminalReason: 'complete',
+    finishedAt: 4_000,
+  }))
+  await page.locator('.goal-outcome')
+    .getByRole('button', { name: 'Remove goal', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: 'Remove this goal?' })
+  await expect(dialog).toBeVisible()
+
+  const replacementObjective = 'Verify a new synthetic report'
+  gateway.emitGoal(goalSnapshot({
+    goalId: 'goal-e2e-replacement',
+    objective: replacementObjective,
+    stateRevision: 1,
+  }))
+  await expect(page.locator('.goal-ribbon')).toContainText(replacementObjective)
+  await dialog.getByRole('button', { name: 'Remove goal', exact: true }).click()
+  await expect(dialog).toHaveCount(0)
+  await expect(page.locator('.goal-ribbon')).toContainText(replacementObjective)
+  expect(gateway.clearParams).toEqual([])
+})
+
+test('Composer Add menu stays above active Goal progress across responsive layouts', async ({ page }) => {
+  await page.setViewportSize({ width: 1368, height: 546 })
+  await page.emulateMedia({ colorScheme: 'dark', reducedMotion: 'no-preference' })
+  const gateway = await installFakeGoalGateway(page)
+  await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
+  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.chat-textarea')).toBeEditable({ timeout: 10_000 })
+
+  gateway.emitGoal(goalSnapshot({
+    stateRevision: 2,
+    objective: 'Verify a responsive Goal workflow with a deliberately long objective that wraps on narrow windows without covering the Composer Add menu.',
+  }))
+  const goalDock = page.locator('.goal-run-dock')
+  await expect(goalDock).toBeVisible()
+
+  const addButton = page.getByRole('button', { name: 'Add', exact: true })
+  await addButton.click()
+  const addMenu = page.locator('.composer-add-menu')
+  await expect(addMenu).toBeVisible()
+
+  const assertClearance = async () => {
+    await expect.poll(async () => page.evaluate(() => {
+      const menu = document.querySelector<HTMLElement>('.composer-add-menu')
+      const goal = document.querySelector<HTMLElement>('.goal-run-dock')
+      if (!menu || !goal) return -1
+      return Math.floor(goal.getBoundingClientRect().top - menu.getBoundingClientRect().bottom)
+    })).toBeGreaterThanOrEqual(8)
+
+    const frames = await page.evaluate(async () => {
+      const samples: Array<{ clearance: number; menuTop: number }> = []
+      for (let index = 0; index < 12; index += 1) {
+        await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
+        const menu = document.querySelector<HTMLElement>('.composer-add-menu')!
+        const goal = document.querySelector<HTMLElement>('.goal-run-dock')!
+        samples.push({
+          clearance: goal.getBoundingClientRect().top - menu.getBoundingClientRect().bottom,
+          menuTop: menu.getBoundingClientRect().top,
+        })
+      }
+      return samples
+    })
+    expect(frames.every(frame => frame.clearance >= 7)).toBe(true)
+    expect(frames.every(frame => frame.menuTop >= 7)).toBe(true)
+  }
+
+  await assertClearance()
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.emulateMedia({ colorScheme: 'light', reducedMotion: 'reduce' })
+  await assertClearance()
+
+  await addMenu.getByRole('menuitem', { name: /Attach files/ }).focus()
+  await expect(addMenu.getByRole('menuitem', { name: /Attach files/ })).toBeFocused()
+  await addMenu.press('Escape')
+  await expect(addMenu).toHaveCount(0)
+
+  await page.evaluate(() => {
+    localStorage.setItem('opensquilla.composerFx', JSON.stringify({ enabled: false }))
+  })
+  await page.reload()
+  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.chat-textarea')).toBeEditable({ timeout: 10_000 })
+  await expect(page.locator('.chat')).not.toHaveClass(/chat--composer-floating/)
+
+  gateway.emitGoal(goalSnapshot({
+    stateRevision: 3,
+    objective: 'Verify the same Goal and Add menu clearance in the original docked Composer layout.',
+  }))
+  await expect(goalDock).toBeVisible()
+  await addButton.click()
+  await expect(addMenu).toBeVisible()
+  await assertClearance()
+
+  gateway.emitGoal(goalSnapshot({
+    status: 'complete',
+    stateRevision: 4,
+    activeTaskId: null,
+    executionState: 'idle',
+    turnsSettled: 1,
+    terminalReason: 'complete',
+    finishedAt: 4_000,
+  }))
+  await expect(goalDock).toHaveCount(0)
+  await expect.poll(async () => page.evaluate(() => {
+    const menu = document.querySelector<HTMLElement>('.composer-add-menu')
+    const button = document.querySelector<HTMLElement>('.chat-plus-btn')
+    if (!menu || !button) return 1
+    return Math.ceil(menu.getBoundingClientRect().bottom - button.getBoundingClientRect().top)
+  })).toBeLessThanOrEqual(-7)
+})
+
+test('Session model routing stays above active Goal progress across responsive layouts', async ({ page }) => {
+  const gateway = await installFakeGoalGateway(page, { sessionRouting: true })
+  await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
+  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.chat-textarea')).toBeEditable({ timeout: 10_000 })
+
+  gateway.emitGoal(goalSnapshot({
+    stateRevision: 2,
+    objective: 'Verify that this active Goal remains usable while the session model routing panel overlaps it across responsive layouts.',
+  }))
+  const goalDock = page.locator('.goal-run-dock')
+  await expect(goalDock).toBeVisible()
+
+  const routingButton = page.getByRole('button', {
+    name: "This chat's model routing",
+    exact: true,
+  })
+  const routingPanel = page.locator('.composer-model-routing')
+
+  for (const viewport of [
+    { width: 1368, height: 546 },
+    { width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize(viewport)
+    await routingButton.click()
+    await expect(routingPanel).toBeVisible()
+
+    await expect.poll(async () => page.evaluate(() => {
+      const panel = document.querySelector<HTMLElement>('.composer-model-routing')
+      const goal = document.querySelector<HTMLElement>('.goal-run-dock')
+      if (!panel || !goal) return 'missing-panel-or-goal'
+      const panelRect = panel.getBoundingClientRect()
+      const goalRect = goal.getBoundingClientRect()
+      const left = Math.max(panelRect.left, goalRect.left)
+      const top = Math.max(panelRect.top, goalRect.top)
+      const right = Math.min(panelRect.right, goalRect.right)
+      const bottom = Math.min(panelRect.bottom, goalRect.bottom)
+      if (right <= left || bottom <= top) return 'no-overlap'
+      const hit = document.elementFromPoint((left + right) / 2, (top + bottom) / 2)
+      if (hit !== null && panel.contains(hit)) return 'routing-panel'
+      return JSON.stringify({
+        hit: hit instanceof HTMLElement ? `${hit.tagName.toLowerCase()}.${hit.className}` : null,
+        goalZIndex: getComputedStyle(goal).zIndex,
+        panelZIndex: getComputedStyle(panel).zIndex,
+        inputBackdropFilter: getComputedStyle(panel.closest('.chat-input-panel')!).backdropFilter,
+      })
+    })).toBe('routing-panel')
+
+    await routingButton.click()
+    await expect(routingPanel).toHaveCount(0)
+    await expect(goalDock).toBeVisible()
+
+    await goalDock.getByRole('button', { name: 'Goal actions', exact: true }).click()
+    const goalMenu = goalDock.getByRole('menu', { name: 'Goal actions', exact: true })
+    await expect(goalMenu).toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(goalMenu).toHaveCount(0)
+  }
+})
+
 test('Goal mode continues through a real Gateway, refresh, and deterministic provider', async ({
   page,
   baseURL,
@@ -469,6 +856,7 @@ test('Goal mode continues through a real Gateway, refresh, and deterministic pro
 
     await page.goto(CONTROL_URL + 'chat')
     await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
+    expectNegotiatedGoalFlow(rpcFrames, gateway.flowEnabled)
     const composer = page.locator('.chat-textarea')
     await expect(composer).toBeEditable({ timeout: 15_000 })
     await composer.fill('/goal')
@@ -642,6 +1030,7 @@ test('Goal mode continues through a real Gateway, refresh, and deterministic pro
     ).toEqual([1, 2, 3])
     const completedCalls = await gateway.readProviderCalls()
     expect(completedCalls[2]?.toolNames).toEqual([])
+    if (gateway.flowEnabled) expect(sentRpcMethods).toContain('transport.flow.update')
   } finally {
     await gateway.stop()
   }
@@ -726,6 +1115,7 @@ test('Goal lifecycle controls preserve the current Task and serialize later cont
 
     await page.goto(CONTROL_URL + 'chat')
     await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
+    expectNegotiatedGoalFlow(rpcFrames, gateway.flowEnabled)
     const composer = page.locator('.chat-textarea')
     await expect(composer).toBeEditable({ timeout: 15_000 })
     await composer.fill('/goal')
@@ -850,7 +1240,375 @@ test('Goal lifecycle controls preserve the current Task and serialize later cont
       .toHaveCount(1)
     await expect.poll(providerCallNumbers).toEqual([1, 2])
     expect(sentRequests('goals.reattach')).toHaveLength(0)
+    if (gateway.flowEnabled) expect(sentRequests('transport.flow.update').length).toBeGreaterThan(0)
   } finally {
     await gateway.stop()
   }
+})
+
+isolatedGatewayTest.describe('Goal silent-reply normalization through an isolated real Gateway', () => {
+  isolatedGatewayTest.use({ isolatedRealGatewayScenario: 'silent-reply' })
+
+  isolatedGatewayTest('keeps protocol sentinels out of live, done, and hydrated UI', async ({
+    page,
+    isolatedRealGateway,
+  }) => {
+    isolatedGatewayTest.setTimeout(120_000)
+    const initialReply = 'The initial Goal turn completed normally.'
+    const mixedBody = 'The deterministic silent-reply body is visible.'
+    const formattedBody = 'The formatted heartbeat body is visible.'
+    type RpcFrame = Record<string, unknown> & { direction: 'sent' | 'received' }
+    const frames: RpcFrame[] = []
+    const socketUrls: string[] = []
+    page.on('websocket', socket => {
+      socketUrls.push(socket.url())
+      socket.on('framesent', ({ payload }) => {
+        try {
+          frames.push({
+            ...(JSON.parse(String(payload)) as Record<string, unknown>),
+            direction: 'sent',
+          })
+        } catch {
+          // Binary/non-JSON frames are outside the RPC contract under test.
+        }
+      })
+      socket.on('framereceived', ({ payload }) => {
+        try {
+          frames.push({
+            ...(JSON.parse(String(payload)) as Record<string, unknown>),
+            direction: 'received',
+          })
+        } catch {
+          // Binary/non-JSON frames are outside the RPC contract under test.
+        }
+      })
+    })
+    const sentRequests = (method: string) => frames.filter(frame => (
+      frame.direction === 'sent' && frame.type === 'req' && frame.method === method
+    ))
+    const responseAfter = (request: RpcFrame) => {
+      const index = frames.indexOf(request)
+      return frames.slice(index + 1).find(frame => (
+        frame.direction === 'received'
+        && frame.type === 'res'
+        && frame.id === request.id
+      ))
+    }
+    const eventPayloads = (event: string) => frames.flatMap(frame => {
+      if (
+        frame.direction !== 'received'
+        || frame.type !== 'event'
+        || frame.event !== event
+        || !frame.payload
+        || typeof frame.payload !== 'object'
+      ) return []
+      return [frame.payload as Record<string, unknown>]
+    })
+    const providerCallNumbers = async () => (
+      (await isolatedRealGateway.readProviderCalls()).map(call => call.callNumber)
+    )
+    const providerWaitingCalls = async () => (
+      (await isolatedRealGateway.readProviderEvents())
+        .filter(event => event.event === 'provider.waiting')
+        .map(event => event.callNumber)
+    )
+    const assertNoProtocolText = async () => {
+      await expect(page.locator('.chat-thread')).not.toContainText('NO_REPLY')
+      await expect(page.locator('.chat-thread')).not.toContainText('HEARTBEAT_OK')
+    }
+    const eventFrameIndex = (
+      event: string,
+      predicate: (payload: Record<string, unknown>) => boolean,
+      startAt = 0,
+    ) => frames.findIndex((frame, index) => {
+      if (
+        index < startAt
+        || frame.direction !== 'received'
+        || frame.type !== 'event'
+        || frame.event !== event
+        || !frame.payload
+        || typeof frame.payload !== 'object'
+      ) return false
+      return predicate(frame.payload as Record<string, unknown>)
+    })
+    const assertCanonicalHistoryPayload = (payload: unknown) => {
+      const serialized = JSON.stringify(payload)
+      expect(serialized).not.toMatch(/NO_REPLY|HEARTBEAT_OK/)
+      const historyMessages = (
+        payload
+        && typeof payload === 'object'
+        && Array.isArray((payload as { messages?: unknown }).messages)
+      ) ? (payload as { messages: Array<Record<string, unknown>> }).messages : []
+      expect(historyMessages.filter(message => message.text === initialReply)).toHaveLength(1)
+      expect(historyMessages.filter(message => message.text === mixedBody)).toHaveLength(1)
+      expect(historyMessages.filter(message => message.text === formattedBody)).toHaveLength(1)
+    }
+    const assertVisibleTurnReceipt = async (
+      body: string,
+      inputTokens: number,
+      outputTokens: number,
+    ) => {
+      const message = page.locator('.msg-ai').filter({ hasText: body })
+      await expect(message).toHaveCount(1)
+      const trigger = message.locator('.msg-meta__more-btn')
+      await expect(trigger).toHaveCount(1)
+      await trigger.click()
+      await expect(trigger).toHaveAttribute('aria-expanded', 'true')
+      const usage = message.locator('.msg-meta-popover')
+      await expect(usage).toBeVisible()
+      await expect(usage).toContainText('qwen3:4b')
+      await expect(usage).toContainText(`↑${inputTokens} ↓${outputTokens}`)
+    }
+
+    await page.goto(`${isolatedRealGateway.controlUrl}chat/new`)
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
+    expectNegotiatedGoalFlow(frames, isolatedRealGateway.flowEnabled)
+    expect(socketUrls).toContain(
+      isolatedRealGateway.webuiOrigin.replace(/^http:/, 'ws:') + '/ws',
+    )
+    expect(socketUrls).not.toContain(isolatedRealGateway.wsUrl)
+
+    const composer = page.locator('.chat-textarea')
+    await expect(composer).toBeEditable({ timeout: 15_000 })
+    await composer.fill('/goal')
+    await expect(page.locator('.chat-slash-item').filter({ hasText: '/goal' }))
+      .toBeVisible({ timeout: 15_000 })
+    await composer.fill(`/goal ${OBJECTIVE}`)
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+
+    // Call 1 is ordinary Goal-set ingress. Call 2 is the first automatic
+    // system event and is held after its raw mixed provider delta, before Done.
+    await expect.poll(providerCallNumbers, { timeout: 30_000 }).toEqual([1, 2])
+    await expect.poll(providerWaitingCalls).toEqual([2])
+    await expect(page.locator('.goal-ribbon')).toBeVisible()
+    await expect(page.locator('.msg-ai').filter({ hasText: initialReply })).toHaveCount(1)
+    await expect(page.locator('.msg-ai').filter({ hasText: mixedBody })).toHaveCount(0)
+    await assertNoProtocolText()
+    // Buffered internal text is not released until it has been normalized at
+    // Done, so neither the raw marker nor the body appears as a premature delta.
+    expect(eventPayloads('session.event.text_delta').map(payload => payload.text))
+      .not.toContain(expect.stringContaining('NO_REPLY'))
+
+    await isolatedRealGateway.releaseFirstTask()
+
+    // Call 2 settles as canonical mixed text; call 3 is pure NO_REPLY and
+    // suppressed; call 4 keeps a body after a formatted HEARTBEAT_OK line;
+    // call 5 then waits before update_goal so this state is reloadable.
+    await expect.poll(providerCallNumbers, { timeout: 30_000 })
+      .toEqual([1, 2, 3, 4, 5])
+    await expect.poll(providerWaitingCalls).toEqual([2, 5])
+    await expect(page.locator('.msg-ai').filter({ hasText: mixedBody })).toHaveCount(1)
+    await expect(page.locator('.msg-ai').filter({ hasText: formattedBody })).toHaveCount(1)
+    await assertNoProtocolText()
+
+    // The pure NO_REPLY turn (call 3) is accounted for by the Goal ledger but
+    // creates no ghost bubble. Every visible turn exposes its own settled usage
+    // through the shared completion receipt, never through the legacy footer.
+    await expect(page.locator('.chat-message-surface .msg-ai')).toHaveCount(3)
+    await assertVisibleTurnReceipt(initialReply, 12, 4)
+    await assertVisibleTurnReceipt(mixedBody, 11, 5)
+    await assertVisibleTurnReceipt(formattedBody, 10, 4)
+
+    const donePayloads = eventPayloads('session.event.done')
+    expect(donePayloads).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        delivery: 'visible',
+        suppression_reason: null,
+        text: mixedBody,
+        text_snapshot: mixedBody,
+        input_mode: 'system_event',
+        run_kind: 'goal',
+      }),
+      expect.objectContaining({
+        delivery: 'suppressed',
+        suppression_reason: 'no_reply',
+        text: '',
+        text_snapshot: '',
+        input_mode: 'system_event',
+        run_kind: 'goal',
+      }),
+      expect.objectContaining({
+        delivery: 'visible',
+        suppression_reason: null,
+        text: formattedBody,
+        text_snapshot: formattedBody,
+        input_mode: 'system_event',
+        run_kind: 'goal',
+      }),
+    ]))
+    for (const payload of eventPayloads('session.event.text_delta')) {
+      expect(String(payload.text || '')).not.toMatch(/NO_REPLY|HEARTBEAT_OK/)
+    }
+    const mixedDeltaIndex = eventFrameIndex(
+      'session.event.text_delta',
+      payload => String(payload.text || '').includes(mixedBody),
+    )
+    const mixedDoneIndex = eventFrameIndex(
+      'session.event.done',
+      payload => payload.text_snapshot === mixedBody,
+      mixedDeltaIndex + 1,
+    )
+    const formattedDeltaIndex = eventFrameIndex(
+      'session.event.text_delta',
+      payload => String(payload.text || '').includes(formattedBody),
+    )
+    const formattedDoneIndex = eventFrameIndex(
+      'session.event.done',
+      payload => payload.text_snapshot === formattedBody,
+      formattedDeltaIndex + 1,
+    )
+    expect(mixedDeltaIndex).toBeGreaterThanOrEqual(0)
+    expect(mixedDoneIndex).toBeGreaterThan(mixedDeltaIndex)
+    expect(formattedDeltaIndex).toBeGreaterThanOrEqual(0)
+    expect(formattedDoneIndex).toBeGreaterThan(formattedDeltaIndex)
+
+    const callsBeforeCompletion = await isolatedRealGateway.readProviderCalls()
+    expect(callsBeforeCompletion[1]).toMatchObject({
+      callNumber: 2,
+      requestHasInternalContinuation: true,
+    })
+    expect(callsBeforeCompletion[4]).toMatchObject({
+      callNumber: 5,
+      historyHasSilentSentinel: false,
+      silentVisibleBodyInAssistantHistory: true,
+    })
+
+    // A new real socket hydrates the SQLite transcript while call 5 remains
+    // gated. Canonical bodies render once and neither suppressed turn grows a
+    // ghost assistant row.
+    const hydrateCountBeforeReload = sentRequests('sessions.messages.hydrate').length
+    const historyCountBeforeReload = sentRequests('chat.history').length
+    const socketCountBeforeReload = socketUrls.length
+    await page.reload()
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
+    await expect.poll(() => socketUrls.length, { timeout: 15_000 })
+      .toBeGreaterThan(socketCountBeforeReload)
+    await expect.poll(
+      () => sentRequests('sessions.messages.hydrate').length,
+      { timeout: 15_000 },
+    ).toBeGreaterThan(hydrateCountBeforeReload)
+    await expect.poll(
+      () => sentRequests('chat.history').length,
+      { timeout: 15_000 },
+    ).toBeGreaterThan(historyCountBeforeReload)
+    const hydrateRequest = sentRequests('sessions.messages.hydrate').at(-1)!
+    await expect.poll(() => Boolean(responseAfter(hydrateRequest)), { timeout: 15_000 })
+      .toBe(true)
+    expect(responseAfter(hydrateRequest)?.payload).toMatchObject({
+      hydration_complete: true,
+    })
+    expect(JSON.stringify(responseAfter(hydrateRequest)?.payload))
+      .not.toMatch(/NO_REPLY|HEARTBEAT_OK/)
+    const historyRequest = sentRequests('chat.history').at(-1)!
+    await expect.poll(() => Boolean(responseAfter(historyRequest)), { timeout: 15_000 })
+      .toBe(true)
+    assertCanonicalHistoryPayload(responseAfter(historyRequest)?.payload)
+    await expect(page.locator('.msg-ai').filter({ hasText: initialReply })).toHaveCount(1)
+    await expect(page.locator('.msg-ai').filter({ hasText: mixedBody })).toHaveCount(1)
+    await expect(page.locator('.msg-ai').filter({ hasText: formattedBody })).toHaveCount(1)
+    await expect(page.locator('.chat-message-surface .msg-ai')).toHaveCount(3)
+    await assertVisibleTurnReceipt(initialReply, 12, 4)
+    await assertVisibleTurnReceipt(mixedBody, 11, 5)
+    await assertVisibleTurnReceipt(formattedBody, 10, 4)
+    await assertNoProtocolText()
+
+    await isolatedRealGateway.releaseSecondTask()
+    await expect.poll(providerCallNumbers, { timeout: 30_000 })
+      .toEqual([1, 2, 3, 4, 5, 6])
+    await expect(page.locator('.goal-ribbon')).toHaveCount(0, { timeout: 30_000 })
+    const outcome = page.locator('.goal-outcome').last()
+    await expect(outcome).toBeVisible({ timeout: 30_000 })
+    await expect(outcome).toContainText('Goal achieved')
+    await assertNoProtocolText()
+    await expect(page.locator('.msg-ai').filter({ hasText: mixedBody })).toHaveCount(1)
+    await expect(page.locator('.msg-ai').filter({ hasText: formattedBody })).toHaveCount(1)
+
+    await expect.poll(() => eventPayloads('session.event.done').some(payload => (
+      payload.delivery === 'suppressed'
+      && payload.suppression_reason === 'heartbeat_ack'
+      && payload.text === ''
+      && payload.text_snapshot === ''
+    )), { timeout: 15_000 }).toBe(true)
+    let terminalGoal: Record<string, unknown> | null = null
+    await expect.poll(() => {
+      terminalGoal = eventPayloads('session.event.goal')
+        .map(payload => payload.goal)
+        .filter((goal): goal is Record<string, unknown> => (
+          Boolean(goal) && typeof goal === 'object'
+        ))
+        .filter(goal => goal.status === 'complete')
+        .at(-1) ?? null
+      return Boolean(terminalGoal)
+    }, { timeout: 15_000 }).toBe(true)
+    expect(terminalGoal?.objective).toBe(OBJECTIVE)
+    const terminalUsage = terminalGoal?.usage as Record<string, unknown> | undefined
+    const terminalTurns = Number(
+      terminalGoal?.turnsSettled ?? terminalGoal?.turns_settled ?? 0,
+    )
+    const terminalTokens = Number(
+      terminalUsage?.totalTokens ?? terminalUsage?.total_tokens ?? 0,
+    )
+    const uniqueDoneByTask = new Map<string, Record<string, unknown>>()
+    for (const payload of eventPayloads('session.event.done')) {
+      const taskId = String(payload.task_id ?? payload.taskId ?? '')
+      expect(taskId).not.toBe('')
+      uniqueDoneByTask.set(taskId, payload)
+    }
+    const allSettledProviderTokens = [...uniqueDoneByTask.values()].reduce(
+      (sum, payload) => sum
+        + Number(payload.input_tokens ?? payload.inputTokens ?? 0)
+        + Number(payload.output_tokens ?? payload.outputTokens ?? 0),
+      0,
+    )
+    expect(terminalTurns).toBeGreaterThan(0)
+    expect(terminalTokens).toBe(allSettledProviderTokens)
+    // The visible text receipts account for 46 tokens. The larger Goal total
+    // proves that suppressed and tool-only work remains in the billing ledger.
+    expect(terminalTokens).toBeGreaterThan(46)
+    await expect(outcome).toContainText(`${terminalTurns} turns`)
+    await expect(outcome).toContainText(`${terminalTokens} tokens`)
+
+    const completedCalls = await isolatedRealGateway.readProviderCalls()
+    expect(completedCalls[5]).toMatchObject({
+      callNumber: 6,
+      toolNames: [],
+      historyHasSilentSentinel: false,
+      silentVisibleBodyInAssistantHistory: true,
+    })
+
+    // Terminal refresh exercises the persisted fallback Goal outcome as well
+    // as the sanitized transcript one final time.
+    const finalHydrateCount = sentRequests('sessions.messages.hydrate').length
+    const finalHistoryCount = sentRequests('chat.history').length
+    const finalSocketCount = socketUrls.length
+    await page.reload()
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
+    await expect.poll(() => socketUrls.length, { timeout: 15_000 })
+      .toBeGreaterThan(finalSocketCount)
+    await expect.poll(() => sentRequests('sessions.messages.hydrate').length, {
+      timeout: 15_000,
+    }).toBeGreaterThan(finalHydrateCount)
+    await expect.poll(() => sentRequests('chat.history').length, { timeout: 15_000 })
+      .toBeGreaterThan(finalHistoryCount)
+    const terminalHydrateRequest = sentRequests('sessions.messages.hydrate').at(-1)!
+    const terminalHistoryRequest = sentRequests('chat.history').at(-1)!
+    await expect.poll(
+      () => Boolean(responseAfter(terminalHydrateRequest)),
+      { timeout: 15_000 },
+    ).toBe(true)
+    await expect.poll(
+      () => Boolean(responseAfter(terminalHistoryRequest)),
+      { timeout: 15_000 },
+    ).toBe(true)
+    expect(JSON.stringify(responseAfter(terminalHydrateRequest)?.payload))
+      .not.toMatch(/NO_REPLY|HEARTBEAT_OK/)
+    assertCanonicalHistoryPayload(responseAfter(terminalHistoryRequest)?.payload)
+    await expect(page.locator('.msg-ai').filter({ hasText: mixedBody })).toHaveCount(1)
+    await expect(page.locator('.msg-ai').filter({ hasText: formattedBody })).toHaveCount(1)
+    const hydratedOutcome = page.locator('.goal-outcome').last()
+    await expect(hydratedOutcome).toBeVisible({ timeout: 15_000 })
+    await expect(hydratedOutcome).toContainText(`${terminalTurns} turns`)
+    await expect(hydratedOutcome).toContainText(`${terminalTokens} tokens`)
+    await assertNoProtocolText()
+  })
 })

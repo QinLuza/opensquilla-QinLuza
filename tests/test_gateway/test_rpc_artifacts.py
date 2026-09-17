@@ -12,6 +12,7 @@ from PIL import Image
 
 import opensquilla.gateway.rpc_artifacts as rpc_artifacts
 from opensquilla.artifacts import ArtifactStore
+from opensquilla.contracts.generated.v4.artifacts_list import ArtifactsListResult
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.guest_rpc_policy import guest_owned_session_key
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher, validate_classification
@@ -105,6 +106,7 @@ async def test_artifacts_list_pages_latest_metadata_and_gets_one(
     assert newest.payload["page_size"] == 2
     assert newest.payload["oldest_cursor"] == refs[1].id
     assert newest.payload["newest_cursor"] == refs[2].id
+    assert ArtifactsListResult.model_validate(newest.payload).total_count == 3
 
     older = await get_dispatcher().dispatch(
         "list-older",
@@ -121,6 +123,7 @@ async def test_artifacts_list_pages_latest_metadata_and_gets_one(
     assert [item["id"] for item in older.payload["artifacts"]] == [refs[0].id]
     assert older.payload["has_more"] is False
     assert older.payload["total_count"] == 3
+    assert ArtifactsListResult.model_validate(older.payload).page_size == 2
 
     fetched = await get_dispatcher().dispatch(
         "get-one",
@@ -329,7 +332,8 @@ async def test_artifact_rpc_offloads_store_reads_to_threads(
     calls: list[str] = []
 
     async def _record_to_thread(func, /, *args, **kwargs):
-        calls.append(func.__name__)
+        if isinstance(getattr(func, "__self__", None), ArtifactStore):
+            calls.append(func.__name__)
         return await original_to_thread(func, *args, **kwargs)
 
     monkeypatch.setattr(rpc_artifacts.asyncio, "to_thread", _record_to_thread)
@@ -365,9 +369,10 @@ async def test_artifacts_list_hides_directory_errors_as_retryable_unavailable(
     )
 
     assert result.error is not None
-    assert result.error.code == "UNAVAILABLE"
+    assert result.error.code == "DOCUMENT_UNAVAILABLE"
     assert result.error.retryable is True
-    assert result.error.message == "Artifact storage is temporarily unavailable."
+    assert result.error.accepted is False
+    assert result.error.message == "This page is temporarily unavailable. Try again."
     assert sensitive_path not in result.error.message
 
 
@@ -402,9 +407,10 @@ async def test_artifacts_get_hides_directory_errors_as_retryable_unavailable(
     )
 
     assert result.error is not None
-    assert result.error.code == "UNAVAILABLE"
+    assert result.error.code == "DOCUMENT_UNAVAILABLE"
     assert result.error.retryable is True
-    assert result.error.message == "Artifact storage is temporarily unavailable."
+    assert result.error.accepted is False
+    assert result.error.message == "This page is temporarily unavailable. Try again."
     assert sensitive_path not in result.error.message
 
 

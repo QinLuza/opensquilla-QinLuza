@@ -197,6 +197,17 @@ def test_models_list_table_warns_about_provider_listing_errors(monkeypatch):
     assert "auth_invalid" in result.stderr
 
 
+def test_config_port_docs_use_public_top_level_key() -> None:
+    root = Path(__file__).resolve().parents[2]
+    expected = "opensquilla config set port 18791"
+    invalid = "opensquilla config set gateway.port"
+
+    for relative_path in ("docs/cli.md", "README.product.md"):
+        text = (root / relative_path).read_text(encoding="utf-8")
+        assert expected in text, relative_path
+        assert invalid not in text, relative_path
+
+
 def test_config_get_honors_env_path_and_redacts(tmp_path: Path, monkeypatch):
     target = tmp_path / "opensquilla.toml"
     target.write_text(
@@ -338,6 +349,41 @@ def test_config_set_legacy_ensemble_toggle_persists_canonical_router_mode(
     assert reloaded.llm_ensemble.enabled is True
     assert reloaded.squilla_router.enabled is True
     assert reloaded.squilla_router.rollout_phase == "full"
+    assert all(
+        tier["provider"] == reloaded.llm.provider
+        for tier in reloaded.squilla_router.tiers.values()
+    )
+
+
+def test_config_set_ensemble_toggle_rejects_custom_foreign_router_without_writes(
+    tmp_path: Path,
+) -> None:
+    from opensquilla.onboarding.router_policy import RouterProviderConflictError
+
+    target = tmp_path / "custom-routing.toml"
+    original = '\n'.join([
+        '[llm]',
+        'provider = "tokenrhythm"',
+        '[llm_ensemble]',
+        'enabled = false',
+        'selection_mode = "router_dynamic"',
+        '[squilla_router]',
+        'enabled = false',
+        'preset_binding = "custom"',
+        '[squilla_router.tiers.c1]',
+        'provider = "openrouter"',
+        'model = "synthetic-model"',
+        '',
+    ])
+    target.write_text(original, encoding="utf-8")
+
+    result = runner.invoke(
+        app, ["config", "set", "llm_ensemble.enabled", "true", "--config", str(target)]
+    )
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, RouterProviderConflictError)
+    assert target.read_text(encoding="utf-8") == original
 
 
 def test_config_set_get_privacy_network_observability_round_trips(tmp_path: Path):
@@ -935,6 +981,19 @@ def test_sessions_list_json_filters_client_side(monkeypatch):
     assert payload["sessions"][0]["key"] == "a"
 
 
+def test_sessions_list_rejects_negative_limit_before_gateway_call(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+
+    result = runner.invoke(app, ["sessions", "list", "--limit", "-1", "--json"])
+
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    payload = json.loads(result.stderr)
+    assert payload["error"]["code"] == "INVALID_REQUEST"
+    assert "--limit must be >= 1" in payload["error"]["message"]
+    assert fake.calls == []
+
+
 def test_sessions_list_uses_active_profile_managed_gateway_runtime_port(
     tmp_path: Path,
     monkeypatch,
@@ -1266,112 +1325,14 @@ def test_memory_search_and_show_use_gateway_rpcs(monkeypatch):
     ) in fake.calls
 
 
-def test_memory_index_raw_fallback_and_repair_commands_use_admin_rpcs(monkeypatch):
+def test_memory_index_command_uses_admin_rpc(monkeypatch):
     fake = _install_fake_gateway(monkeypatch)
-    fake.rpc_payloads = {
-        "memory.index": {"agentId": "main", "force": True},
-        "memory.raw_fallbacks.list": {
-            "agentId": "main",
-            "count": 1,
-            "files": [{"path": "memory/.raw_fallbacks/raw.md", "sizeBytes": 12}],
-        },
-        "memory.raw_fallbacks.show": {
-            "agentId": "main",
-            "path": "memory/.raw_fallbacks/raw.md",
-            "fromLine": 1,
-            "lineCount": 1,
-            "truncated": False,
-            "content": "raw",
-        },
-        "memory.repair.list": {
-            "agentId": "main",
-            "count": 1,
-            "items": [
-                {
-                    "summaryId": 7,
-                    "sessionKey": "agent:main:thread-1",
-                    "compactionId": "cmp-1",
-                    "flushReceiptStatus": "degraded_forensic",
-                }
-            ],
-        },
-        "memory.repair.show": {
-            "agentId": "main",
-            "sessionKey": "agent:main:thread-1",
-            "compactionId": "cmp-1",
-            "entries": [{"role": "user", "content": "preimage fact"}],
-        },
-        "memory.repair.run": {
-            "agentId": "main",
-            "count": 1,
-            "results": [{"compactionId": "cmp-1", "status": "repaired"}],
-        },
-    }
+    fake.rpc_payloads = {"memory.index": {"agentId": "main", "force": True}}
 
     index = runner.invoke(app, ["memory", "index", "--agent", "main", "--force", "--json"])
-    listed = runner.invoke(app, ["memory", "raw-fallbacks", "list", "--json"])
-    shown = runner.invoke(
-        app,
-        ["memory", "raw-fallbacks", "show", "memory/.raw_fallbacks/raw.md", "--json"],
-    )
-    repair_listed = runner.invoke(app, ["memory", "repair", "list", "--json"])
-    repair_shown = runner.invoke(
-        app,
-        [
-            "memory",
-            "repair",
-            "show",
-            "--session-key",
-            "agent:main:thread-1",
-            "--compaction-id",
-            "cmp-1",
-            "--json",
-        ],
-    )
-    repair_run = runner.invoke(
-        app,
-        [
-            "memory",
-            "repair",
-            "run",
-            "--session-key",
-            "agent:main:thread-1",
-            "--compaction-id",
-            "cmp-1",
-            "--json",
-        ],
-    )
 
     assert index.exit_code == 0, index.stdout
-    assert listed.exit_code == 0, listed.stdout
-    assert shown.exit_code == 0, shown.stdout
-    assert repair_listed.exit_code == 0, repair_listed.stdout
-    assert repair_shown.exit_code == 0, repair_shown.stdout
-    assert repair_run.exit_code == 0, repair_run.stdout
     assert ("memory.index", {"agentId": "main", "force": True}) in fake.calls
-    assert ("memory.raw_fallbacks.list", {"agentId": "main"}) in fake.calls
-    assert (
-        "memory.raw_fallbacks.show",
-        {"path": "memory/.raw_fallbacks/raw.md", "agentId": "main"},
-    ) in fake.calls
-    assert ("memory.repair.list", {"agentId": "main", "limit": 50}) in fake.calls
-    assert (
-        "memory.repair.show",
-        {
-            "agentId": "main",
-            "sessionKey": "agent:main:thread-1",
-            "compactionId": "cmp-1",
-        },
-    ) in fake.calls
-    assert (
-        "memory.repair.run",
-        {
-            "agentId": "main",
-            "limit": 50,
-            "sessionKey": "agent:main:thread-1",
-            "compactionId": "cmp-1",
-        },
-    ) in fake.calls
 
 
 def test_cron_run_requires_confirmation_before_gateway_call(monkeypatch):
@@ -1396,12 +1357,28 @@ def test_cron_run_yes_calls_existing_rpc(monkeypatch):
     assert ("cron.run", {"id": "job-1"}) in fake.calls
 
 
+def test_cron_runs_rejects_negative_limit_before_gateway_call(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+
+    result = runner.invoke(
+        app,
+        ["cron", "runs", "job-1", "--limit", "-1", "--json"],
+    )
+
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    payload = json.loads(result.stderr)
+    assert payload["error"]["code"] == "INVALID_REQUEST"
+    assert "--limit must be >= 1" in payload["error"]["message"]
+    assert fake.calls == []
+
+
 def test_cron_commands_use_existing_rpc_payloads(monkeypatch):
     fake = _install_fake_gateway(monkeypatch)
     fake.rpc_payloads = {
         "cron.list": [{"id": "job-1", "name": "Daily", "agentId": "main"}],
         "cron.status": {"id": "job-1", "name": "Daily"},
-        "cron.add": {"id": "job-2", "expression": "*/5 * * * *"},
+        "cron.create": {"id": "job-2", "expression": "*/5 * * * *"},
         "cron.update": {"id": "job-1", "enabled": False},
         "cron.runs": [{"id": "run-1", "status": "ok"}],
     }
@@ -1437,7 +1414,7 @@ def test_cron_commands_use_existing_rpc_payloads(monkeypatch):
     assert ("cron.list", {"agentId": "main"}) in fake.calls
     assert ("cron.status", {"id": "job-1"}) in fake.calls
     assert (
-        "cron.add",
+        "cron.create",
         {
             "expression": "*/5 * * * *",
             "text": "check in",
@@ -1577,6 +1554,174 @@ def test_cost_json_returns_gateway_payload(monkeypatch):
     assert ("usage.cost", {}) in fake.calls
 
 
+def test_cost_by_model_uses_routed_model_breakdown(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+    fake.cost_payload = {
+        "breakdown": [
+            {
+                "session": "agent:webchat:routed",
+                "model": "unknown",
+                "inputTokens": 30,
+                "outputTokens": 3,
+                "costUsd": 0.03,
+                "modelBreakdown": [
+                    {
+                        "model": "deepseek-v4-flash",
+                        "inputTokens": 10,
+                        "outputTokens": 1,
+                        "costUsd": 0.01,
+                    },
+                    {
+                        "model": "deepseek-v4-pro",
+                        "inputTokens": 20,
+                        "outputTokens": 2,
+                        "costUsd": 0.02,
+                    },
+                ],
+            }
+        ],
+        "totalCostUsd": 0.03,
+    }
+
+    result = runner.invoke(app, ["cost", "--by-model", "--json"])
+
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout)["byModel"] == [
+        {
+            "model": "deepseek-v4-flash",
+            "inputTokens": 10,
+            "outputTokens": 1,
+            "costUsd": 0.01,
+        },
+        {
+            "model": "deepseek-v4-pro",
+            "inputTokens": 20,
+            "outputTokens": 2,
+            "costUsd": 0.02,
+        },
+    ]
+
+
+def test_cost_by_model_prefers_deployment_breakdown(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+    fake.cost_payload = {
+        "breakdown": [
+            {
+                "session": "agent:webchat:multi-provider",
+                "model": "gpt-4o",
+                "inputTokens": 2_000_000,
+                "outputTokens": 0,
+                "costUsd": 2.5,
+                "modelBreakdown": [
+                    {
+                        "model": "gpt-4o",
+                        "inputTokens": 2_000_000,
+                        "outputTokens": 0,
+                        "costUsd": 0.0,
+                    }
+                ],
+                "deploymentBreakdown": [
+                    {
+                        "provider": "openai",
+                        "model": "gpt-4o",
+                        "inputTokens": 1_000_000,
+                        "outputTokens": 0,
+                        "costUsd": 2.5,
+                    },
+                    {
+                        "provider": "ollama",
+                        "model": "gpt-4o",
+                        "inputTokens": 1_000_000,
+                        "outputTokens": 0,
+                        "costUsd": 0.0,
+                    },
+                ],
+            }
+        ],
+        "totalCostUsd": 2.5,
+    }
+
+    result = runner.invoke(app, ["cost", "--by-model", "--json"])
+
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout)["byModel"] == [
+        {
+            "model": "gpt-4o",
+            "inputTokens": 2_000_000,
+            "outputTokens": 0,
+            "costUsd": 2.5,
+        }
+    ]
+
+
+def test_cost_by_model_falls_back_when_breakdown_is_partial(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+    fake.cost_payload = {
+        "breakdown": [
+            {
+                "session": "agent:webchat:resumed",
+                "model": "post-restart-model",
+                "inputTokens": 1_010,
+                "outputTokens": 101,
+                "costUsd": 0.11,
+                "deploymentBreakdown": [
+                    {
+                        "provider": "openai",
+                        "model": "post-restart-model",
+                        "inputTokens": 10,
+                        "outputTokens": 1,
+                        "costUsd": 0.01,
+                    }
+                ],
+            }
+        ],
+        "totalCostUsd": 0.11,
+    }
+
+    result = runner.invoke(app, ["cost", "--by-model", "--json"])
+
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout) == {
+        "byModel": [
+            {
+                "model": "unknown",
+                "inputTokens": 1_010,
+                "outputTokens": 101,
+                "costUsd": 0.11,
+            }
+        ],
+        "totalCostUsd": 0.11,
+    }
+
+
+def test_cost_by_model_preserves_legacy_row_fallback(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+    fake.cost_payload = {
+        "breakdown": [
+            {
+                "session": "agent:webchat:legacy",
+                "model": "legacy-model",
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "cost_usd": 0.1,
+            }
+        ],
+        "totalCostUsd": 0.1,
+    }
+
+    result = runner.invoke(app, ["cost", "--by-model", "--json"])
+
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout)["byModel"] == [
+        {
+            "model": "legacy-model",
+            "inputTokens": 10,
+            "outputTokens": 2,
+            "costUsd": 0.1,
+        }
+    ]
+
+
 def test_provider_and_search_diagnostics_use_gateway_rpcs(monkeypatch):
     fake = _install_fake_gateway(monkeypatch)
     fake.rpc_payloads = {
@@ -1612,6 +1757,31 @@ def test_provider_and_search_diagnostics_use_gateway_rpcs(monkeypatch):
         "search.query",
         {"query": "hello", "provider": "duckduckgo", "limit": 2},
     ) in fake.calls
+
+
+def test_search_status_text_reports_blocked_network_precondition(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+    reason = (
+        "NetworkMode.PROXY_ALLOWLIST requires Run Context grants to run "
+        "in-process network tools through the managed proxy."
+    )
+    fake.rpc_payloads = {
+        "search.status": {
+            "activeProvider": "duckduckgo",
+            "provider": "duckduckgo",
+            "configured": True,
+            "buildable": True,
+            "networkReady": False,
+            "networkBlockedReason": reason,
+        }
+    }
+
+    result = runner.invoke(app, ["search", "status"])
+
+    assert result.exit_code == 0, result.stdout
+    assert "blocked" in result.stdout
+    assert reason in " ".join(result.stdout.split())
+    assert ("search.status", {}) in fake.calls
 
 
 def test_search_query_json_exits_nonzero_on_diagnostic_failure(monkeypatch):

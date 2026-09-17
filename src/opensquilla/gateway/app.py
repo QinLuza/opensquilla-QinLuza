@@ -18,6 +18,9 @@ from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket
 
 from opensquilla import __version__
+from opensquilla.contracts.generated.v4.sessions_list_metadata import (
+    SESSIONS_LIST_METHOD,
+)
 from opensquilla.gateway.approval_events import build_approval_snapshot_item
 from opensquilla.gateway.approval_queue import get_approval_queue
 from opensquilla.gateway.config import GatewayConfig
@@ -77,7 +80,6 @@ def create_gateway_app(
     cron_scheduler: Any = None,
     turn_runner: Any = None,
     task_runtime: Any = None,
-    flush_service: Any = None,
     heartbeat_service: Any = None,
     heartbeat_loop: Any = None,
     agent_registry: Any = None,
@@ -89,6 +91,7 @@ def create_gateway_app(
     extra_routes: list[Route] | None = None,
     prompt_cache_keepalive_service: Any = None,
     skill_management_service: Any = None,
+    sandbox_upgrade_report: dict[str, object] | None = None,
 ) -> Starlette:
     """Build and return the Starlette ASGI application."""
     if diagnostics_state is None:
@@ -105,7 +108,7 @@ def create_gateway_app(
         if result.error is None:
             return default
         code = result.error.code
-        if code == "INVALID_REQUEST":
+        if code in {"INVALID_PARAMS", "INVALID_REQUEST"}:
             return 400
         if code == "UNAUTHORIZED":
             return 403
@@ -195,7 +198,15 @@ def create_gateway_app(
         view = request.query_params.get("view")
         if view:
             params["view"] = view
-        result = await dispatcher.dispatch("_http", "sessions.list", params or None, ctx)
+        cursor = request.query_params.get("cursor")
+        if cursor is not None:
+            params["cursor"] = cursor
+        result = await dispatcher.dispatch(
+            "_http",
+            SESSIONS_LIST_METHOD,
+            params or None,
+            ctx,
+        )
         if result.ok:
             return _with_http_guest_cookie(
                 request,
@@ -254,6 +265,7 @@ def create_gateway_app(
                 "status": "running",
                 "provider": provider_name,
                 "auth_mode": config.auth.mode,
+                "sandboxUpgrade": sandbox_upgrade_report,
             }
         )
 
@@ -481,11 +493,12 @@ def create_gateway_app(
             meta_run_writer=meta_run_writer,
             skill_loader=skill_loader,
             skill_management_service=skill_management_service,
-            skill_management_state=skill_management_state or {},
+            skill_management_state=(
+                skill_management_state if skill_management_state is not None else {}
+            ),
             cron_scheduler=cron_scheduler,
             turn_runner=turn_runner,
             task_runtime=task_runtime,
-            flush_service=flush_service,
             heartbeat_service=heartbeat_service,
             heartbeat_loop=heartbeat_loop,
             prompt_cache_keepalive_service=prompt_cache_keepalive_service,
@@ -495,6 +508,11 @@ def create_gateway_app(
             memory_managers=memory_managers or {},
             memory_stores=memory_stores or {},
             memory_retrievers=memory_retrievers or {},
+            artifact_preview_service=getattr(
+                app.state,
+                "artifact_preview_service",
+                None,
+            ),
         )
 
     async def api_channels_status(request: Request) -> JSONResponse:
@@ -745,11 +763,12 @@ def create_gateway_app(
             usage_event_sink=usage_event_sink,
             meta_run_writer=meta_run_writer,
             skill_loader=skill_loader,
-            skill_management_state=skill_management_state or {},
+            skill_management_state=(
+                skill_management_state if skill_management_state is not None else {}
+            ),
             cron_scheduler=cron_scheduler,
             turn_runner=turn_runner,
             task_runtime=task_runtime,
-            flush_service=flush_service,
             heartbeat_service=heartbeat_service,
             heartbeat_loop=heartbeat_loop,
             agent_registry=agent_registry,
@@ -760,6 +779,11 @@ def create_gateway_app(
             memory_retrievers=memory_retrievers,
             prompt_cache_keepalive_service=prompt_cache_keepalive_service,
             skill_management_service=skill_management_service,
+            artifact_preview_service=getattr(
+                app.state,
+                "artifact_preview_service",
+                None,
+            ),
         )
 
     # ── Routes ───────────────────────────────────────────────────────────────

@@ -109,6 +109,14 @@ def _make_storage() -> Any:
     return storage
 
 
+
+
+
+
+
+
+
+
 def _make_runtime(
     turn_handler: Callable[..., Awaitable[Any]] | None = None,
     max_concurrency: int = 4,
@@ -677,7 +685,7 @@ async def test_cancel_plan_run_stops_the_implementation_task(
             is_owner=True,
             authenticated=True,
         ),
-        config=GatewayConfig(memory={"flush_enabled": False}),
+        config=GatewayConfig(memory={}),
         task_runtime=rt,
     )
     ctx.session_manager = manager
@@ -724,6 +732,39 @@ async def test_terminal_expires_pending_approvals_for_owning_session(
     handle = await rt.enqueue(env, "hello")
     await rt.wait(handle.task_id, timeout=2.0)
 
+    queue.expire_pending_for_session.assert_called_once_with(env.session_key)
+
+
+@pytest.mark.asyncio
+async def test_prestart_queued_cancel_preserves_running_owner_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = MagicMock()
+    monkeypatch.setattr(
+        "opensquilla.application.approval_queue.get_approval_queue",
+        lambda: queue,
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _handler(run: Any) -> None:
+        if run.message == "running":
+            started.set()
+            await release.wait()
+
+    rt = _make_runtime(turn_handler=_handler, max_concurrency=1)
+    env = _make_envelope("agent-1::approval-running-owner")
+    running = await rt.enqueue(env, "running")
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    queued = await rt.enqueue(env, "queued")
+
+    assert await rt.cancel(task_id=queued.task_id, source="webui_stop") == 1
+    queued_record = await rt.wait(queued.task_id, timeout=2.0)
+    assert queued_record.status is AgentTaskStatus.CANCELLED
+    queue.expire_pending_for_session.assert_not_called()
+
+    release.set()
+    await rt.wait(running.task_id, timeout=2.0)
     queue.expire_pending_for_session.assert_called_once_with(env.session_key)
 
 
@@ -2000,6 +2041,210 @@ async def test_undrained_late_steer_is_promoted_to_followup() -> None:
 
 
 @pytest.mark.asyncio
+async def test_late_steer_commit_precedes_session_routing_set() -> None:
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    followup_seen = asyncio.Event()
+    promotion_committed = asyncio.Event()
+    release_promotion_commit = asyncio.Event()
+    setting_entered = asyncio.Event()
+    current_mode = "direct"
+    seen: list[tuple[str, str | None]] = []
+    committed_audits: list[dict[str, Any]] = []
+    promoted_task_ids: list[str] = []
+
+    def accepted_config(*, session_key: str, run_kind: str) -> Any:
+        assert session_key == "agent-1::steer-routing-linearization"
+        assert run_kind == "session_turn"
+        return SimpleNamespace(
+            squilla_router=SimpleNamespace(
+                enabled=current_mode == "router",
+                rollout_phase="enforce" if current_mode == "router" else "observe",
+            ),
+            llm_ensemble=SimpleNamespace(enabled=False, selection_mode=""),
+            session_mode=current_mode,
+            session_routing_revision=1 if current_mode == "direct" else 2,
+            session_routing_source="session_override",
+        )
+
+    async def handler(run: Any) -> None:
+        seen.append((run.message, getattr(run.accepted_config, "session_mode", None)))
+        if run.message == "first":
+            first_started.set()
+            await release_first.wait()
+            return
+        followup_seen.set()
+
+    storage = _make_storage()
+    create_agent_task = storage.create_agent_task
+
+    async def create_with_blocked_promotion_return(record: AgentTaskRecord) -> None:
+        details = record.details if isinstance(record.details, dict) else {}
+        metadata = details.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("steer_restart_recovery") is True:
+            # The durable boundary has crossed, but the runtime has not yet
+            # activated the promoted task or returned its admission gate.
+            await create_agent_task(record)
+            committed_audits.append(dict(details["accepted_model_routing"]))
+            promoted_task_ids.append(record.task_id)
+            promotion_committed.set()
+            await release_promotion_commit.wait()
+            return
+        await create_agent_task(record)
+
+    storage.create_agent_task = create_with_blocked_promotion_return
+    runtime = TaskRuntime(
+        storage=storage,
+        turn_handler=handler,
+        accepted_config_provider=accepted_config,
+    )
+    envelope = _make_envelope("agent-1::steer-routing-linearization")
+    first = await runtime.enqueue(
+        envelope,
+        "first",
+        run_kind="session_turn",
+    )
+    await asyncio.wait_for(first_started.wait(), timeout=2.0)
+    assert await runtime.steer(
+        envelope.session_key,
+        "late correction",
+        persisted_user_message_id="message-routing-linearization",
+    ) == first.task_id
+
+    release_first.set()
+    await asyncio.wait_for(promotion_committed.wait(), timeout=2.0)
+
+    async def set_session_mode() -> None:
+        nonlocal current_mode
+        async with runtime.collect_admission(envelope.session_key):
+            setting_entered.set()
+            current_mode = "router"
+
+    setting = asyncio.create_task(set_session_mode())
+    await asyncio.sleep(0)
+    assert setting_entered.is_set() is False
+    assert committed_audits[0]["effective_mode"] == "direct"
+    assert committed_audits[0]["session_revision"] == 1
+
+    release_promotion_commit.set()
+    await asyncio.wait_for(setting, timeout=2.0)
+    await runtime.wait(first.task_id, timeout=2.0)
+    await asyncio.wait_for(followup_seen.wait(), timeout=2.0)
+    await runtime.wait(promoted_task_ids[0], timeout=2.0)
+
+    assert seen == [("first", "direct"), ("late correction", "direct")]
+
+
+@pytest.mark.asyncio
+async def test_terminal_waits_for_late_steer_handoff_and_publishes_in_order() -> None:
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    promotion_started = asyncio.Event()
+    release_promotion = asyncio.Event()
+    followup_seen = asyncio.Event()
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    async def _handler(run: Any) -> None:
+        if run.message == "first":
+            first_started.set()
+            await release_first.wait()
+            return
+        followup_seen.set()
+
+    async def _emit(_session_key: str, name: str, payload: dict[str, Any]) -> None:
+        events.append((name, payload))
+
+    storage = _make_storage()
+    create_agent_task = storage.create_agent_task
+
+    async def _create_with_blocked_handoff(record: AgentTaskRecord) -> None:
+        details = record.details if isinstance(record.details, dict) else {}
+        metadata = details.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("steer_restart_recovery") is True:
+            promotion_started.set()
+            await release_promotion.wait()
+        await create_agent_task(record)
+
+    storage.create_agent_task = _create_with_blocked_handoff
+    runtime = TaskRuntime(
+        storage=storage,
+        turn_handler=_handler,
+        event_emitter=_emit,
+    )
+    envelope = _make_envelope("agent-1::steer-terminal-order")
+    first = await runtime.enqueue(envelope, "first")
+    await first_started.wait()
+    assert await runtime.steer(
+        envelope.session_key,
+        "late correction",
+        persisted_user_message_id="message-terminal-order",
+        client_request_id="request-terminal-order",
+        client_message_id="client-terminal-order",
+        surface_id="webui",
+    ) == first.task_id
+
+    release_first.set()
+    waiter = asyncio.create_task(runtime.wait(first.task_id, timeout=2.0))
+    await asyncio.wait_for(promotion_started.wait(), timeout=2.0)
+
+    runtime_task = runtime._tasks[first.task_id]
+    persisted = await runtime.status(first.task_id)
+    assert persisted.status is AgentTaskStatus.SUCCEEDED
+    assert runtime_task.terminal_settling is True
+    assert runtime_task.terminal_emitted is False
+    assert runtime_task.terminal_settled is False
+    assert not waiter.done()
+    assert not any(
+        name == "task.succeeded" and payload.get("task_id") == first.task_id
+        for name, payload in events
+    )
+
+    driver = runtime_task.asyncio_task
+    assert driver is not None
+    driver.cancel()
+    await asyncio.sleep(0)
+    assert not waiter.done()
+    assert not any(
+        name == "task.succeeded" and payload.get("task_id") == first.task_id
+        for name, payload in events
+    )
+
+    release_promotion.set()
+    settled = await waiter
+    assert settled.status is AgentTaskStatus.SUCCEEDED
+    assert runtime_task.terminal_settling is False
+    assert runtime_task.terminal_emitted is True
+    assert runtime_task.terminal_settled is True
+    await asyncio.wait_for(followup_seen.wait(), timeout=2.0)
+
+    promoted_index = next(
+        index
+        for index, (name, payload) in enumerate(events)
+        if name == "session.event.input_disposition"
+        and payload.get("disposition") == "promoted"
+    )
+    terminal_index = next(
+        index
+        for index, (name, payload) in enumerate(events)
+        if name == "task.succeeded" and payload.get("task_id") == first.task_id
+    )
+    queued_index = next(
+        index
+        for index, (name, payload) in enumerate(events)
+        if name == "task.queued" and payload.get("task_id") != first.task_id
+    )
+    assert promoted_index < terminal_index < queued_index
+    assert sum(
+        name == "task.succeeded" and payload.get("task_id") == first.task_id
+        for name, payload in events
+    ) == 1
+
+    promoted_payload = events[promoted_index][1]
+    promoted_task_id = promoted_payload["promoted_turn_id"]
+    await runtime.wait(promoted_task_id, timeout=2.0)
+
+
+@pytest.mark.asyncio
 async def test_live_v2_promotion_atomically_rebinds_batch_and_preserves_ids(
     tmp_path,
 ) -> None:
@@ -2207,13 +2452,13 @@ async def test_failed_late_steer_promotion_is_durable_and_emits_recovery_state()
             "intent": "steer",
             "disposition": "rejected",
             "target_turn_id": first.task_id,
-                "revision": 2,
-                "promoted_from_turn_id": first.task_id,
-                "failure_code": "STEER_PROMOTION_QUEUE_FULL",
-                "retryable": True,
-                "recovery": "resend_after_queue_drains",
-            }
-        ]
+            "revision": 2,
+            "promoted_from_turn_id": first.task_id,
+            "failure_code": "STEER_PROMOTION_QUEUE_FULL",
+            "retryable": True,
+            "recovery": "resend_after_queue_drains",
+        }
+    ]
     failure_event = next(
         payload
         for _session, name, payload in events
@@ -2222,6 +2467,19 @@ async def test_failed_late_steer_promotion_is_durable_and_emits_recovery_state()
     )
     assert failure_event["retryable"] is True
     assert failure_event["recovery"] == "resend_after_queue_drains"
+    await rt.wait(first.task_id, timeout=2.0)
+    rejected_index = next(
+        index
+        for index, (_session, name, payload) in enumerate(events)
+        if name == "session.event.input_disposition"
+        and payload.get("failure_code") == "STEER_PROMOTION_QUEUE_FULL"
+    )
+    terminal_index = next(
+        index
+        for index, (_session, name, payload) in enumerate(events)
+        if name == "task.succeeded" and payload.get("task_id") == first.task_id
+    )
+    assert rejected_index < terminal_index
 
     release_queued.set()
     await rt.wait(queued.task_id, timeout=2.0)
@@ -2473,6 +2731,7 @@ async def test_exception_path_clears_dicts() -> None:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+@pytest.mark.ci_serial
 async def test_no_leak_under_load(monkeypatch: pytest.MonkeyPatch) -> None:
     """10 000 tasks, each <=50 ms; dict sizes after GC must be within ±2 of baseline."""
     num_tasks = 10_000
@@ -2499,18 +2758,24 @@ async def test_no_leak_under_load(monkeypatch: pytest.MonkeyPatch) -> None:
     baseline_envelope = len(rt._last_envelope_by_session)
 
     # --- run 10 000 tasks ---
-    handles = []
-    for i in range(num_tasks):
-        sk = f"agent-1::sess-load-{i % session_count}"
-        env = _make_envelope(sk)
-        h = await rt.enqueue(env, f"msg-{i}")
-        handles.append(h)
-
-    # Wait for all to complete under one shared deadline. Giving every waiter
-    # its own timer schedules 10 000 timeout callbacks and makes this leak
-    # check sensitive to event-loop scheduling on slower CI runners.
-    async with asyncio.timeout(60.0):
-        await asyncio.gather(*(rt.wait(h.task_id) for h in handles))
+    # Keep the workload at 10 000 tasks, but drain it in bounded batches. A
+    # single gather of 10 000 ``runtime.wait`` calls creates another 10 000
+    # waiter tasks and timer bookkeeping on top of the runtime workload; that
+    # amplification is what made this quantitative check consume a minute on
+    # loaded Windows runners. The shared deadline still catches a stuck task.
+    batch_size = 500
+    deadline = asyncio.get_running_loop().time() + 60.0
+    for batch_start in range(0, num_tasks, batch_size):
+        handles = []
+        for i in range(batch_start, min(batch_start + batch_size, num_tasks)):
+            sk = f"agent-1::sess-load-{i % session_count}"
+            env = _make_envelope(sk)
+            handles.append(await rt.enqueue(env, f"msg-{i}"))
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise TimeoutError("task runtime leak workload exceeded its shared deadline")
+        async with asyncio.timeout(remaining):
+            await asyncio.gather(*(rt.wait(h.task_id) for h in handles))
 
     # --- post-GC snapshot ---
     gc.collect()

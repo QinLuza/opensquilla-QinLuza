@@ -1,12 +1,33 @@
 import asyncio
 import contextlib
+import gc
+import logging
 from contextvars import ContextVar
+from pathlib import Path
 
 import pytest
 
 from opensquilla.engine import stream_wrappers
-from opensquilla.engine.stream_wrappers import heartbeat_stream, idle_timeout_stream
-from opensquilla.engine.types import RunHeartbeatEvent, TextDeltaEvent
+from opensquilla.engine.stream_wrappers import (
+    heartbeat_stream,
+    idle_timeout_stream,
+    wrap_stream,
+)
+from opensquilla.engine.types import (
+    AnswerGenerationResetEvent,
+    ControlTerminalEvent,
+    ControlTerminalReason,
+    DoneEvent,
+    RunHeartbeatEvent,
+    TextDeltaEvent,
+)
+from opensquilla.git_runtime import git_run_mode_scope
+from opensquilla.process_tree import task_process_scope
+from opensquilla.run_mode import RunMode
+from opensquilla.runtime_packs.manager import runtime_pack_state_scope
+from opensquilla.sandbox.integration import sandbox_policy_scope
+from opensquilla.sandbox.policy_models import SandboxPolicy as StoredSandboxPolicy
+from opensquilla.skills.toolchains.manager import managed_toolchain_state_scope
 
 # A wedged wrapper must fail the assertion, not wedge the test run.
 _HARD_LIMIT = 5.0
@@ -522,3 +543,233 @@ async def test_idle_timeout_still_propagates_upstream_failures() -> None:
                 seen.append(event)
 
     assert [event.text for event in seen] == ["first"]
+
+
+@pytest.mark.asyncio
+async def test_context_bound_stream_does_not_let_legacy_timeout_create_terminal() -> None:
+    async def source():
+        await asyncio.sleep(0.04)
+        yield AnswerGenerationResetEvent(
+            turn_id="turn-context-bound",
+            assistant_message_id="assistant-context-bound",
+            old_generation_epoch=0,
+            new_generation_epoch=1,
+            safe_reason="canonical ensemble takeover",
+            sequence=1,
+        )
+        yield DoneEvent(text="fixed answer")
+
+    events = [
+        event
+        async for event in wrap_stream(
+            source(),
+            idle_timeout=0.001,
+            heartbeat_interval=None,
+            context_bound=True,
+        )
+    ]
+
+    assert [event.kind for event in events] == ["answer_generation_reset", "done"]
+
+
+@pytest.mark.asyncio
+async def test_unmarked_stream_keeps_legacy_idle_timeout_behavior() -> None:
+    async def source():
+        await asyncio.sleep(0.04)
+        yield TextDeltaEvent(text="late")
+
+    with pytest.raises(TimeoutError, match="Stream idle"):
+        async for _event in wrap_stream(
+            source(),
+            idle_timeout=0.001,
+            heartbeat_interval=None,
+        ):
+            pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("context_bound", [False, True])
+@pytest.mark.parametrize("stop_early", [False, True])
+async def test_composed_stream_closes_source_once_in_its_owner_context(
+    context_bound: bool,
+    stop_early: bool,
+) -> None:
+    owner: ContextVar[str | None] = ContextVar("composed_stream_owner", default=None)
+    started_by: list[asyncio.Task | None] = []
+    closed_by: list[asyncio.Task | None] = []
+    reset_errors: list[ValueError] = []
+
+    async def source():
+        started_by.append(asyncio.current_task())
+        token = owner.set("turn")
+        try:
+            yield TextDeltaEvent(text="first")
+            yield TextDeltaEvent(text="second")
+        finally:
+            closed_by.append(asyncio.current_task())
+            try:
+                owner.reset(token)
+            except ValueError as exc:
+                reset_errors.append(exc)
+
+    raw = source()
+    stream = wrap_stream(raw, idle_timeout=1.0, context_bound=context_bound)
+    seen: list[str] = []
+    try:
+        async with asyncio.timeout(_HARD_LIMIT):
+            async for event in stream:
+                seen.append(event.text)
+                if stop_early:
+                    break
+            await stream.aclose()
+            await stream.aclose()
+
+        assert seen == (["first"] if stop_early else ["first", "second"])
+        assert closed_by == started_by
+        assert reset_errors == []
+        assert owner.get() is None
+    finally:
+        # Keep a failed close-chain assertion from leaving a live generator.
+        await stream.aclose()
+        await raw.aclose()
+
+
+@pytest.mark.asyncio
+async def test_composed_heartbeat_closes_source_after_cancellation_terminal() -> None:
+    owner: ContextVar[str | None] = ContextVar("heartbeat_turn_owner", default=None)
+    ready = asyncio.Event()
+    started_by: list[asyncio.Task | None] = []
+    closed_by: list[asyncio.Task | None] = []
+    reset_errors: list[ValueError] = []
+    terminal_yielded: list[bool] = []
+
+    async def source():
+        started_by.append(asyncio.current_task())
+        token = owner.set("turn")
+        try:
+            yield TextDeltaEvent(text="partial")
+            ready.set()
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            terminal_yielded.append(True)
+            yield ControlTerminalEvent(
+                turn_id="turn-synthetic",
+                assistant_message_id="assistant-synthetic",
+                sequence=1,
+                reason=ControlTerminalReason.CANCEL,
+            )
+            raise
+        finally:
+            closed_by.append(asyncio.current_task())
+            try:
+                owner.reset(token)
+            except ValueError as exc:
+                reset_errors.append(exc)
+
+    raw = source()
+    stream = wrap_stream(raw, heartbeat_interval=15.0, context_bound=True)
+
+    async def consume() -> None:
+        async for _event in stream:
+            pass
+
+    consumer = asyncio.create_task(consume())
+    try:
+        async with asyncio.timeout(_HARD_LIMIT):
+            await ready.wait()
+            consumer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await consumer
+            await stream.aclose()
+
+        assert terminal_yielded == [True]
+        assert closed_by == started_by
+        assert reset_errors == []
+        assert owner.get() is None
+    finally:
+        if not consumer.done():
+            consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+        await stream.aclose()
+        await raw.aclose()
+
+
+@pytest.mark.asyncio
+async def test_composed_stream_accepts_an_iterator_without_aclose() -> None:
+    class Source:
+        def __init__(self) -> None:
+            self.events = iter([TextDeltaEvent(text="first"), DoneEvent(text="done")])
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.events)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+    stream = wrap_stream(Source(), context_bound=True)
+    events = [event async for event in stream]
+    await stream.aclose()
+
+    assert [event.text for event in events] == ["first", "done"]
+
+
+class _SlowRunEvent:
+    """Stand-in event so the generator has something to yield."""
+
+
+async def _turn_shaped_generator(state_dir: str):
+    """A generator shaped like ``TurnRunner.run``: scope stack + yields."""
+    with (
+        managed_toolchain_state_scope(state_dir),
+        runtime_pack_state_scope(state_dir),
+        sandbox_policy_scope(StoredSandboxPolicy()),
+        git_run_mode_scope(RunMode.SAFE),
+        task_process_scope(state_dir, session_key="s", task_id="t"),
+    ):
+        yield _SlowRunEvent()
+        # Abandoned while suspended here, exactly like a turn generator whose
+        # consumer went away without closing it.
+        await asyncio.sleep(3600)
+        yield _SlowRunEvent()
+
+
+async def _advance_once(gen) -> None:
+    await gen.__anext__()
+
+
+@pytest.mark.asyncio
+async def test_turn_scope_stack_survives_asyncgen_finalizer(
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    state_dir = str(tmp_path / "state")
+    gen = _turn_shaped_generator(state_dir)
+
+    # First advance binds the scope stack's ContextVar tokens to *this*
+    # task's Context, then leaves the generator suspended mid-turn.
+    await _advance_once(gen)
+
+    # Drop every reference: finalization now belongs to asyncio's
+    # async-generator finalizer hook, which runs aclose() in a fresh Context.
+    # "Task exception was never retrieved" is logged when the finished
+    # finalizer task itself is collected, so both collections and the waits
+    # must sit inside the capture window.
+    del gen
+    with caplog.at_level(logging.ERROR, logger="asyncio"):
+        gc.collect()  # schedule the finalizer task
+        await asyncio.sleep(0.1)  # let aclose() run to completion
+        gc.collect()  # collect the finished task → unretrieved logged here
+        await asyncio.sleep(0.05)
+    unretrieved = [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.ERROR
+        and "Task exception was never retrieved" in record.getMessage()
+    ]
+    assert unretrieved == [], (
+        "scope stack crashed during async-generator finalization: "
+        f"{[r.getMessage() for r in unretrieved]}"
+    )

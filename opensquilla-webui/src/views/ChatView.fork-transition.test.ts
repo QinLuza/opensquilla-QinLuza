@@ -16,22 +16,22 @@ describe('chat fork hand-off contract', () => {
   it('uses durable inclusive turn ids for historical assistant branches', () => {
     expect(messageListSource).toContain("forkConversation: [throughTurnId?: string]")
     expect(messageListSource).toContain("turnOutcome?.turnId?.trim()")
-    expect(messageListSource).toContain("@fork=\"$emit('forkConversation', forkThroughTurnId(index))\"")
-    expect(transitionSource).toContain("method: 'sessions.forkThroughTurn'")
-    expect(transitionSource).toContain("params: { key: parentKey, throughTurnId }")
-    expect(chatViewSource).toContain('rpc.call<ForkRpcResponse>(request.method, request.params)')
-    expect(chatViewSource).toContain('validatedForkChildKey(res, normalizedTurnId)')
-    expect(chatViewSource.indexOf('validatedForkChildKey(res, normalizedTurnId)')).toBeLessThan(
+    expect(messageListSource).toContain("@fork=\"$emit('forkConversation', forkThroughTurnId(entry.index))\"")
+    expect(chatViewSource).toContain('sessionLifecycle.fork({')
+    expect(chatViewSource).toContain('throughTurnId: normalizedTurnId')
+    expect(chatViewSource).not.toContain('rpc.call<ForkRpcResponse>')
+    expect(chatViewSource).toContain('const childKey = res.key')
+    expect(chatViewSource.indexOf('const childKey = res.key')).toBeLessThan(
       chatViewSource.indexOf('query: { session: childKey }'),
     )
-    expect(transitionSource).toContain("response?.forkMode !== 'through_turn'")
-    expect(transitionSource).toContain('response.throughTurnId !== throughTurnId')
+    expect(transitionSource).not.toContain('ForkRpcResponse')
+    expect(transitionSource).not.toContain('sessions.forkThroughTurn')
     expect(chatViewSource).not.toContain('beforeMessageId: normalizedTurnId')
     expect(chatViewSource).toContain("clearForkTransition(generation)\n      pushToast(t('chat.toast.forkFailed')")
   })
 
   it('keeps a read-only parent projection visible until child history is ready', () => {
-    expect(chatViewSource).toContain(':messages="forkTransition?.previewMessages || renderedMessages"')
+    expect(chatViewSource).toContain(':messages="forkTransition?.previewMessages || visibleRenderedMessages"')
     expect(chatViewSource).toContain(':session-key="forkTransition?.parentKey || sessionKey"')
     expect(chatViewSource).toContain(':inert="forkTransition ? true : undefined"')
     expect(chatViewSource).toContain('Render-only snapshot; never becomes the child session\'s canonical messages.')

@@ -1,7 +1,8 @@
 """Real Gateway fixture for the Goal-mode browser regression.
 
 The browser test starts this process with the repository virtualenv.  The
-provider is deterministic, but every other boundary is production code:
+Provider replies are deterministic and token counting uses the production
+conservative offline fallback. Every lifecycle boundary is production code:
 WebSocket RPC, SQLite state, TaskRuntime, GoalService, TurnRunner, tools, and
 the automatic continuation lifecycle.
 """
@@ -16,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from opensquilla import token_estimation
 from opensquilla.gateway.boot import start_gateway_server
 from opensquilla.gateway.config import AuthConfig, GatewayConfig
 from opensquilla.gateway.websocket import SubscriptionManager
@@ -35,6 +37,13 @@ FIRST_REPLY = "The release inputs are inspected; final verification still remain
 FINAL_REPLY = "The deterministic release report is complete and verified."
 LIFECYCLE_FIRST_REPLY = "Task one completed after the lifecycle checks."
 LIFECYCLE_SECOND_REPLY = "Task two completed after Goal removal."
+SILENT_INITIAL_REPLY = "The initial Goal turn completed normally."
+SILENT_MIXED_REPLY = "NO_REPLY\nThe deterministic silent-reply body is visible."
+SILENT_VISIBLE_BODY = "The deterministic silent-reply body is visible."
+SILENT_FORMATTED_REPLY = (
+    "**HEARTBEAT_OK**\nThe formatted heartbeat body is visible."
+)
+SILENT_FORMATTED_BODY = "The formatted heartbeat body is visible."
 
 
 def _message_text(message: Message) -> str:
@@ -87,7 +96,11 @@ class DeterministicGoalProvider:
             _message_text(message) for message in messages if message.role == "assistant"
         )
         expected_first_reply = (
-            LIFECYCLE_FIRST_REPLY if self._scenario == "lifecycle" else FIRST_REPLY
+            LIFECYCLE_FIRST_REPLY
+            if self._scenario == "lifecycle"
+            else SILENT_INITIAL_REPLY
+            if self._scenario == "silent-reply"
+            else FIRST_REPLY
         )
         tool_names = [str(getattr(tool, "name", "")) for tool in tools or []]
         self._record(
@@ -102,11 +115,100 @@ class DeterministicGoalProvider:
                 ),
                 "firstReplyInAssistantHistory": expected_first_reply in assistant_history,
                 "requestHasInternalContinuation": "[INTERNAL SYSTEM EVENT]" in message_text,
+                "historyHasSilentSentinel": (
+                    "NO_REPLY" in assistant_history or "HEARTBEAT_OK" in assistant_history
+                ),
+                "silentVisibleBodyInAssistantHistory": (
+                    SILENT_VISIBLE_BODY in assistant_history
+                ),
             }
         )
+        if self._scenario == "silent-reply":
+            return self._stream_silent_reply(call_number)
         if self._scenario == "lifecycle":
             return self._stream_lifecycle(call_number)
         return self._stream_continuation(call_number)
+
+    async def _stream_silent_reply(self, call_number: int) -> AsyncIterator[Any]:
+        if call_number == 1:
+            # The Goal-set turn is ordinary user ingress, so it must not rely
+            # on internal sentinel interpretation.
+            yield TextDeltaEvent(text=SILENT_INITIAL_REPLY)
+            yield DoneEvent(
+                stop_reason="stop",
+                input_tokens=12,
+                output_tokens=4,
+                model=MODEL,
+            )
+            return
+        if call_number == 2:
+            # This first automatic continuation is an internal system event.
+            # Hold Done after the raw provider delta so Playwright can prove no
+            # marker escapes into either the WebSocket stream or live DOM.
+            yield TextDeltaEvent(text=SILENT_MIXED_REPLY)
+            await self._wait_for_release(call_number, self._first_release_file)
+            yield DoneEvent(
+                stop_reason="stop",
+                input_tokens=11,
+                output_tokens=5,
+                model=MODEL,
+            )
+            return
+        if call_number == 3:
+            # A pure no-reply acknowledgement must settle without creating a
+            # ghost assistant row, while Goal continuation remains active.
+            yield TextDeltaEvent(text="NO_REPLY")
+            yield DoneEvent(
+                stop_reason="stop",
+                input_tokens=7,
+                output_tokens=1,
+                model=MODEL,
+            )
+            return
+        if call_number == 4:
+            # Markdown presentation around the protocol line is normalized on
+            # an internal turn, while its substantive body remains visible.
+            yield TextDeltaEvent(text=SILENT_FORMATTED_REPLY)
+            yield DoneEvent(
+                stop_reason="stop",
+                input_tokens=10,
+                output_tokens=4,
+                model=MODEL,
+            )
+            return
+        if call_number == 5:
+            # Pause before completion so the browser can reload the durable
+            # history after mixed, pure-suppressed, and formatted turns.
+            await self._wait_for_release(call_number, self._second_release_file)
+            yield ToolUseStartEvent(
+                tool_use_id="silent-goal-complete-5",
+                tool_name="update_goal",
+            )
+            yield ToolUseEndEvent(
+                tool_use_id="silent-goal-complete-5",
+                tool_name="update_goal",
+                arguments={"status": "complete"},
+            )
+            yield DoneEvent(
+                stop_reason="tool_use",
+                input_tokens=9,
+                output_tokens=2,
+                model=MODEL,
+            )
+            return
+        if call_number == 6:
+            # A final pure heartbeat acknowledgement exercises the second
+            # suppression reason. The completed Goal uses its durable fallback
+            # outcome anchor and must still expose accumulated usage.
+            yield TextDeltaEvent(text="HEARTBEAT_OK")
+            yield DoneEvent(
+                stop_reason="stop",
+                input_tokens=5,
+                output_tokens=1,
+                model=MODEL,
+            )
+            return
+        raise AssertionError(f"Unexpected silent-reply provider call {call_number}")
 
     async def _wait_for_release(self, call_number: int, release_file: Path) -> None:
         self._record({"event": "provider.waiting", "callNumber": call_number})
@@ -217,14 +319,21 @@ class DeterministicGoalSelector:
 
 
 async def main() -> None:
+    # Every fixture gets a fresh temporary directory, including tiktoken's
+    # default download cache. Use the production conservative fallback so a
+    # chat lifecycle proof never waits for an external tokenizer download.
+    token_estimation._encoding = token_estimation._ENCODING_UNAVAILABLE
     port = int(os.environ["OPENSQUILLA_WEBUI_GOAL_E2E_PORT"])
     state_dir = Path(os.environ["OPENSQUILLA_WEBUI_GOAL_E2E_STATE"])
     event_log = Path(os.environ["OPENSQUILLA_WEBUI_GOAL_E2E_EVENT_LOG"])
     first_release_file = Path(os.environ["OPENSQUILLA_WEBUI_GOAL_E2E_RELEASE_FIRST"])
     second_release_file = Path(os.environ["OPENSQUILLA_WEBUI_GOAL_E2E_RELEASE"])
     scenario = os.environ.get("OPENSQUILLA_WEBUI_GOAL_E2E_SCENARIO", "continuation")
-    if scenario not in {"continuation", "lifecycle"}:
+    if scenario not in {"continuation", "lifecycle", "silent-reply"}:
         raise ValueError(f"Unsupported Goal E2E scenario: {scenario}")
+    auth_mode = os.environ.get("OPENSQUILLA_WEBUI_GOAL_E2E_AUTH_MODE", "none")
+    if auth_mode not in {"none", "token"}:
+        raise ValueError(f"Unsupported Gateway fixture auth mode: {auth_mode}")
     webui_origin = os.environ["OPENSQUILLA_WEBUI_GOAL_E2E_ORIGIN"]
     state_dir.mkdir(parents=True, exist_ok=True)
     workspace_dir = state_dir / "workspace"
@@ -233,7 +342,7 @@ async def main() -> None:
     config = GatewayConfig(
         host="127.0.0.1",
         port=port,
-        auth=AuthConfig(mode="none"),
+        auth=AuthConfig(mode=auth_mode, token="synthetic-real-gateway-owner-token"),
     )
     config.state_dir = str(state_dir)
     config.workspace_dir = str(workspace_dir)
@@ -246,8 +355,6 @@ async def main() -> None:
         tier["model"] = MODEL
     config.naming.enabled = False
     config.compaction.enabled = False
-    config.memory.flush_enabled = False
-    config.memory.repair_enabled = False
     config.memory.ttl_sweep_interval_minutes = 0
     config.meta_skill.enabled = False
     config.heartbeat.enabled = False

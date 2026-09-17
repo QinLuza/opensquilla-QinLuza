@@ -104,6 +104,16 @@
                 </div>
                 <div class="sk-add-section-title__actions">
                   <button
+                    v-if="cancellableInstallSource === sourceMode"
+                    class="btn btn--ghost btn--sm"
+                    data-testid="skills-cancel-install"
+                    type="button"
+                    :disabled="cancellingSource === sourceMode"
+                    @click="emit('cancelInstall', sourceMode)"
+                  >{{ cancellingSource === sourceMode
+                    ? t('cronSkills.registry.cancellingInstall')
+                    : t('cronSkills.registry.cancelInstall') }}</button>
+                  <button
                     class="btn btn--ghost btn--sm"
                     type="button"
                     :disabled="installControlsBlocked"
@@ -134,7 +144,7 @@
                   :data-status="item.status"
                 >
                   <span class="sk-add-queue-item__icon" aria-hidden="true">
-                    <span v-if="item.status === 'installing'" class="sk-spinner" aria-hidden="true" />
+                    <span v-if="item.status === 'installing' || item.status === 'waiting' || item.status === 'cancelling'" class="sk-spinner" aria-hidden="true" />
                     <Icon v-else-if="item.status === 'installed' || item.status === 'unchanged'" name="check" :size="18" />
                     <Icon v-else-if="item.status === 'failed' || item.status === 'unknown'" name="info" :size="18" />
                     <Icon v-else name="clock" :size="18" />
@@ -147,6 +157,7 @@
                         : t(`cronSkills.registry.queueStatus.${item.status}`) }}</span>
                     </div>
                     <code :title="item.identifier">{{ item.identifier }}</code>
+                    <p v-if="item.progress && (item.status === 'waiting' || item.status === 'installing')" aria-live="polite">{{ item.progress }}</p>
                     <p v-if="item.error" class="sk-add-queue-item__error">{{ item.error }}</p>
                     <p v-if="item.status === 'deferred'" class="sk-add-queue-item__note">
                       {{ t('cronSkills.registry.rateLimitDeferred') }}
@@ -164,6 +175,18 @@
                       class="sk-add-lifecycle"
                       :data-tone="item.lifecycleTone"
                     >{{ item.lifecycleLabel }}</span>
+                    <div v-if="item.status === 'selection_required'" role="group" :aria-label="t('cronSkills.registry.selectSkillDirectory')">
+                      <p>{{ t('cronSkills.registry.selectSkillDirectory') }}</p>
+                      <button
+                        v-for="candidate in item.candidates"
+                        :key="candidate.identifier"
+                        type="button"
+                        class="btn btn--sm btn--ghost"
+                        :disabled="installControlsBlocked"
+                        data-testid="skills-select-directory"
+                        @click="emit('retry', item.id, false, candidate.identifier)"
+                      >{{ candidate.path || candidate.name }}</button>
+                    </div>
                     <details v-if="item.diagnostics.length" class="sk-add-diagnostics">
                       <summary>{{ t('cronSkills.registry.diagnostics', { count: item.diagnostics.length }) }}</summary>
                       <div v-for="diagnostic in item.diagnostics" :key="`${diagnostic.phase}:${diagnostic.code}`">
@@ -174,7 +197,7 @@
                       </div>
                     </details>
                     <button
-                      v-if="item.status === 'failed'"
+                      v-if="item.status === 'failed' || item.status === 'cancelled'"
                       class="btn btn--sm sk-add-retry"
                       :class="item.requiresRiskAcknowledgement ? 'btn--primary' : 'btn--ghost'"
                       type="button"
@@ -373,6 +396,7 @@ import type {
 import {
   GITHUB_BATCH_MAX_REFERENCES,
   skillInstallRequiresRiskAcknowledgement,
+  skillInstallCandidates,
   skillRegistryOperationKey,
 } from '@/composables/skills/useSkillRegistry'
 import { skillLifecyclePresentation } from '@/composables/skills/useSkillsCatalog'
@@ -388,6 +412,8 @@ const props = defineProps<{
   registrySearchError: string
   activities: SkillInstallActivities
   runningSource: SkillInstallSource | null
+  cancellableInstallSource: SkillInstallSource | null
+  cancellingSource: SkillInstallSource | null
   mutationBlocked?: boolean
 }>()
 
@@ -398,7 +424,8 @@ const emit = defineEmits<{
   search: []
   installGithub: []
   install: [identifier: string, source: string, displayName: string]
-  retry: [id: string, acknowledgeRisk?: boolean]
+  retry: [id: string, acknowledgeRisk?: boolean, candidateIdentifier?: string]
+  cancelInstall: [source: SkillInstallSource]
   clearActivity: [source: SkillInstallSource]
 }>()
 
@@ -434,12 +461,14 @@ for (const source of ['clawhub', 'github'] as const) {
 function settleActivityExpansion(source: SkillInstallSource) {
   const items = props.activities[source].items
   if (props.runningSource === source
-    || items.some(item => item.status === 'queued' || item.status === 'installing')) {
+    || items.some(item => item.status === 'queued'
+      || item.status === 'installing'
+      || item.status === 'waiting' || item.status === 'cancelling')) {
     activityExpanded.value[source] = true
     return
   }
   activityExpanded.value[source] = items.some(item =>
-    item.status === 'failed' || item.status === 'unknown')
+    item.status === 'failed' || item.status === 'unknown' || item.status === 'selection_required')
 }
 
 const currentActivity = computed(() => props.activities[sourceMode.value])
@@ -453,7 +482,9 @@ function activityPhase(source: SkillInstallSource) {
   const activity = props.activities[source]
   if (activity.phase) return activity.phase
   if (props.runningSource !== source) return 'terminal'
-  return activity.items.some(item => item.status === 'queued' || item.status === 'installing')
+  return activity.items.some(item => item.status === 'queued'
+    || item.status === 'installing'
+    || item.status === 'waiting' || item.status === 'cancelling')
     ? 'installing'
     : 'refreshing'
 }
@@ -478,15 +509,21 @@ const completedCount = computed(() => currentItems.value.filter(item =>
   item.status === 'installed'
     || item.status === 'unchanged'
     || item.status === 'failed'
-    || item.status === 'unknown').length)
+    || item.status === 'unknown'
+    || item.status === 'cancelled'
+    || item.status === 'selection_required').length)
 const currentIndex = computed(() => {
-  const installing = currentItems.value.findIndex(item => item.status === 'installing')
+  const installing = currentItems.value.findIndex(item =>
+    item.status === 'installing' || item.status === 'waiting' || item.status === 'cancelling')
   return installing >= 0
     ? installing + 1
     : Math.min(completedCount.value + 1, currentItems.value.length)
 })
 const primaryActionLabel = computed(() => {
   if (currentQueueRunning.value) {
+    if (props.cancellingSource === sourceMode.value) {
+      return t('cronSkills.registry.cancellingInstall')
+    }
     if (currentActivityPhase.value === 'refreshing') {
       return t('cronSkills.skillsView.refreshing')
     }
@@ -511,6 +548,7 @@ const queueSummary = computed(() => {
   const failed = currentItems.value.filter(item => item.status === 'failed').length
   const deferred = currentItems.value.filter(item => item.status === 'deferred').length
   const unknown = currentItems.value.filter(item => item.status === 'unknown').length
+  const cancelled = currentItems.value.filter(item => item.status === 'cancelled').length
   return [
     t('cronSkills.registry.queueProcessed', {
       processed: completedCount.value,
@@ -521,10 +559,12 @@ const queueSummary = computed(() => {
     ...(failed ? [t('cronSkills.registry.queueFailed', { count: failed })] : []),
     ...(deferred ? [t('cronSkills.registry.queueDeferred', { count: deferred })] : []),
     ...(unknown ? [t('cronSkills.registry.queueUnknown', { count: unknown })] : []),
+    ...(cancelled ? [t('cronSkills.registry.queueCancelled', { count: cancelled })] : []),
   ].join(' · ')
 })
 
 function sourceRunningLabel(source: SkillInstallSource): string {
+  if (props.cancellingSource === source) return t('cronSkills.registry.cancellingInstall')
   if (activityPhase(source) === 'refreshing') return t('cronSkills.skillsView.refreshing')
   return t('cronSkills.registry.sourceInstalling', { name: runningItemName(source) })
 }
@@ -537,7 +577,7 @@ const installAnnouncement = computed(() => {
 
 function sourceAttentionCount(source: SkillInstallSource): number {
   return props.activities[source].items.filter(item =>
-    item.status === 'failed' || item.status === 'unknown').length
+    item.status === 'failed' || item.status === 'unknown' || item.status === 'selection_required').length
 }
 
 function sourceAttentionLabel(source: SkillInstallSource): string {
@@ -553,6 +593,7 @@ function sourceAttentionLabel(source: SkillInstallSource): string {
 function runningItemName(source: SkillInstallSource): string {
   const activity = props.activities[source]
   return activity.items.find(item => item.status === 'installing')?.displayName
+    || activity.items.find(item => item.status === 'cancelling')?.displayName
     || activity.items.find(item => item.status === 'queued')?.displayName
     || t(`cronSkills.registry.source${source === 'github' ? 'GitHub' : 'ClawHub'}`)
 }
@@ -616,9 +657,12 @@ const resultRows = computed(() => props.results.map((result) => {
 type ResultRow = (typeof resultRows.value)[number]
 
 function resultActionLabel(row: ResultRow): string {
-  if (row.queueStatus === 'queued' || row.queueStatus === 'installing') {
+  if (row.queueStatus === 'queued'
+    || row.queueStatus === 'installing'
+    || row.queueStatus === 'cancelling') {
     return t(`cronSkills.registry.queueStatus.${row.queueStatus}`)
   }
+  if (row.queueStatus === 'cancelled') return t('cronSkills.registry.retry')
   if (row.queueStatus === 'failed' || row.queueStatus === 'unknown') {
     return t('cronSkills.registry.viewDetails')
   }
@@ -665,6 +709,7 @@ const queueRows = computed(() => currentItems.value.map((item) => {
   return {
     ...item,
     requiresRiskAcknowledgement: skillInstallRequiresRiskAcknowledgement(item.result),
+    candidates: skillInstallCandidates(item.result),
     operationLabel: operationFailed
       ? t(item.result?.installed
         ? 'cronSkills.registry.existingInstallPreserved'
@@ -1110,6 +1155,10 @@ function effectiveFromLabel(value: string | undefined): string {
 .sk-add-queue-item[data-status="failed"] {
   background: color-mix(in srgb, var(--danger) 6%, var(--bg));
   border-color: color-mix(in srgb, var(--danger) 32%, var(--border));
+}
+
+.sk-add-queue-item[data-status="cancelled"] {
+  background: color-mix(in srgb, var(--text-muted) 5%, var(--bg));
 }
 
 .sk-add-queue-item[data-status="installed"] .sk-add-queue-item__icon,

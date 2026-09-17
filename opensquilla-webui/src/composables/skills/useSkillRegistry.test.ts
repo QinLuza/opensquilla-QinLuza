@@ -7,16 +7,95 @@ import {
   skillInstallRequiresRiskAcknowledgement,
   skillInstallWasRateLimited,
   skillRegistryOperationKey,
-  useSkillRegistry,
+  useSkillRegistry as useSkillRegistryModel,
 } from './useSkillRegistry'
 import { createSkillMutationGate } from './useSkillMutationGate'
-import { useSkillProposals } from './useSkillProposals'
+import { useSkillProposals as useSkillProposalsModel } from './useSkillProposals'
+import type { SkillCatalog } from '@/modules/skillCatalog'
 
 const pushToast = vi.hoisted(() => vi.fn())
 
 vi.mock('@/composables/useToasts', () => ({
   useToasts: () => ({ pushToast }),
 }))
+
+type RpcCall = (method: string, params?: Record<string, unknown>) => Promise<any>
+
+function catalogFromCall(
+  call: RpcCall,
+  hasRpcMethod: (method: string) => boolean = () => false,
+): SkillCatalog {
+  return {
+    list: async () => (await call('skills.list', { includeLifecycle: true })).skills || [],
+    detail: skill => call('skills.get', { name: skill.name, includeLifecycle: true }),
+    search: async (query, options) => {
+      const result = await call('skills.search', {
+        query,
+        limit: options?.limit ?? 20,
+        source: options?.source || 'clawhub',
+      })
+      return {
+        results: result.results || [],
+        diagnostics: result.diagnostics || [],
+        message: result.message || '',
+      }
+    },
+    reload: () => call('skills.reload'),
+    install: request => call('skills.install', {
+      identifier: request.identifier,
+      source: request.source,
+      ...(request.operationId ? { operationId: request.operationId } : {}),
+      ...(request.riskConfirmation
+        ? { force: true, riskConfirmation: request.riskConfirmation }
+        : {}),
+    }),
+    supportsInstallCancellation: () => hasRpcMethod('skills.install.cancel'),
+    cancelInstall: operationId => call('skills.install.cancel', { operationId }),
+    installDependencies: request => call('skills.deps.install', {
+      name: request.name,
+      install_id: request.dependencyId,
+      ...(request.skillInstallId ? { installId: request.skillInstallId } : {}),
+      ...(request.instanceId ? { instanceId: request.instanceId } : {}),
+    }),
+    uninstall: request => call('skills.uninstall', {
+      ...(request.name ? { name: request.name } : {}),
+      ...(request.installId ? { installId: request.installId } : {}),
+    }),
+    proposals: async () => ({
+      proposals: (await call('exec.proposals.list')).proposals || [],
+      autoEnabledSkills: (await call('exec.proposals.auto_enabled.list')).skills || [],
+      settings: (await call('exec.proposals.settings.get')).settings || null,
+    }),
+    updateProposalSettings: changes => call('exec.proposals.settings.set', { ...changes }),
+    proposal: proposalId => call('exec.proposals.show', { proposal_id: proposalId }),
+    acceptProposal: (proposalId, options) => call('exec.proposals.accept', {
+      proposal_id: proposalId,
+      ...(options?.force ? { force: true } : {}),
+    }),
+    rejectProposal: proposalId => call('exec.proposals.reject', { proposal_id: proposalId }),
+    disableAutoEnabledSkill: name => call('exec.proposals.auto_enabled.disable', { name }),
+  }
+}
+
+function asCatalog(source: SkillCatalog | { call: RpcCall; hasRpcMethod?: (method: string) => boolean }) {
+  return 'call' in source
+    ? catalogFromCall(source.call, source.hasRpcMethod)
+    : source
+}
+
+function useSkillRegistry(
+  source: SkillCatalog | { call: RpcCall; hasRpcMethod?: (method: string) => boolean },
+  ...rest: Parameters<typeof useSkillRegistryModel> extends [unknown, ...infer Tail] ? Tail : never
+) {
+  return useSkillRegistryModel(asCatalog(source), ...rest)
+}
+
+function useSkillProposals(
+  source: SkillCatalog | { call: RpcCall; hasRpcMethod?: (method: string) => boolean },
+  ...rest: Parameters<typeof useSkillProposalsModel> extends [unknown, ...infer Tail] ? Tail : never
+) {
+  return useSkillProposalsModel(asCatalog(source), ...rest)
+}
 
 afterEach(() => {
   vi.restoreAllMocks()
@@ -185,6 +264,81 @@ describe('useSkillRegistry install state', () => {
     expect(registry.installActivities.value.github.items[3].status).toBe('installed')
     expect(registry.githubUrl.value).toBe('https://github.com/acme/skill-3')
     expect(registry.queueRunning.value).toBe(false)
+  })
+
+  it('cancels the active backend install and does not start queued items', async () => {
+    let finishInstall: ((result: { success: boolean; cancelled: boolean }) => void) | undefined
+    const call = vi.fn((method: string, _params: Record<string, unknown>) => {
+      if (method === 'skills.install') {
+        return new Promise(resolve => { finishInstall = resolve })
+      }
+      if (method === 'skills.install.cancel') {
+        finishInstall?.({ success: false, cancelled: true })
+        return Promise.resolve({ success: false, cancelled: true })
+      }
+      return Promise.reject(new Error(`Unexpected RPC method: ${method}`))
+    })
+    const loadData = vi.fn(async () => true)
+    const registry = useSkillRegistry({
+      call,
+      hasRpcMethod: (method: string) => method === 'skills.install.cancel',
+    } as never, loadData)
+    registry.githubUrl.value = [
+      'https://github.com/acme/one',
+      'https://github.com/acme/two',
+    ].join('\n')
+
+    const installing = registry.installGithub()
+    await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(1))
+    const operationId = call.mock.calls[0][1].operationId
+
+    const cancelling = registry.cancelInstall('github')
+    expect(registry.installActivities.value.github.items.map(item => item.status))
+      .toEqual(['cancelling', 'cancelled'])
+    expect(call).toHaveBeenLastCalledWith('skills.install.cancel', { operationId })
+
+    await cancelling
+    await installing
+
+    expect(String(operationId)).toMatch(/^[0-9a-f-]{36}$/)
+    expect(registry.installActivities.value.github.items.map(item => item.status))
+      .toEqual(['cancelled', 'cancelled'])
+    expect(call.mock.calls.filter(([method]) => method === 'skills.install')).toHaveLength(1)
+    expect(loadData).not.toHaveBeenCalled()
+    expect(registry.queueRunning.value).toBe(false)
+  })
+
+  it('preserves a success that commits while cancellation races and refreshes it', async () => {
+    let finishInstall: ((result: { success: boolean; installed: boolean }) => void) | undefined
+    const call = vi.fn((method: string) => {
+      if (method === 'skills.install') {
+        return new Promise(resolve => { finishInstall = resolve })
+      }
+      if (method === 'skills.install.cancel') {
+        finishInstall?.({ success: true, installed: true })
+        return Promise.resolve({ success: false, cancelled: true })
+      }
+      return Promise.reject(new Error(`Unexpected RPC method: ${method}`))
+    })
+    const loadData = vi.fn(async () => true)
+    const registry = useSkillRegistry({
+      call,
+      hasRpcMethod: (method: string) => method === 'skills.install.cancel',
+    } as never, loadData)
+    registry.githubUrl.value = [
+      'https://github.com/acme/one',
+      'https://github.com/acme/two',
+    ].join('\n')
+
+    const installing = registry.installGithub()
+    await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(1))
+    await registry.cancelInstall('github')
+    await installing
+
+    expect(registry.installActivities.value.github.items.map(item => item.status))
+      .toEqual(['installed', 'cancelled'])
+    expect(registry.githubUrl.value).toBe('https://github.com/acme/two')
+    expect(loadData).toHaveBeenCalledOnce()
   })
 
   it('rejects more than ten unique GitHub references without truncating or starting RPCs', async () => {
@@ -781,5 +935,32 @@ describe('useSkillRegistry install state', () => {
     expect(outcome.missingStill.env_any).toEqual([
       ['OPENROUTER_API_KEY', 'ARK_API_KEY'],
     ])
+  })
+})
+
+
+describe('Skill directory selection', () => {
+  it('only installs a server candidate and clears old risk acknowledgement', async () => {
+    const identifier = `acme/pack@${'a'.repeat(40)}:skills/demo/SKILL.md`
+    const call = vi.fn(async () => ({
+      success: false, message: 'Choose directory',
+      riskConfirmation: 'obsolete-token',
+      diagnostics: [{ code: 'SOURCE_TREE_AMBIGUOUS', details: {
+        selectionRequired: true, repository: 'acme/pack', immutableRevision: 'a'.repeat(40),
+        candidates: [{ name: 'demo', path: 'skills/demo', identifier }],
+      } }],
+    }))
+    const registry = useSkillRegistry({ call }, vi.fn(async () => true))
+    registry.githubUrl.value = 'https://github.com/acme/pack'
+    await registry.installGithub()
+    const item = registry.installActivities.value.github.items[0]
+    expect(item.status).toBe('selection_required')
+    await registry.retryQueueItem(item.id, true, 'https://evil.invalid/skill')
+    expect(call).toHaveBeenCalledTimes(1)
+    call.mockResolvedValueOnce({ success: true, message: 'Installed' } as never)
+    await registry.retryQueueItem(item.id, true, identifier)
+    expect(call).toHaveBeenLastCalledWith('skills.install', { identifier, source: 'github' })
+    expect(item.status).toBe('installed')
+    expect(registry.githubUrl.value).toBe('')
   })
 })

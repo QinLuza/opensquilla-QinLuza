@@ -38,7 +38,11 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import structlog
 
 from opensquilla.artifacts import artifact_payload
-from opensquilla.engine.types import AgentConfig, AgentEvent, ArtifactEvent
+from opensquilla.engine.types import (
+    AgentConfig,
+    AgentEvent,
+    ArtifactEvent,
+)
 from opensquilla.engine.usage_accounting import (
     UsageAccountingScope,
     UsageEventSink,
@@ -627,6 +631,105 @@ def _metadata_for_meta_subagent(base_config: AgentConfig) -> dict[str, Any]:
     return metadata
 
 
+# Meta steps replace the parent's prompt and loop policy, but they execute on
+# the same physical deployment. Keep the inherited contract explicit and
+# narrow: model/request budgets, compaction, and recoverable tool-result
+# storage. Dynamic prompt state, output schemas, forced tool choices, memory
+# flush, and benchmark/endgame behavior intentionally fall back to clean
+# defaults.
+_META_SUBAGENT_REQUEST_FIELDS = (
+    "timeout",
+    "request_timeout",
+    "max_safe_tool_concurrency",
+    "max_tokens",
+    "max_turn_llm_calls",
+    "max_turn_input_tokens",
+    "max_turn_output_tokens",
+    "max_turn_billed_cost_usd",
+    "max_turn_cost_usd",
+    "max_turn_tool_errors",
+    "temperature",
+    "top_p",
+    "thinking",
+    "thinking_budget_tokens",
+    "stop_sequences",
+    "model_id",
+    "provider_id",
+    "context_window_tokens",
+    "context_window_tokens_global_override",
+    "context_overflow_threshold",
+    "max_overflow_retries",
+    "max_history_turns",
+    "max_provider_retries",
+    "length_capped_continuations",
+    "retry_base_backoff_ms",
+    "retry_max_backoff_ms",
+    "reasoning_prefill_recovery_mode",
+    "cache_mode",
+    "model_capabilities",
+)
+_META_SUBAGENT_COMPACTION_FIELDS = (
+    "compaction_profile",
+    "compaction_protected_recent_messages",
+    "compaction_total_timeout_seconds",
+    "compaction_heartbeat_interval_seconds",
+    "compaction_execution_plan",
+    "compaction_execution_plan_factory",
+)
+_META_SUBAGENT_RECOVERY_FIELDS = (
+    "tool_result_projection_max_inline_chars",
+    "tool_result_dispatch_max_chars",
+    "tool_result_dispatch_turn_max_chars",
+    "tool_result_provider_request_max_chars",
+    "provider_request_proof_max_chars",
+    "provider_request_proof_max_chars_explicit",
+    "tool_use_argument_provider_request_max_chars",
+    "tool_use_argument_projection_enabled",
+    "tool_result_external_keep_recent",
+    "runtime_events_path",
+    "tool_result_store_dir",
+    "tool_result_store_session_id",
+    "tool_result_store_session_key",
+    "tool_result_store_agent_id",
+    "tool_result_store_full_trace",
+    "tool_result_store_max_bytes",
+    "tool_result_store_disk_budget_bytes",
+    "tool_result_store_retention_seconds",
+    "provider_call_observer",
+)
+
+
+def _derive_meta_subagent_config(
+    base_config: AgentConfig,
+    *,
+    system_prompt: str,
+    workspace_dir: str | None,
+) -> AgentConfig:
+    inherited_fields = (
+        _META_SUBAGENT_REQUEST_FIELDS
+        + _META_SUBAGENT_COMPACTION_FIELDS
+        + _META_SUBAGENT_RECOVERY_FIELDS
+    )
+    inherited = {name: getattr(base_config, name) for name in inherited_fields}
+    inherited["stop_sequences"] = list(base_config.stop_sequences)
+    configured_iterations = max(0, int(base_config.max_iterations or 0))
+    inherited.update(
+        {
+            "max_iterations": min(configured_iterations or 30, 30),
+            "system_prompt": system_prompt,
+            "extra_system_prompt": None,
+            "cache_breakpoints": (
+                [{"text": system_prompt, "cache": "true"}]
+                if base_config.cache_breakpoints
+                else None
+            ),
+            "workspace_dir": workspace_dir,
+            "metadata": _metadata_for_meta_subagent(base_config),
+        }
+    )
+    return AgentConfig(**inherited)
+
+
 class MetaOrchestrator:
     """Run one MetaPlan end-to-end with per-step kind dispatch.
 
@@ -657,6 +760,7 @@ class MetaOrchestrator:
         turn_id: str | None = None,
         memory_persist_enabled: bool = True,
         usage_tracker: Any | None = None,
+        metaskill_usage_recorder: Callable[[str], Any] | None = None,
         skill_runtime_env: Mapping[str, Mapping[str, str]] | None = None,
         # PR3: ``dao`` is the preferred alias for ``run_writer`` when the
         # caller only needs the DAO surface (try_claim_resume /
@@ -702,6 +806,9 @@ class MetaOrchestrator:
         self._session_key = session_key
         self._turn_id = turn_id
         self._usage_tracker = usage_tracker
+        # Receives only the newly created persistence run key. The callback
+        # must not inspect plan, inputs, prompts, or step output.
+        self._metaskill_usage_recorder = metaskill_usage_recorder
         # Volatile, parent-resolved credentials keyed by the exact bundled
         # skill that needs them. They are applied directly to subprocess env,
         # never rendered through Jinja or written to run persistence.
@@ -1000,6 +1107,7 @@ class MetaOrchestrator:
         if trusted_preflight_replay and trusted_replay_meta_run_id:
             replay_meta_run_id = _safe_meta_run_id(trusted_replay_meta_run_id)
 
+        confirmed_preflight_run = False
         if self._run_writer is not None:
             existing_run: Any = None
             if run_id is not None:
@@ -1016,6 +1124,7 @@ class MetaOrchestrator:
                     run_id = None
                 else:
                     existing_run = existing
+                    confirmed_preflight_run = True
             if run_id is None:
                 confirmed_run_id = _preflight_confirmation_run_id(match.inputs)
                 if confirmed_run_id:
@@ -1034,6 +1143,7 @@ class MetaOrchestrator:
                     ):
                         run_id = confirmed_run_id
                         existing_run = existing
+                        confirmed_preflight_run = True
             if run_id is None:
                 # This reserved input must exist in the exact snapshot written
                 # by begin_run_sync. Downstream manifests may use it as a
@@ -1043,6 +1153,10 @@ class MetaOrchestrator:
                     match.inputs[_META_RUN_INPUT_KEY] = replay_meta_run_id
                 else:
                     _seed_fresh_meta_run_id(match.inputs)
+                # This is a newly admitted execution even if the optional
+                # audit writer is unavailable; the generated input id gives
+                # the usage observer a bounded deduplication key.
+                created_new_run = True
                 try:
                     run_id = await _to_thread(
                         self._run_writer.begin_run_sync,
@@ -1053,13 +1167,13 @@ class MetaOrchestrator:
                         session_key=self._session_key,
                         turn_id=self._turn_id,
                     )
-                    created_new_run = bool(run_id)
                 except Exception as exc:  # noqa: BLE001
                     log.warning("orchestrator.begin_run_failed: %s", exc)
             else:
                 # A confirmed preflight reuses its original persistence row.
                 # Restore the runtime-owned value from that snapshot instead
                 # of accepting a caller-provided reserved input.
+                confirmed_preflight_run = existing_run is not None
                 persisted_id = _persisted_meta_run_id(existing_run)
                 match.inputs[_META_RUN_INPUT_KEY] = _safe_meta_run_id(
                     persisted_id or run_id,
@@ -1071,6 +1185,43 @@ class MetaOrchestrator:
                 match.inputs[_META_RUN_INPUT_KEY] = replay_meta_run_id
             else:
                 _seed_fresh_meta_run_id(match.inputs)
+            if run_id is None:
+                created_new_run = True
+
+        usage_observation_pending = (
+            created_new_run or confirmed_preflight_run or self._run_writer is None
+        )
+        # The usage key is deliberately independent from the artifact namespace.
+        # In particular, a trusted replay may reuse the source run's artifact id
+        # while still being a distinct demonstrated execution.
+        if run_id is not None and self._run_writer is not None:
+            usage_observation_key = _safe_meta_run_id(run_id)
+        elif replay_meta_run_id:
+            # A trusted replay is a new demonstrated use even though artifact
+            # routing deliberately keeps the source run's meta_run_id.
+            usage_observation_key = f"meta-use-{secrets.token_hex(12)}"
+        else:
+            usage_observation_key = _safe_meta_run_id(
+                match.inputs.get(_META_RUN_INPUT_KEY),
+            )
+        usage_observation_sent = False
+
+        def _notify_metaskill_usage() -> None:
+            """Notify once immediately before the first executable step."""
+
+            nonlocal usage_observation_sent
+            if usage_observation_sent or not usage_observation_pending:
+                return
+            usage_observation_sent = True
+            if self._metaskill_usage_recorder is None:
+                return
+            try:
+                self._metaskill_usage_recorder(usage_observation_key)
+            except Exception as exc:  # noqa: BLE001 - telemetry never kills a run
+                log.warning(
+                    "orchestrator.metaskill_usage_record_failed",
+                    error_type=type(exc).__name__,
+                )
 
         if (
             created_new_run
@@ -1086,7 +1237,7 @@ class MetaOrchestrator:
                 replay_failover_aliases=replay_failover_aliases,
             )
 
-        on_step_begin, on_step_finish, on_step_failover = (
+        persist_on_step_begin, on_step_finish, on_step_failover = (
             self._step_persistence_hooks(
                 run_id=run_id,
                 plan=match.plan,
@@ -1094,6 +1245,29 @@ class MetaOrchestrator:
                 usage_scope_prefix=run_id or f"meta:{match.plan.name}:{id(match)}",
             )
         )
+
+        async def on_step_begin(
+            step_id: str,
+            effective_skill: str,
+            rendered_inputs: dict[str, Any],
+        ) -> None:
+            if persist_on_step_begin is not None:
+                await persist_on_step_begin(step_id, effective_skill, rendered_inputs)
+
+        async def dispatch_step_stream(
+            step: MetaStep,
+            effective_skill: str,
+            inputs: dict[str, Any],
+            outputs: dict[str, str],
+        ) -> AsyncIterator[AgentEvent | _StepDone]:
+            async for event in self._dispatch_step_stream(
+                step,
+                effective_skill,
+                inputs,
+                outputs,
+                on_execution_started=_notify_metaskill_usage,
+            ):
+                yield event
 
         final_result: MetaResult | None = None
         cancelled = False
@@ -1107,7 +1281,7 @@ class MetaOrchestrator:
             )
             async for item in run_dag(
                 scheduler_match,
-                dispatch_step_stream=self._dispatch_step_stream,
+                dispatch_step_stream=dispatch_step_stream,
                 yield_skill_view_preface=self._yield_skill_view_preface,
                 max_parallelism=self._max_parallelism,
                 on_step_begin=on_step_begin,
@@ -1253,6 +1427,8 @@ class MetaOrchestrator:
         effective_skill: str,
         inputs: dict[str, Any],
         outputs: dict[str, str],
+        *,
+        on_execution_started: Callable[[], None] | None = None,
     ) -> AsyncIterator[AgentEvent | _StepDone]:
         """Streaming dispatch — yields nested events then a final :class:`_StepDone`.
 
@@ -1282,6 +1458,8 @@ class MetaOrchestrator:
             return
 
         if step.kind == "llm_classify":
+            if on_execution_started is not None:
+                on_execution_started()
             text = await run_llm_classify_step(
                 step,
                 inputs,
@@ -1292,6 +1470,8 @@ class MetaOrchestrator:
             yield _StepDone(text=text)
             return
         if step.kind == "llm_chat":
+            if on_execution_started is not None:
+                on_execution_started()
             text = await run_llm_chat_step(
                 step,
                 inputs,
@@ -1302,6 +1482,8 @@ class MetaOrchestrator:
             yield _StepDone(text=text)
             return
         if step.kind == "tool_call":
+            if on_execution_started is not None:
+                on_execution_started()
             result = await run_tool_call_step(
                 step,
                 inputs,
@@ -1321,6 +1503,8 @@ class MetaOrchestrator:
             yield _StepDone(text=result.text)
             return
         if step.kind == "skill_exec":
+            if on_execution_started is not None:
+                on_execution_started()
             text = await run_skill_exec_step(
                 step,
                 effective_skill,
@@ -1394,6 +1578,8 @@ class MetaOrchestrator:
                 if ctx_payload:
                     prefill_context = ctx_payload
                     llm_chat_for_prefill = self._llm_chat
+            if on_execution_started is not None:
+                on_execution_started()
             text = await run_user_input_step(
                 step,
                 inputs=inputs,
@@ -1410,6 +1596,8 @@ class MetaOrchestrator:
             yield _StepDone(text=text)
             return
         if effective_skill == "paper-section-author" and self._llm_chat is not None:
+            if on_execution_started is not None:
+                on_execution_started()
             text = await run_step_with_skill_text_only(
                 step,
                 effective_skill,
@@ -1421,6 +1609,8 @@ class MetaOrchestrator:
             yield _StepDone(text=text)
             return
         # agent kind: forward sub-Agent events as they arrive.
+        if on_execution_started is not None:
+            on_execution_started()
         async for item in run_step_with_skill_stream(
             step,
             effective_skill,
@@ -2132,6 +2322,11 @@ def make_agent_runner_from_parent(
                 ):
                     return await tool_handler(call)
 
+            setattr(
+                _child_tool_handler,
+                "_opensquilla_available_tools",
+                getattr(tool_handler, "_opensquilla_available_tools", frozenset()),
+            )
             child_tool_handler = _child_tool_handler
         # Per-call recovery: prefer the live tool_context's workspace_dir
         # over the (possibly stale or None) factory closure value. The
@@ -2187,19 +2382,14 @@ def make_agent_runner_from_parent(
                 f"approval."
             )
 
-        sub_config = AgentConfig(
-            model_id=getattr(base_config, "model_id", None),
-            provider_id=getattr(base_config, "provider_id", ""),
-            max_iterations=min(getattr(base_config, "max_iterations", 30), 30),
+        sub_config = _derive_meta_subagent_config(
+            base_config,
             system_prompt=sub_system_prompt,
-            extra_system_prompt=None,
-            metadata=_metadata_for_meta_subagent(base_config),
-            # Forward the resolved workspace_dir so sub-Agent's write_file /
-            # memory_save / shell tools resolve paths inside the operator's
-            # workspace rather than falling back to process cwd. Without
-            # this, sub-Agents trip workspace_strict ToolError loops in the
-            # persist / publish_artifact steps of multi-step DAGs.
-            workspace_dir=workspace_dir,
+            # Use the live per-call workspace for both prompt grounding and
+            # tool resolution. The factory closure may be stale after a session
+            # rebind, while effective_workspace_dir was resolved immediately
+            # above from the current ToolContext.
+            workspace_dir=effective_workspace_dir,
         )
 
         # Strip meta_invoke from the sub-Agent's tool surface so a step
@@ -2381,6 +2571,10 @@ def make_llm_chat_from_provider(
             max_tokens=request_budget.max_output_tokens,
             temperature=0.0,
             provider_request_max_chars=request_budget.provider_request_max_chars,
+            provider_context_window_tokens=request_budget.context_window_tokens,
+            provider_request_max_chars_explicit_cap=(
+                request_budget.provider_request_max_chars_explicit_cap
+            ),
             provider_request_correlation=call_provider_request_correlation,
         )
         messages = [Message(role="user", content=user_message)]

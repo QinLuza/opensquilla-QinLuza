@@ -89,15 +89,17 @@ async function mountPanel(options: {
     return {}
   })
   const rpc = {
-    waitForConnection: vi.fn(async () => {}),
-    supportsMethod: vi.fn((method: string) => methods.includes(method)),
-    markMethodUnavailable: vi.fn(),
+    ready: vi.fn(async () => {}),
+    hasRpcMethod: vi.fn((method: string) => methods.includes(method)),
+    rememberUnsupportedMethod: vi.fn(),
     call,
   }
   vi.doMock('@/stores/rpc', () => ({ useRpcStore: () => rpc }))
 
   const { createApp, nextTick } = await import('vue')
   const i18n = (await import('@/i18n')).default
+  const { MEMORY_PROFILE_IMPORT_KEY } = await import('@/modules/memoryProfileImport')
+  const { createV4MemoryProfileImport } = await import('@/adapters/gateway/memoryProfileImportV4')
   i18n.global.locale.value = 'en'
   const Component = (await import('./SettingsMemoryPanel.vue')).default
   const el = document.createElement('div')
@@ -109,6 +111,17 @@ async function mountPanel(options: {
   document.body.appendChild(el)
   const app = createApp(Component)
   app.use(i18n)
+  app.provide(MEMORY_PROFILE_IMPORT_KEY, createV4MemoryProfileImport({
+    ready: async () => rpc.ready(),
+    supports: rpc.hasRpcMethod,
+    markUnsupported: rpc.rememberUnsupportedMethod,
+    request: async <T = unknown>(method: string, params?: Record<string, unknown>) => (
+      await (call as unknown as (
+        method: string,
+        params?: Record<string, unknown>,
+      ) => Promise<unknown>)(method, params)
+    ) as T,
+  }))
   app.mount(el)
   mounted.push({ app, el })
   await settle()
@@ -131,7 +144,7 @@ describe('SettingsMemoryPanel', () => {
     expect(call).not.toHaveBeenCalled()
   })
 
-  it('keeps the localized export prompt collapsed while its copy action stays available', async () => {
+  it('explains the two-step import path and keeps the localized prompt copyable', async () => {
     const writeText = vi.fn(async (_text: string) => {})
     vi.stubGlobal('navigator', {
       ...navigator,
@@ -140,9 +153,32 @@ describe('SettingsMemoryPanel', () => {
       language: 'en',
     })
     const { el } = await mountPanel()
+    const steps = el.querySelector<HTMLOListElement>('.memory-import__steps')!
+    const stepHeadings = Array.from(
+      steps.querySelectorAll<HTMLElement>('.memory-import__step-head h4'),
+    ).map(heading => heading.textContent?.trim())
     const prompt = el.querySelector<HTMLElement>('[data-testid="memory-import-export-prompt"]')!
 
+    expect(steps.getAttribute('aria-label')).toBe('Steps to import memory')
+    expect(steps.querySelectorAll('.memory-import__step')).toHaveLength(2)
+    expect(stepHeadings).toEqual([
+      'Copy the prompt and send it to your other AI',
+      "Paste the AI's complete response",
+    ])
+    expect(el.textContent).toContain(
+      'OpenSquilla will prepare a reviewable preview before changing memory.',
+    )
+    expect(prompt.style.display).not.toBe('none')
+    expect(prompt.textContent).toContain('Create a portable profile of the user')
+    const promptToggle = el.querySelector<HTMLButtonElement>(
+      '[aria-controls="memory-import-export-prompt"]',
+    )!
+    expect(promptToggle.getAttribute('aria-expanded')).toBe('true')
+    promptToggle.click()
+    await settle()
+    expect(promptToggle.getAttribute('aria-expanded')).toBe('false')
     expect(prompt.style.display).toBe('none')
+
     const copy = el.querySelector<HTMLButtonElement>('[data-testid="memory-import-copy-prompt"]')!
     expect(copy).toBeTruthy()
     copy.click()
@@ -151,7 +187,11 @@ describe('SettingsMemoryPanel', () => {
     expect(writeText).toHaveBeenCalledTimes(1)
     expect(writeText.mock.calls[0][0]).toContain('Imported from: <AI assistant name>')
     expect(copy.textContent).toContain('Copied')
-    expect(el.textContent).toContain('for at most two calls')
+    expect(el.textContent).toContain(
+      'To generate a preview, OpenSquilla sends the pasted text, current profile, and prior import records',
+    )
+    expect(el.textContent).toContain('Chat history is excluded')
+    expect(el.textContent).not.toContain('for at most two calls')
   })
 
   it('previews with the advertised single model, renders a real diff, and applies by opaque ids', async () => {
