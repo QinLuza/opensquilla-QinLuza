@@ -1044,9 +1044,9 @@ def _patch_provider_and_emit(
         # tokenrhythm provider, and the provider-consistency guard skips tiers
         # aimed at another provider. The explicit model keeps resolution alive
         # via the connection fallback if the default profile ever changes.
-        lambda ctx, session: _FakeProvider(
+        lambda ctx, session, model_override=None: _FakeProvider(
             provider_kind="tokenrhythm",
-            model=provider_model,
+            model=model_override or provider_model,
         ),
     )
 
@@ -1468,7 +1468,7 @@ async def test_call_naming_provider_returns_sanitized_title(monkeypatch):
     )
     assert title == "Reset Password"
     assert provider.calls[0][0][0].role == "user"
-    assert provider.calls[0][0][0].content.startswith("Generate a title")
+    assert provider.calls[0][0][0].content == "Please help me reset my password"
     assert provider.calls[0][2].max_tokens == 512
     assert provider.calls[0][2].temperature == 0
     assert provider.calls[0][2].thinking is False
@@ -1520,26 +1520,33 @@ async def test_call_naming_provider_reasoning_budget_exceeded_returns_none():
 
 @pytest.mark.asyncio
 async def test_call_naming_provider_timeout_returns_none():
+    closed = asyncio.Event()
+
     async def _never():
-        yield _delta("stuck")
+        try:
+            yield _delta("stuck")
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
 
     provider = _AdapterProvider(lambda: _never())
     title = await call_naming_provider(
         "hello", provider=provider, model="provider/model", timeout=0.01
     )
     assert title is None
+    assert closed.is_set()
 
 
 @pytest.mark.asyncio
 async def test_call_naming_provider_accounts_physical_usage_path():
     provider = _AdapterProvider(
-        lambda: _ProviderStream([_delta("Title"), _done(2)]),
+        lambda: _ProviderStream([_delta("Account Usage"), _done(2)]),
         accounts_physical_usage=True,
     )
     title = await call_naming_provider(
         "hello", provider=provider, model="provider/model"
     )
-    assert title == "Title"
+    assert title == "Account Usage"
 
 
 @pytest.mark.asyncio
@@ -1580,3 +1587,93 @@ async def test_call_naming_provider_with_real_adapter(monkeypatch):
         model="provider/model",
     )
     assert title == "Real adapter title"
+
+
+@pytest.mark.asyncio
+async def test_call_naming_provider_cancellation_closes_stream():
+    started = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def stream():
+        try:
+            started.set()
+            yield _delta("Partial")
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    provider = _AdapterProvider(stream)
+    task = asyncio.create_task(call_naming_provider(
+        "hello", provider=provider, model="provider/model",
+    ))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_call_naming_provider_bounds_cancellation_resistant_cleanup(monkeypatch):
+    import opensquilla.session.naming as naming
+
+    release = asyncio.Event()
+    closed = asyncio.Event()
+
+    class SlowCloseStream(_ProviderStream):
+        async def aclose(self):
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()
+            closed.set()
+
+    provider = _AdapterProvider(
+        lambda: SlowCloseStream([_delta("Useful Topic"), _done(2)]),
+        accounts_physical_usage=True,
+    )
+    monkeypatch.setattr(naming, "_NAMING_STREAM_CLOSE_TIMEOUT_SECONDS", 0.001)
+    monkeypatch.setattr(naming, "_NAMING_STREAM_CANCEL_GRACE_SECONDS", 0.001)
+    try:
+        title = await asyncio.wait_for(call_naming_provider(
+            "hello", provider=provider, model="provider/model",
+        ), timeout=1)
+        assert title == "Useful Topic"
+        assert not closed.is_set()
+    finally:
+        release.set()
+        await asyncio.wait_for(closed.wait(), timeout=1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", [
+    DoneEvent(output_tokens=2, reasoning_tokens=513),
+    DoneEvent(output_tokens=2, reasoning_content="reason " * 600),
+])
+async def test_call_naming_provider_checks_terminal_reasoning_budget(terminal):
+    provider = _AdapterProvider(lambda: _ProviderStream([_delta("Useful Topic"), terminal]))
+    assert await call_naming_provider(
+        "hello", provider=provider, model="provider/model",
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_generate_session_title_does_not_send_mismatched_target(storage, mgr, monkeypatch):
+    calls, emits = _patch_provider_and_emit(monkeypatch, title="Incorrect Target")
+    monkeypatch.setattr(
+        "opensquilla.gateway.compaction_target.resolve_selected_compaction_provider",
+        lambda ctx, session, **kwargs: _FakeProvider(
+            provider_kind="tokenrhythm", model="chat-model",
+        ),
+    )
+    key = "agent:main:webchat:unavailable-naming-target"
+    await storage.upsert_session(SessionNode(session_key=key, session_id="synthetic-target"))
+    config = GatewayConfig()
+    config.naming.model = "naming-model"
+    ctx = SimpleNamespace(config=config, session_manager=mgr, provider_selector=None)
+
+    await generate_session_title(ctx, key, "Use the configured naming model")
+
+    assert calls["llm"] == 0
+    assert emits == []
+    assert (await storage.get_session(key)).derived_title is None

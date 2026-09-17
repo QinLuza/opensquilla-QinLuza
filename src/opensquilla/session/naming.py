@@ -1,8 +1,8 @@
 """Session auto-naming — generate a short title from the first user message.
 
 After the first user message of an eligible session, :func:`generate_session_title`
-runs a single one-shot LLM call (mirroring the compaction summarizer's direct
-``/chat/completions`` POST) and writes the result to ``SessionNode.derived_title``.
+runs one provider-adapter call and writes the result to
+``SessionNode.derived_title``.
 
 Explicit ``naming.model`` and ``naming.tier`` settings always win. Without an
 explicit naming target, direct routing reuses the resolved session/provider
@@ -81,6 +81,8 @@ _MAX_INPUT_CHARS = 4000  # cap the untrusted first message fed to the namer
 # ends at length with empty content.
 _TITLE_MAX_TOKENS = 512
 _TOKENRHYTHM_TITLE_MAX_TOKENS = 1024
+_NAMING_STREAM_CLOSE_TIMEOUT_SECONDS = 0.25
+_NAMING_STREAM_CANCEL_GRACE_SECONDS = 0.05
 _OPENROUTER_REASONING_DEFAULT_MODELS = frozenset(
     {
         "deepseek/deepseek-v4",
@@ -387,16 +389,23 @@ async def call_naming_provider(
 
     if provider is None or not (first_message or "").strip():
         return None
+    chat = getattr(provider, "chat", None)
+    if not callable(chat):
+        return None
 
+    provider_kind = provider_connection_config(provider).provider_kind.strip().lower()
+    requested_output_tokens = (
+        _TOKENRHYTHM_TITLE_MAX_TOKENS
+        if provider_kind == "tokenrhythm" else _TITLE_MAX_TOKENS
+    )
+    request_budget = resolve_auxiliary_request_budget(
+        provider, model=model, max_output_tokens=requested_output_tokens,
+    )
     system_prompt = _build_system_prompt(language)
     user_content = _fit_naming_user_content(
         first_message,
         system_prompt=system_prompt,
-        budget=resolve_auxiliary_request_budget(
-            provider,
-            model=model,
-            max_output_tokens=_TITLE_MAX_TOKENS,
-        ),
+        budget=request_budget,
     )
     if user_content is None:
         log.warning(
@@ -408,11 +417,17 @@ async def call_naming_provider(
 
     messages = [Message(role="user", content=user_content)]
     chat_config = ChatConfig(
-        max_tokens=_TITLE_MAX_TOKENS,
+        max_tokens=request_budget.max_output_tokens,
         temperature=0,
         system=system_prompt,
         thinking=False,
+        thinking_level="off",
         thinking_budget_explicit=False,
+        provider_request_max_chars=request_budget.provider_request_max_chars,
+        provider_context_window_tokens=request_budget.context_window_tokens,
+        provider_request_max_chars_explicit_cap=(
+            request_budget.provider_request_max_chars_explicit_cap
+        ),
         timeout=timeout,
         provider_request_correlation=provider_request_correlation,
         candidate_output_mode="inert_artifact",
@@ -436,12 +451,12 @@ async def call_naming_provider(
     accounted_stream: Any | None = None
     try:
         if provider_accounts_physical_usage(provider):
-            provider_stream = provider.chat(messages, tools=None, config=chat_config)
+            provider_stream = chat(messages, tools=None, config=chat_config)
             accounted_stream = provider_stream
         else:
             def _start_provider_stream() -> Any:
                 nonlocal provider_stream
-                provider_stream = provider.chat(messages, tools=None, config=chat_config)
+                provider_stream = chat(messages, tools=None, config=chat_config)
                 return provider_stream
 
             accounted_stream = account_provider_stream(
@@ -454,16 +469,22 @@ async def call_naming_provider(
         reasoning_chunks: list[str] = []
         saw_done = False
         reported_output_tokens = 0
+        reported_reasoning_tokens = 0
+        terminal_reasoning_content = ""
+        refused = False
 
         def _enforce_output_budget() -> None:
             visible_text = "".join(chunks)
             visible_tokens = _estimate_tokens(visible_text) if visible_text else 0
-            reasoning_text = "".join(reasoning_chunks)
+            reasoning_text = "".join(reasoning_chunks) or terminal_reasoning_content
             reasoning_tokens = _estimate_tokens(reasoning_text) if reasoning_text else 0
             estimated_output_tokens = visible_tokens + reasoning_tokens
-            if max(reported_output_tokens, estimated_output_tokens) > (
-                _TITLE_MAX_TOKENS
-            ):
+            # Reported output commonly includes reasoning; do not count it twice.
+            if max(
+                reported_output_tokens,
+                estimated_output_tokens,
+                reported_reasoning_tokens + visible_tokens,
+            ) > request_budget.max_output_tokens:
                 raise _NamingProviderError(
                     "provider output exceeded naming token budget"
                 )
@@ -492,6 +513,16 @@ async def call_naming_provider(
                         _enforce_output_budget()
                 elif isinstance(event, DoneEvent) or getattr(event, "kind", "") == "done":
                     saw_done = True
+                    refused = refused or bool(getattr(event, "refusal", False)) or (
+                        str(getattr(event, "stop_reason", "")).lower()
+                        in {"content_filter", "refusal"}
+                    )
+                    reported_reasoning_tokens = max(
+                        0, int(getattr(event, "reasoning_tokens", 0) or 0),
+                    )
+                    terminal_reasoning_content = str(
+                        getattr(event, "reasoning_content", "") or ""
+                    )
                     reported_output_tokens = max(
                         0,
                         int(getattr(event, "output_tokens", 0) or 0),
@@ -503,6 +534,10 @@ async def call_naming_provider(
             raise _NamingProviderError(
                 "provider stream ended before a terminal completion event"
             )
+        if refused:
+            # The terminal event already finalized usage; a refusal is not a
+            # transport error and must leave the transcript-derived title intact.
+            return None
         result = "".join(chunks).strip()
         if not result:
             raise _NamingProviderError("provider returned an empty title")
@@ -540,18 +575,62 @@ def _estimate_tokens(text: str) -> int:
     return estimate_tokens(text)
 
 
+def _consume_naming_close_result(task: asyncio.Future[Any]) -> None:
+    """Consume a detached close result without surfacing a late cleanup failure."""
+
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except Exception as exc:  # noqa: BLE001 - cleanup must not replace the result
+        log.debug(
+            "session_naming.provider_stream_close_failed",
+            error=redact_tokenrhythm_install_ids(str(exc)),
+        )
+    except BaseException:
+        return
+
+
 async def _close_naming_provider_stream(stream: Any | None) -> None:
-    """Bound best-effort stream cleanup without hiding the call outcome."""
+    """Bound best-effort stream cleanup without hiding the call outcome.
+
+    ``asyncio.timeout`` cannot bound an iterator whose ``aclose`` implementation
+    swallows cancellation while it finishes usage accounting.  Run the close in
+    its own task and detach it after a short cancellation grace instead.
+    """
 
     if stream is None:
         return
     close = getattr(stream, "aclose", None)
     if not callable(close):
         return
+    close_task: asyncio.Future[Any] | None = None
     try:
         close_result = close()
-        if inspect.isawaitable(close_result):
-            await close_result
+        if not inspect.isawaitable(close_result):
+            return
+        close_task = asyncio.ensure_future(close_result)
+        done, _pending = await asyncio.wait(
+            {close_task},
+            timeout=_NAMING_STREAM_CLOSE_TIMEOUT_SECONDS,
+        )
+        if close_task in done:
+            _consume_naming_close_result(close_task)
+            return
+        close_task.cancel()
+        done, _pending = await asyncio.wait(
+            {close_task},
+            timeout=_NAMING_STREAM_CANCEL_GRACE_SECONDS,
+        )
+        if close_task in done:
+            _consume_naming_close_result(close_task)
+        else:
+            close_task.add_done_callback(_consume_naming_close_result)
+    except asyncio.CancelledError:
+        if close_task is not None and not close_task.done():
+            close_task.cancel()
+            close_task.add_done_callback(_consume_naming_close_result)
+        raise
     except Exception as exc:  # noqa: BLE001 - cleanup must not replace the result
         log.debug(
             "session_naming.provider_stream_close_failed",
@@ -765,6 +844,15 @@ async def generate_session_title(
         )
         if target is None:
             return
+        if provider_connection_config(provider).model != target.model:
+            # Rebuild only a clone so explicit naming targets reach the physical
+            # adapter without changing the session's chat deployment.
+            provider = resolve_selected_compaction_provider(
+                ctx, session, model_override=target.model,
+            )
+            if provider is None or provider_connection_config(provider).model != target.model:
+                log.warning("session_naming.target_unavailable", model=target.model)
+                return
 
         from opensquilla.engine.usage_accounting import bind_usage_accounting_scope
         from opensquilla.gateway.usage_ledger_runtime import build_session_usage_scope
