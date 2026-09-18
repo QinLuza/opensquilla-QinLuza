@@ -492,7 +492,13 @@ def _chat_completion(chat_id: str, created: int, model: str, content: str) -> di
     }
 
 
-def _chunk(chat_id: str, created: int, model: str, delta: dict[str, Any], finish: str | None) -> str:
+def _chunk(
+    chat_id: str,
+    created: int,
+    model: str,
+    delta: dict[str, Any],
+    finish: str | None,
+) -> str:
     data = {
         "id": chat_id,
         "object": "chat.completion.chunk",
@@ -808,7 +814,7 @@ async def chat_completions(
             events = await asyncio.wait_for(
                 _run_turn(key, user_message, route=route), timeout=TIMEOUT_S
             )
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise HTTPException(504, f"agent 响应超时（>{TIMEOUT_S:g}s）") from exc
         error_text = _collect_terminal_error(events)
         if error_text:

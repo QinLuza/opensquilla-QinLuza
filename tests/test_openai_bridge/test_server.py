@@ -152,11 +152,17 @@ def test_event_error_message_extraction() -> None:
 def test_map_error_event_timeout_and_generic() -> None:
     """timeout 类错误映射为 type=timeout，其余为 server_error 并透传 code。"""
     mapped = _map_error_event(
-        {"message": "Stream idle timeout", "code": "stream_idle_timeout", "terminal_reason": "timeout"}
+        {
+            "message": "Stream idle timeout",
+            "code": "stream_idle_timeout",
+            "terminal_reason": "timeout",
+        }
     )
     assert mapped["type"] == "timeout"
     assert mapped["code"] == "stream_idle_timeout"
-    mapped = _map_error_event({"message": "llm ensemble had 3 successful proposer(s)", "code": "agent_error"})
+    mapped = _map_error_event(
+        {"message": "llm ensemble had 3 successful proposer(s)", "code": "agent_error"}
+    )
     assert mapped["type"] == "server_error"
     assert mapped["code"] == "agent_error"
     assert "llm ensemble" in str(mapped["message"])
@@ -216,11 +222,17 @@ def test_detect_client_title_request_hits_signature() -> None:
     messages = [
         {
             "role": "system",
-            "content": "Create a concise title for an AI coding-assistant session from the supplied human messages.",
+            "content": (
+                "Create a concise title for an AI coding-assistant session "
+                "from the supplied human messages."
+            ),
         },
         {
             "role": "user",
-            "content": 'Generate the session title from this JSON array of human messages:\n[{"seq":8,"text":"回答我：159753"}]',
+            "content": (
+                'Generate the session title from this JSON array of human messages:\n'
+                '[{"seq":8,"text":"回答我：159753"}]'
+            ),
         },
     ]
     assert _detect_client_title_request(messages) == "回答我：159753"
@@ -232,7 +244,10 @@ def test_detect_client_title_request_picks_last_entry() -> None:
         {"role": "system", "content": "Create a concise title for an AI coding-assistant session."},
         {
             "role": "user",
-            "content": 'Generate the session title from this JSON array of human messages:\n[{"seq":1,"text":"first"},{"seq":2,"text":"second"}]',
+            "content": (
+                'Generate the session title from this JSON array of human messages:\n'
+                '[{"seq":1,"text":"first"},{"seq":2,"text":"second"}]'
+            ),
         },
     ]
     assert _detect_client_title_request(messages) == "second"
@@ -246,7 +261,10 @@ def test_detect_client_title_request_misses_normal_chat() -> None:
             [
                 {
                     "role": "user",
-                    "content": 'Generate the session title from this JSON array of human messages:\n[{"seq":1,"text":"hi"}]',
+                    "content": (
+                        'Generate the session title from this JSON array of human messages:\n'
+                        '[{"seq":1,"text":"hi"}]'
+                    ),
                 }
             ]
         )
@@ -256,7 +274,10 @@ def test_detect_client_title_request_misses_normal_chat() -> None:
     assert (
         _detect_client_title_request(
             [
-                {"role": "system", "content": "Create a concise title for an AI coding-assistant session."},
+                {
+                    "role": "system",
+                    "content": "Create a concise title for an AI coding-assistant session.",
+                },
                 {"role": "user", "content": "请正常与我对话"},
             ]
         )
@@ -266,8 +287,17 @@ def test_detect_client_title_request_misses_normal_chat() -> None:
     assert (
         _detect_client_title_request(
             [
-                {"role": "system", "content": "Create a concise title for an AI coding-assistant session."},
-                {"role": "user", "content": "Generate the session title from this JSON array of human messages:\nnot a json array"},
+                {
+                    "role": "system",
+                    "content": "Create a concise title for an AI coding-assistant session.",
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Generate the session title from this JSON array of human messages:\n"
+                        "not a json array"
+                    ),
+                },
             ]
         )
         is None
@@ -276,8 +306,17 @@ def test_detect_client_title_request_misses_normal_chat() -> None:
     assert (
         _detect_client_title_request(
             [
-                {"role": "system", "content": "Create a concise title for an AI coding-assistant session."},
-                {"role": "user", "content": 'Generate the session title from this JSON array of human messages:\n[{"seq":1,"text":"   "}]'},
+                {
+                    "role": "system",
+                    "content": "Create a concise title for an AI coding-assistant session.",
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        'Generate the session title from this JSON array of human messages:\n'
+                        '[{"seq":1,"text":"   "}]'
+                    ),
+                },
             ]
         )
         is None
@@ -291,7 +330,10 @@ def test_detect_client_title_request_truncates_long_text() -> None:
         {"role": "system", "content": "Create a concise title for an AI coding-assistant session."},
         {
             "role": "user",
-            "content": f'Generate the session title from this JSON array of human messages:\n[{{"seq":1,"text":"{long_text}"}}]',
+            "content": (
+                f'Generate the session title from this JSON array of human messages:\n'
+                f'[{{"seq":1,"text":"{long_text}"}}]'
+            ),
         },
     ]
     title = _detect_client_title_request(messages)
@@ -309,10 +351,16 @@ def test_chat_completions_short_circuits_client_title_request() -> None:
         json={
             "model": "OpenSquilla",
             "messages": [
-                {"role": "system", "content": "Create a concise title for an AI coding-assistant session."},
+                {
+                    "role": "system",
+                    "content": "Create a concise title for an AI coding-assistant session.",
+                },
                 {
                     "role": "user",
-                    "content": 'Generate the session title from this JSON array of human messages:\n[{"seq":8,"text":"回答我：159753"}]',
+                    "content": (
+                        'Generate the session title from this JSON array of human messages:\n'
+                        '[{"seq":8,"text":"回答我：159753"}]'
+                    ),
                 },
             ],
         },
@@ -337,7 +385,13 @@ def test_first_user_text_extracts_first_non_empty_user() -> None:
 def test_first_user_text_supports_content_parts() -> None:
     """content 为 [{"type":"text","text":...}] 数组时仍能提取。"""
     messages = [
-        {"role": "user", "content": [{"type": "text", "text": "片段一"}, {"type": "text", "text": "片段二"}]}
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "片段一"},
+                {"type": "text", "text": "片段二"},
+            ],
+        }
     ]
     assert _first_user_text(messages) == "片段一\n片段二"
 

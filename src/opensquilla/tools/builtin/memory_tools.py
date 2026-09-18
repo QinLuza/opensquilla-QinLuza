@@ -367,7 +367,7 @@ def create_memory_tools(
         if gateway_config is not None:
             from opensquilla.agents.scope import is_isolated_custom_agent
             isolated = is_isolated_custom_agent(gateway_config, agent_id)
-        
+
         if isolated:
             # Strict isolation: no fallback to main
             s = stores.get(agent_id)
