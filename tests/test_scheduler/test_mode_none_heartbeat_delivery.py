@@ -34,7 +34,11 @@ def _job(mode: object, *, best_effort: bool = False) -> CronJob:
 _OVERRIDE = {"channel_name": "feishu", "channel_id": "chat-1"}
 
 
-def _hb(status: str = "skipped", delivery_status: str = "skipped", reason: str = "disabled") -> SimpleNamespace:
+def _hb(
+    status: str = "skipped",
+    delivery_status: str = "skipped",
+    reason: str = "disabled",
+) -> SimpleNamespace:
     return SimpleNamespace(status=status, delivery_status=delivery_status, reason=reason)
 
 
