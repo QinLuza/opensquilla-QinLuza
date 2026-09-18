@@ -37,6 +37,7 @@ from opensquilla.usage_reasons import (
 
 _NANOS_PER_USD = Decimal("1000000000")
 _CANCELLED_USAGE_TERMINAL_GRACE_SECONDS = 0.25
+_PROVIDER_STREAM_CLOSE_TIMEOUT_SECONDS = 0.25
 log = structlog.get_logger(__name__)
 
 
@@ -49,6 +50,36 @@ class UsageAccountingUnavailableError(RuntimeError):
 
     code = "usage_accounting_unavailable"
     retryable = True
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_ms: int | None = None,
+        usage_call_index: int | None = None,
+        no_prior_provider_dispatch: bool = False,
+        replay_safe: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_ms = retry_after_ms
+        self.usage_call_index = usage_call_index
+        self.no_prior_provider_dispatch = no_prior_provider_dispatch
+        self.replay_safe = replay_safe
+
+    def bind_usage_call(self, call: UsageCallStart) -> None:
+        """Attach fail-closed evidence from the rejected provider admission."""
+
+        call_index = max(1, int(call.call_index))
+        self.usage_call_index = call_index
+        self.no_prior_provider_dispatch = call_index == 1
+
+    def bind_replay_safety(self, *, no_prior_irreversible_effect: bool) -> None:
+        """Prove whole-turn replay safety without weakening retryability."""
+
+        self.replay_safe = (
+            self.no_prior_provider_dispatch
+            and no_prior_irreversible_effect
+        )
 
 
 class UsageAccountingBusyError(UsageAccountingUnavailableError):
@@ -87,6 +118,7 @@ class UsageExecutionContext:
     session_epoch: int = 0
     agent_id: str = ""
     run_kind: str = "agent"
+    root_turn_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +140,7 @@ class UsageCallStart:
     # Appended with a default so independently constructed sinks/tests keep
     # source compatibility while TurnRunner supplies the real reset epoch.
     session_epoch: int = 0
+    root_turn_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +225,7 @@ class UsageAccountingScope:
             call_index=self.call_index,
             agent_run_id=context.agent_run_id,
             turn_id=context.turn_id,
+            root_turn_id=context.root_turn_id or context.turn_id,
             parent_turn_id=context.parent_turn_id,
             session_id=context.session_id,
             session_epoch=context.session_epoch,
@@ -247,6 +281,9 @@ async def start_usage_call(
     start_task = asyncio.create_task(scope.sink.start(call))
     try:
         await asyncio.shield(start_task)
+    except UsageAccountingUnavailableError as exc:
+        exc.bind_usage_call(call)
+        raise
     except asyncio.CancelledError:
         # Cancellation raced the fail-closed barrier.  Resolve the durable
         # decision before unwinding; a committed row is explicitly closed.
@@ -376,6 +413,7 @@ async def account_provider_stream(
     *,
     provider: str,
     model: str,
+    close_timeout: float | None = _PROVIDER_STREAM_CLOSE_TIMEOUT_SECONDS,
 ) -> AsyncGenerator[Any, None]:
     """Account exactly one physical ``provider.chat`` invocation.
 
@@ -385,16 +423,25 @@ async def account_provider_stream(
 
     scope = current_usage_accounting_scope()
     if scope is None:
-        async for event in stream_factory():
-            yield event
+        unaccounted_stream = stream_factory()
+        try:
+            async for event in unaccounted_stream:
+                yield event
+        finally:
+            await _close_accounted_provider_stream(
+                unaccounted_stream,
+                timeout=close_timeout,
+            )
         return
 
     call = await start_usage_call(scope, provider=provider, model=model)
+    stream: AsyncIterator[Any] | None = None
     terminal = False
     cancelled = False
     unknown_reason = "provider_stream_ended_without_usage"
     try:
-        async for event in stream_factory():
+        stream = stream_factory()
+        async for event in stream:
             kind = str(getattr(event, "kind", "") or "")
             if kind == "done" and not terminal:
                 # Preserve the physical deployment for compatibility rollups
@@ -420,15 +467,49 @@ async def account_provider_stream(
         unknown_reason = "provider_exception"
         raise
     finally:
-        if not terminal:
-            if cancelled:
-                await _mark_usage_call_unknown_after_cancellation(
-                    scope,
-                    call,
-                    unknown_reason,
-                )
-            else:
-                await mark_usage_call_unknown(scope, call, unknown_reason)
+        try:
+            if not terminal:
+                if cancelled:
+                    await _mark_usage_call_unknown_after_cancellation(
+                        scope,
+                        call,
+                        unknown_reason,
+                    )
+                else:
+                    await mark_usage_call_unknown(scope, call, unknown_reason)
+        finally:
+            if stream is not None:
+                await _close_accounted_provider_stream(stream, timeout=close_timeout)
+
+
+async def _close_accounted_provider_stream(
+    stream: AsyncIterator[Any],
+    *,
+    timeout: float | None,
+) -> None:
+    """Close the physical stream when the accounting wrapper stops early."""
+
+    if timeout is not None:
+        from opensquilla.engine.repetition_guard import close_async_iterator_bounded
+
+        await close_async_iterator_bounded(
+            stream,
+            timeout=timeout,
+            event_prefix="usage_accounting.provider_stream",
+        )
+        return
+    aclose = getattr(stream, "aclose", None)
+    if not callable(aclose):
+        return
+    try:
+        await aclose()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - cleanup must preserve provider outcome
+        log.warning(
+            "usage_accounting.provider_stream_close_failed",
+            error_type=type(exc).__name__,
+        )
 
 
 def _usage_int(value: Any) -> int:
@@ -456,25 +537,37 @@ def _raw_nonnegative_number(value: Any) -> bool:
     return parsed.is_finite() and parsed >= 0
 
 
+def _row_value(
+    row: Mapping[str, Any],
+    *keys: str,
+    default: Any = None,
+) -> Any:
+    for key in keys:
+        if key in row:
+            return row[key]
+    return default
+
+
 def _breakdown_reconciles(event: object, rows: list[dict[str, Any]]) -> bool:
     """Return whether every additive Done envelope field equals its rows."""
 
-    is_error = str(getattr(event, "kind", "") or "") == "error"
-    additive_keys = (
-        ("input_tokens", "input_tokens"),
-        ("output_tokens", "output_tokens"),
-        ("reasoning_tokens", "reasoning_tokens"),
-        ("cached_tokens", "cache_read_tokens"),
-        ("cache_write_tokens", "cache_write_tokens"),
+    event_kind = str(getattr(event, "kind", "") or "")
+    is_error = event_kind == "error" or (
+        event_kind == "provider_generation_reset"
+        and bool(getattr(event, "terminal", False))
     )
-    for event_key, row_key in additive_keys:
-        row_values = [
-            row.get(
-                row_key,
-                row.get("cached_tokens", 0) if row_key == "cache_read_tokens" else 0,
-            )
-            for row in rows
-        ]
+    additive_keys = (
+        ("input_tokens", ("input_tokens", "inputTokens")),
+        ("output_tokens", ("output_tokens", "outputTokens")),
+        ("reasoning_tokens", ("reasoning_tokens", "reasoningTokens")),
+        (
+            "cached_tokens",
+            ("cache_read_tokens", "cacheReadTokens", "cached_tokens", "cachedTokens"),
+        ),
+        ("cache_write_tokens", ("cache_write_tokens", "cacheWriteTokens")),
+    )
+    for event_key, row_keys in additive_keys:
+        row_values = [_row_value(row, *row_keys, default=0) for row in rows]
         if not all(_raw_nonnegative_number(value) for value in row_values):
             return False
         if (
@@ -484,7 +577,17 @@ def _breakdown_reconciles(event: object, rows: list[dict[str, Any]]) -> bool:
         ):
             return False
 
-    billed_values = [row.get("billed_cost", 0.0) for row in rows]
+    billed_values = [
+        _row_value(
+            row,
+            "billed_cost",
+            "billedCost",
+            "billed_cost_usd",
+            "billedCostUsd",
+            default=0.0,
+        )
+        for row in rows
+    ]
     if not all(_raw_nonnegative_number(value) for value in billed_values):
         return False
     return is_error or sum(
@@ -497,9 +600,13 @@ def _row_has_explicit_usage_receipt(row: dict[str, Any]) -> bool:
 
     if not str(row.get("model") or row.get("provider") or "").strip():
         return False
-    return all(
-        key in row and _raw_nonnegative_number(row[key])
-        for key in ("input_tokens", "output_tokens")
+    input_key = next((key for key in ("input_tokens", "inputTokens") if key in row), None)
+    output_key = next((key for key in ("output_tokens", "outputTokens") if key in row), None)
+    return bool(
+        input_key
+        and output_key
+        and _raw_nonnegative_number(row[input_key])
+        and _raw_nonnegative_number(row[output_key])
     )
 
 
@@ -590,21 +697,42 @@ def _item_from_row(
     ordinal: int,
     default_provider: str,
     default_model: str,
+    resolve_estimates: bool,
 ) -> UsageCallItem:
     provider = str(row.get("provider") or default_provider or "")
     model = str(row.get("model") or default_model or "")
-    input_tokens = _usage_int(row.get("input_tokens"))
-    output_tokens = _usage_int(row.get("output_tokens"))
-    reasoning_tokens = _usage_int(row.get("reasoning_tokens"))
-    cache_read_tokens = _usage_int(
-        row.get("cache_read_tokens")
-        if "cache_read_tokens" in row
-        else row.get("cached_tokens")
+    input_tokens = _usage_int(_row_value(row, "input_tokens", "inputTokens"))
+    output_tokens = _usage_int(_row_value(row, "output_tokens", "outputTokens"))
+    reasoning_tokens = _usage_int(
+        _row_value(row, "reasoning_tokens", "reasoningTokens")
     )
-    cache_write_tokens = _usage_int(row.get("cache_write_tokens"))
-    billed = _usage_float(row.get("billed_cost"))
-    receipt = _coerce_billing_receipt(row.get("billing_receipt"))
-    row_source = str(row.get("cost_source") or "none").strip().lower()
+    cache_read_tokens = _usage_int(
+        _row_value(
+            row,
+            "cache_read_tokens",
+            "cacheReadTokens",
+            "cached_tokens",
+            "cachedTokens",
+        )
+    )
+    cache_write_tokens = _usage_int(
+        _row_value(row, "cache_write_tokens", "cacheWriteTokens")
+    )
+    billed = _usage_float(
+        _row_value(
+            row,
+            "billed_cost",
+            "billedCost",
+            "billed_cost_usd",
+            "billedCostUsd",
+        )
+    )
+    receipt = _coerce_billing_receipt(
+        _row_value(row, "billing_receipt", "billingReceipt")
+    )
+    row_source = str(
+        _row_value(row, "cost_source", "costSource", default="none") or "none"
+    ).strip().lower()
     receipt_pending = receipt is not None and receipt.status == "pending"
     confirmed_receipt = receipt is not None and receipt.status == "confirmed"
     # Explicit source retains compatibility with provider adapters and test
@@ -622,7 +750,7 @@ def _item_from_row(
     estimate_usd = 0.0
     estimate_basis: str | None = None
     price_source: str | None = None
-    if not provider_billed:
+    if not provider_billed and resolve_estimates:
         resolved = resolve_model_price(model, provider)
         estimate = estimate_cost(
             input_tokens=input_tokens,
@@ -651,10 +779,18 @@ def _item_from_row(
         source = "opensquilla_estimate"
     elif estimate_basis == "free":
         source = "free"
+    elif not resolve_estimates:
+        # Turn-level billed accounting must stay purely receipt-driven.  In
+        # particular, a pending receipt whose compatibility source still says
+        # ``provider_billed`` must not be reclassified as a confirmed bill
+        # merely because estimate resolution was intentionally skipped.
+        source = (
+            "free"
+            if row_source == "free" and not receipt_pending
+            else "unavailable"
+        )
     else:
-        source = str(row.get("cost_source") or "unavailable")
-        if source == "none":
-            source = "unavailable"
+        source = "unavailable" if row_source == "none" else row_source
 
     return UsageCallItem(
         ordinal=ordinal,
@@ -680,6 +816,7 @@ def normalize_provider_usage(
     default_provider: str,
     default_model: str,
     completed_at_ms: int,
+    resolve_estimates: bool = True,
 ) -> UsageCallResult:
     """Normalize a provider ``DoneEvent`` without depending on persistence.
 
@@ -687,7 +824,9 @@ def normalize_provider_usage(
     preserve the billed/unbilled split for every member.  Otherwise a single
     item is synthesized from the envelope.  Envelope token and cost counters
     are always summed from those same items, making every dimension reconcile
-    exactly without a second rounding path.
+    exactly without a second rounding path.  ``resolve_estimates=False`` keeps
+    normalization receipt-only so turn budget accounting never performs price
+    resolution on the provider stream's synchronous error path.
     """
 
     raw_breakdown = getattr(event, "model_usage_breakdown", None)
@@ -723,6 +862,7 @@ def normalize_provider_usage(
             ordinal=ordinal,
             default_provider=provider,
             default_model=model,
+            resolve_estimates=resolve_estimates,
         )
         for ordinal, row in enumerate(rows)
     )

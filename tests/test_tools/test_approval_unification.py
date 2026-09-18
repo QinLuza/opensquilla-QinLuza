@@ -11,6 +11,7 @@ from opensquilla.sandbox import destructive_backup
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.integration import configure_runtime, reset_runtime
 from opensquilla.sandbox.policy_models import FilePolicySettings, SandboxPolicy
+from opensquilla.sandbox.types import SecurityLevel
 from opensquilla.tools.builtin import code_exec, shell
 from opensquilla.tools.builtin import patch as patch_tool
 from opensquilla.tools.types import CallerKind, ToolContext, current_tool_context
@@ -34,6 +35,7 @@ def _reset_state():
 @pytest.mark.asyncio
 async def test_shell_warnlist_uses_sandbox_gate_without_exec_approval(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     calls: list[tuple[str, object]] = []
 
@@ -42,8 +44,8 @@ async def test_shell_warnlist_uses_sandbox_gate_without_exec_approval(
 
     async def _fake_gate_action(**kwargs):
         calls.append(("gate", kwargs))
-        policy = SimpleNamespace()
-        request = SimpleNamespace(cwd="/tmp", action_kind="shell.exec", policy=policy)
+        policy = SimpleNamespace(level=SecurityLevel.STANDARD)
+        request = SimpleNamespace(cwd=tmp_path, action_kind="shell.exec", policy=policy)
         return object(), policy, request
 
     async def _fake_run_under_backend(request, *, runtime=None):
@@ -69,10 +71,13 @@ async def test_shell_warnlist_uses_sandbox_gate_without_exec_approval(
     )
 
     token = current_tool_context.set(
-        ToolContext(is_owner=True, caller_kind=CallerKind.CLI, session_key="s1")
+        ToolContext(
+            is_owner=True, caller_kind=CallerKind.CLI, session_key="s1",
+            workspace_dir=str(tmp_path),
+        )
     )
     try:
-        result = await shell.exec_command("rm x")
+        result = await shell.exec_command("rm x", workdir=str(tmp_path))
     finally:
         current_tool_context.reset(token)
 

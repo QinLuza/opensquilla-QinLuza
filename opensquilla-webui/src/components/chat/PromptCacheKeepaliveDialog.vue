@@ -169,13 +169,13 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, inject, nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import ControlSwitch from '@/components/ControlSwitch.vue'
 import Icon from '@/components/Icon.vue'
 import { useDialogA11y } from '@/composables/useDialogA11y'
 import { useToasts } from '@/composables/useToasts'
-import { useRpcStore } from '@/stores/rpc'
+import { PROMPT_CACHE_LEASE_KEY } from '@/modules/promptCacheLease'
 import type {
   PromptCacheKeepaliveStatus,
   PromptCacheKeepaliveStatusUpdate,
@@ -188,7 +188,9 @@ const emit = defineEmits<{
 }>()
 const { t } = useI18n()
 const { pushToast } = useToasts()
-const rpc = useRpcStore()
+const injectedPromptCacheLease = inject(PROMPT_CACHE_LEASE_KEY)
+if (!injectedPromptCacheLease) throw new Error('PromptCacheLease was not provided')
+const promptCacheLease = injectedPromptCacheLease
 const dialogRef = ref<HTMLElement | null>(null)
 const closeButtonRef = ref<HTMLElement | null>(null)
 const loading = ref(false)
@@ -239,10 +241,7 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
-    const next = await rpc.call<PromptCacheKeepaliveStatus>(
-      'sessions.promptCacheKeepalive.status',
-      { key: props.sessionKey },
-    )
+    const next = await promptCacheLease.status(props.sessionKey)
     status.value = next
     draftEnabled.value = next.enabled
     draftTtlMinutes.value = Math.max(5, Math.round(next.ttlSeconds / 60))
@@ -272,15 +271,12 @@ async function save() {
     const idleTimeoutSeconds = Number.isInteger(draftIdleTimeoutMinutes.value)
       ? Math.round(draftIdleTimeoutMinutes.value * 60)
       : (status.value?.idleTimeoutSeconds || 3_600)
-    const next = await rpc.call<PromptCacheKeepaliveStatus>(
-      'sessions.promptCacheKeepalive.set',
-      {
-        key: savedSessionKey,
-        enabled: draftEnabled.value,
-        ttlSeconds,
-        idleTimeoutSeconds,
-      },
-    )
+    const next = await promptCacheLease.setPolicy({
+      key: savedSessionKey,
+      enabled: draftEnabled.value,
+      ttlSeconds,
+      idleTimeoutSeconds,
+    })
     status.value = next
     emit('saved', { sessionKey: savedSessionKey, status: next })
     pushToast(t(next.enabled
@@ -354,10 +350,13 @@ useDialogA11y(dialogRef, computed(() => props.open), close, {
 .keepalive-dialog__toggle small,
 .keepalive-dialog__muted { color: var(--text-muted); font-size: var(--fs-xs); }
 .keepalive-dialog__timing { display: grid; gap: var(--sp-3); grid-template-columns: repeat(2, minmax(0, 1fr)); }
-.keepalive-dialog__timing.is-disabled,
 .keepalive-dialog__summary.is-disabled { opacity: var(--state-disabled-opacity); }
 .keepalive-dialog__field { display: grid; gap: var(--sp-2); min-width: 0; }
 .keepalive-dialog__field-label { align-items: center; display: flex; gap: var(--sp-1); }
+.keepalive-dialog__timing.is-disabled .keepalive-dialog__field-label > label,
+.keepalive-dialog__timing.is-disabled .keepalive-dialog__input-wrap {
+  opacity: var(--state-disabled-opacity);
+}
 .keepalive-dialog__field strong { font-size: var(--fs-sm); font-weight: 600; }
 .keepalive-dialog__field-help {
   align-items: center;

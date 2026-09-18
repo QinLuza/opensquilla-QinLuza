@@ -16,6 +16,17 @@ export interface PlanRevisionSnapshot {
   createdAt?: number
 }
 
+/** Presentation is independent of immutable plan content and execution state. */
+export interface PlanPresentationSnapshot {
+  revisionId: string
+  dismissed: boolean
+  stateRevision: number
+}
+
+export interface PlanPresentationRequest extends PlanCardActionTarget {
+  dismissed: boolean
+}
+
 export type CollaborationMode = 'default' | 'plan'
 
 export interface CollaborationSnapshot {
@@ -52,7 +63,7 @@ export interface PlanRunSnapshot {
   status: PlanRunStatus
   currentStepId?: string
   stateRevision?: number
-  /** Execution owner. `manual` today; a future durable goal driver can reuse the same run. */
+  /** Execution owner retained for compatibility with already-published run records. */
   driverKind?: string
   driverId?: string
   activeTaskId?: string

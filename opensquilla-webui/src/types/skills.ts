@@ -1,4 +1,20 @@
 import type { SkillStatTile } from '@/components/skills/SkillsStats.vue'
+import type { SelectedSkillRef } from '@/types/selectedSkills'
+
+/** Metadata-only slash candidate. Skill instructions remain on the Gateway. */
+export interface SkillCandidate extends SelectedSkillRef {
+  generation: number
+  description: string
+  descriptionZh?: string
+  aliases: readonly string[]
+  kind: 'skill' | 'meta'
+  source: 'extra' | 'bundled' | 'managed' | 'personal' | 'project' | 'workspace'
+  disabled: boolean
+  manualOnly: boolean
+  ready: boolean
+  reason?: string
+  reasonCode?: string
+}
 
 export interface SkillInstall {
   id: string
@@ -80,6 +96,66 @@ export interface SkillInstallMissingStill {
   env_any: string[][]
 }
 
+export type SkillInstallState = 'tracked' | 'untracked' | 'missing' | 'drifted'
+export type SkillLoadState =
+  | 'loaded'
+  | 'rejected'
+  | 'not_discovered'
+  | 'serving_previous'
+  | 'validated_offline'
+export type SkillSelectionState = 'active' | 'shadowed' | 'disabled' | 'hidden'
+export type SkillCompatibilityState =
+  | 'native'
+  | 'instruction_only'
+  | 'degraded'
+  | 'unsupported'
+export type SkillReadinessState = 'ready' | 'needs_setup' | 'unknown'
+
+export interface SkillLifecycle {
+  install_state: SkillInstallState
+  load_state: SkillLoadState
+  selection_state: SkillSelectionState
+  compatibility_state: SkillCompatibilityState
+  readiness_state: SkillReadinessState
+}
+
+export interface SkillDiagnostic {
+  code: string
+  severity: string
+  phase: string
+  blocking: boolean
+  message: string
+  hint?: string
+  details?: Record<string, unknown>
+}
+
+export interface SkillSourceResolution {
+  source?: string
+  requestedIdentifier?: string
+  canonicalIdentifier?: string
+  packageIdentifier?: string
+  publisher?: string
+  version?: string
+  immutableRevision?: string
+  upstreamUrl?: string
+  artifactKind?: string
+  artifactDigest?: string
+  resolverContentHash?: string
+  trustState?: string
+  immutable?: boolean
+  diagnostics?: SkillDiagnostic[]
+}
+
+export interface SkillInvocationCapability {
+  model_catalog: boolean
+  skill_view: boolean
+  user_completion: boolean
+  direct_command: boolean
+  argument_substitution: boolean
+  scoped_tool_permissions: boolean
+  sandbox_execution: 'unknown' | string
+}
+
 export interface SkillDependencyInstallOutcome {
   success: boolean
   complete: boolean
@@ -89,6 +165,9 @@ export interface SkillDependencyInstallOutcome {
 
 export interface Skill {
   name: string
+  disabled?: boolean
+  user_invocable?: boolean
+  disable_model_invocation?: boolean
   description?: string
   description_zh?: string
   emoji?: string
@@ -108,6 +187,30 @@ export interface Skill {
   homepage?: string
   file_path?: string
   content?: string
+  instance_id?: string
+  install_id?: string
+  installed?: boolean
+  active?: boolean
+  instruction_usable?: boolean
+  lifecycle?: SkillLifecycle
+  diagnostics?: SkillDiagnostic[]
+  invocation?: SkillInvocationCapability
+  visibility?: 'public' | 'meta' | 'internal' | 'tombstone' | 'experimental' | string
+  invocation_mode?: 'direct' | 'meta_only' | 'coding_only' | 'historical_only' | 'experimental_internal' | string
+  owner_meta_skills?: string[]
+  generation?: number
+  digest?: string
+  source?: string
+  dependency_count?: number
+  dependencies?: Array<{
+    name: string
+    available: boolean
+    visibility?: string
+    invocation?: string
+    owners?: string[]
+    digest?: string
+    source?: string
+  }>
 }
 
 export interface Proposal {
@@ -155,10 +258,17 @@ export interface ProposalsSettings {
 export interface RegistryResult {
   name: string
   description?: string
+  version?: string
+  author?: string
   identifier?: string
   source?: string
   trust_level?: string
   installed?: boolean
+  install_reference?: string
+  installReference?: string
+  lifecycle?: SkillLifecycle
+  instruction_usable?: boolean
+  diagnostics?: SkillDiagnostic[]
 }
 
 export interface SkillLayerGroup {

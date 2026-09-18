@@ -24,6 +24,22 @@
       <section class="sk-detail__body">
         <p class="sk-detail__desc">{{ localizedSkillDescription(skill, String(locale)) }}</p>
 
+        <div v-if="canSetEnabled && !isMetaSkill(skill) && skill.name !== 'code-task'" class="sk-detail__section">
+          <div class="sk-detail__section-title">{{ t('cronSkills.skillDetail.allowUse') }}</div>
+          <p class="sk-detail__advisory-note">{{ t('cronSkills.skillDetail.allowUseHelp') }}</p>
+          <button
+            type="button"
+            role="switch"
+            :aria-checked="!skill.disabled"
+            :aria-label="t('cronSkills.skillDetail.allowUse')"
+            class="btn btn--sm"
+            :disabled="mutationDisabled || settingEnabled"
+            @click="emit('setEnabled', skill.name, Boolean(skill.disabled))"
+          >
+            {{ settingEnabled ? t('cronSkills.skillDetail.saving') : skill.disabled ? t('cronSkills.skillDetail.enable') : t('cronSkills.skillDetail.disable') }}
+          </button>
+        </div>
+
         <div v-if="isMetaSkill(skill) && skill.triggers && skill.triggers.length" class="sk-detail__section">
           <div class="sk-detail__section-title">{{ t('cronSkills.skillDetail.triggers') }}</div>
           <div class="sk-detail__sub-list">
@@ -156,7 +172,7 @@
             <button
               v-else
               class="btn btn--primary btn--sm"
-              :disabled="installingDepsId === i.id"
+              :disabled="mutationDisabled || installingDepsId === i.id"
               @click="emit('installDeps', skill.name, i.id)"
             >
               {{ installingDepsId === i.id ? t('cronSkills.skillDetail.installing') : t('cronSkills.skillDetail.installVia', { kind: i.kind }) }}
@@ -172,12 +188,13 @@
           <div class="sk-detail__section-title">SKILL.md</div>
           <div v-if="loadingContent" class="sk-detail__content-state">{{ t('cronSkills.skillDetail.loadingContent') }}</div>
           <div v-else-if="contentError" class="sk-detail__content-state sk-detail__content-state--error">{{ contentError }}</div>
+          <div v-else-if="skill.disabled" class="sk-detail__content-state">{{ t('cronSkills.skillDetail.disabledContent') }}</div>
           <pre v-else class="sk-detail__pre">{{ skill.content || t('cronSkills.skillDetail.emptyContent') }}</pre>
         </div>
       </section>
       <footer class="sk-detail__foot">
         <small v-if="skill.file_path" class="sk-dim sk-detail__path">{{ skill.file_path }}</small>
-        <button v-if="skill.layer === 'managed'" class="btn btn--sm" :disabled="uninstallingName === skill.name" @click="emit('uninstall', skill.name)">
+        <button v-if="skill.layer === 'managed'" class="btn btn--sm" :disabled="mutationDisabled || uninstallingName === skill.name" @click="emit('uninstall', skill.name, skill.install_id || '')">
           {{ uninstallingName === skill.name ? t('cronSkills.skillDetail.removing') : t('cronSkills.skillDetail.remove') }}
         </button>
       </footer>
@@ -215,12 +232,16 @@ const props = defineProps<{
   installFeedback: string
   installingDepsId: string | null
   uninstallingName: string | null
+  mutationDisabled?: boolean
+  canSetEnabled?: boolean
+  settingEnabled?: boolean
 }>()
 
 const emit = defineEmits<{
   close: []
   installDeps: [name: string, installId: string]
-  uninstall: [name: string]
+  uninstall: [name: string, installId: string]
+  setEnabled: [name: string, enabled: boolean]
 }>()
 
 const dialogRef = ref<HTMLDialogElement | null>(null)

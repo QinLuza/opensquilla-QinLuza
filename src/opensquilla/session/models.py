@@ -135,6 +135,12 @@ class SessionNode(SQLModel, table=True):
     auth_profile_override_source: str | None = None
     context_tokens: int | None = None
 
+    # Per-session routing strategy. ``None`` is retained only for rows created
+    # before session routing existed; the manager/storage resolver atomically
+    # materializes it to the then-current global mode before use.
+    model_routing_mode: str | None = None
+    model_routing_revision: int = 0
+
     # Token tracking
     input_tokens: int = 0
     output_tokens: int = 0
@@ -192,6 +198,10 @@ class SessionNode(SQLModel, table=True):
     # and continue to resolve the Agent/default OpenSquilla workspace.
     workspace_id: str | None = Field(default=None, index=True)
 
+    # Backend-owned execution root for new ordinary tasks. NULL is the legacy
+    # path-resolution contract, not a request to allocate a new directory.
+    execution_workspace: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+
     # Agent id for multi-agent support
     agent_id: str = "main"
 
@@ -212,12 +222,20 @@ class TranscriptEntry(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     session_id: str = Field(index=True)
     session_key: str = Field(index=True)
+    # Callers may supply a stable identity for streamed assistant publication;
+    # storage treats that identity as an upsert key without requiring a schema
+    # or migration change.
     message_id: str = Field(default_factory=_new_uuid)
     role: str  # user | assistant | system | tool
     content: str | None = None
     tool_calls: list[dict[str, Any]] | None = Field(default=None, sa_column=Column(JSON))
     tool_call_id: str | None = None
     reasoning_content: str | None = None
+    # Accepted provider messages, separate from the turn's display aggregates.
+    # None identifies legacy rows whose original message boundaries are unknown.
+    assistant_replay: dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSON), repr=False
+    )
     turn_usage: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
     # Gateway-owned causal identity shared by every durable row in one turn.
     # Additive JSON keeps older readers and pre-identity transcript rows valid.
@@ -285,6 +303,97 @@ class PlanRunRecord(SQLModel, table=True):
     schema_version: int = 1
 
 
+class GoalRecord(SQLModel, table=True):
+    """The single server-authoritative Goal for one session generation.
+
+    Goal execution is deliberately not a PlanRun overlay.  ``session_key`` is
+    the current-row identity, while ``session_id`` plus ``session_epoch`` fence
+    every task/tool write against reset and replacement races.
+    """
+
+    __tablename__ = "session_goals"
+
+    session_key: str = Field(
+        primary_key=True,
+        max_length=512,
+        foreign_key="sessions.session_key",
+    )
+    session_id: str = Field(index=True)
+    session_epoch: int = 0
+    goal_id: str = Field(default_factory=_new_uuid, unique=True, index=True)
+    objective: str
+    status: str = Field(default="active", index=True)
+
+    # Monotonic compare-and-set fences.  Timestamps are presentation fields and
+    # must never be used as optimistic-concurrency tokens.
+    state_revision: int = 1
+    objective_revision: int = 1
+    progress_revision: int = 0
+    progress_json: dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSON),
+    )
+
+    continuation_seq: int = 0
+    active_task_id: str | None = Field(default=None, index=True)
+    # Durable product anchor for the user transcript row that created this
+    # Goal.  Unlike objective text, this identity remains unambiguous after an
+    # edit and lets reconnecting clients restore the lightweight origin label.
+    source_user_message_id: str | None = None
+    # Internal replay fence for the task that durably committed the current
+    # structured complete/blocked result.  This is intentionally not exposed
+    # under its storage name: snapshots only project its semantic turn
+    # identity as ``terminalTurnId``.
+    terminal_task_id: str | None = None
+    turns_started: int = 0
+    turns_settled: int = 0
+    window_turns_started: int = 0
+
+    active_time_ms: int = 0
+    window_active_time_ms: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    total_tokens: int = 0
+
+    token_budget: int | None = None
+    budget_tokens_used: int = 0
+    usage_accounting_version: int = 1
+    usage_coverage: str = "complete"
+    usage_accounting_started_at_ms: int | None = None
+    background: bool = False
+
+    pause_reason: str | None = None
+    blocked_reason: str | None = None
+    terminal_reason: str | None = None
+    created_at_ms: int = Field(default_factory=_now_ms)
+    updated_at_ms: int = Field(default_factory=_now_ms)
+    finished_at_ms: int | None = None
+    schema_version: int = 1
+
+class GoalCommandReceiptRecord(SQLModel, table=True):
+    """Durable idempotency result for one accepted Goal mutation."""
+
+    __tablename__ = "goal_command_receipts"
+
+    receipt_id: str = Field(default_factory=_new_uuid, primary_key=True)
+    source_scope: str = Field(index=True, max_length=256)
+    request_session_key: str = Field(
+        index=True,
+        max_length=512,
+        foreign_key="sessions.session_key",
+    )
+    client_request_id: str = Field(max_length=64)
+    action: str = Field(max_length=32)
+    request_fingerprint: str = Field(max_length=128)
+    accepted_session_id: str = Field(index=True)
+    accepted_session_epoch: int = 0
+    response_json: dict[str, Any] = Field(sa_column=Column(JSON))
+    created_at_ms: int = Field(default_factory=_now_ms)
+
+
 class SessionSummary(SQLModel, table=True):
     """Compaction summary record — stores merged summaries of older transcript segments."""
 
@@ -308,7 +417,6 @@ class SessionSummary(SQLModel, table=True):
     removed_count: int = 0
     kept_count: int = 0
     chunk_count: int = 0
-    flush_receipt_status: str = "unknown"
     # The transcript entry id up to which this summary covers (inclusive)
     covered_through_id: int = 0
     created_at: int = Field(default_factory=_now_ms)
@@ -342,7 +450,7 @@ class SessionContextState(SQLModel, table=True):
 
 
 class MemoryDurableReceipt(SQLModel, table=True):
-    """Durable ledger row for memory checkpoint and flush outcomes."""
+    """Durable ledger row for deterministic memory checkpoint outcomes."""
 
     __tablename__ = "memory_durable_receipts"
 
@@ -352,7 +460,6 @@ class MemoryDurableReceipt(SQLModel, table=True):
     turn_id: str | None = Field(default=None, index=True)
     scope: str = Field(index=True)
     source_path: str | None = None
-    target_path: str | None = None
     content_hash: str | None = None
     coverage_turn_id: str | None = Field(default=None, index=True)
     coverage_hash: str | None = Field(default=None, index=True)
@@ -360,8 +467,6 @@ class MemoryDurableReceipt(SQLModel, table=True):
     idempotency_key: str = Field(index=True, unique=True)
     status: str = Field(index=True)
     reason: str | None = None
-    attempt_count: int = 0
-    next_retry_at_ms: int | None = None
     created_at: int = Field(default_factory=_now_ms)
     updated_at: int = Field(default_factory=_now_ms)
     schema_version: int = 1

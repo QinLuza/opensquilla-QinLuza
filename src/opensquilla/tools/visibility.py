@@ -9,7 +9,6 @@ from enum import StrEnum
 import structlog
 
 from opensquilla.provider.types import ToolDefinition
-from opensquilla.tools.plan_access import plan_access_allows
 from opensquilla.tools.policy_runtime import (
     ToolSurfaceCapabilities,
     resolve_runtime_tool_surface,
@@ -68,6 +67,7 @@ _CHANNEL_DEFAULT_ALLOW: frozenset[str] = frozenset(
         "web_discover",
         "web_fetch",
         "web_search",
+        "tool_search",
     }
 )
 
@@ -275,9 +275,6 @@ def effective_tool_context(
 
 
 def is_tool_visible(rt: RegisteredTool, ctx: ToolContext | None = None) -> bool:
-    if not plan_access_allows(rt.spec, ctx):
-        log.debug("tool_filtered", tool=rt.spec.name, reason="plan_mode_denied")
-        return False
     if not guest_safe_tool_allowed(ctx, rt.spec.name):
         log.debug("tool_filtered", tool=rt.spec.name, reason="guest_safe_not_allowed")
         return False
@@ -300,7 +297,7 @@ def is_tool_visible(rt: RegisteredTool, ctx: ToolContext | None = None) -> bool:
         )
     )
     if (
-        not rt.spec.exposed_by_default
+        rt.spec.default_access == "deny"
         and not explicitly_allowed
         and not surfaced
         and not channel_profile_visible

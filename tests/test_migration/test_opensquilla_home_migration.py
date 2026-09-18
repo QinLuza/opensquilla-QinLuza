@@ -7,8 +7,8 @@ real released-era config shape.
 
 from __future__ import annotations
 
+import hashlib
 import json
-import multiprocessing
 import os
 import shutil
 import sqlite3
@@ -54,6 +54,7 @@ from opensquilla.session.storage import SessionStorage
 
 FIXTURE_CONFIG = Path(__file__).parent / "fixtures" / "homes" / "cli-0.1" / "config.toml"
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
+LEGACY_GOAL_FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "legacy-goal-lineage"
 PORTABLE_RELEASE_MANIFEST = (
     Path(__file__).resolve().parents[1]
     / "test_recovery"
@@ -98,17 +99,32 @@ def _isolate_profile_operation_locks(
     monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "user-state"))
 
 
-def _probe_gateway_lock(state_dir: str, queue: multiprocessing.Queue) -> None:
-    from opensquilla.gateway.pidlock import GatewayPidLock
+def _probe_gateway_lock(state_dir: Path) -> str:
+    # Probe the real OS lock without spawning a re-import of the Gateway test module.
+    script = """
+import sys
+from opensquilla.recovery.locking import (
+    acquire_gateway_legacy_lease,
+    release_gateway_legacy_lease,
+)
 
-    lock = GatewayPidLock(state_dir)
-    try:
-        lock.acquire()
-    except SystemExit:
-        queue.put("busy")
-    else:
-        queue.put("acquired")
-        lock.release()
+assert "opensquilla.gateway" not in sys.modules
+lease = acquire_gateway_legacy_lease(sys.argv[1])
+try:
+    print("busy" if lease is None else "acquired")
+finally:
+    release_gateway_legacy_lease(lease)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(state_dir)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    outcome = result.stdout.strip()
+    assert outcome in {"busy", "acquired"}, result.stdout
+    return outcome
 
 # Base scheduler_jobs DDL as scheduler/persistence.py creates it (the
 # ``enabled`` column arrived later via a conditional column add).
@@ -527,6 +543,40 @@ def test_profile_import_preserves_unmodified_toml_bytes_and_comments(
 
     assert not _errors(report)
     assert (target / "config.toml").read_bytes() == source_config
+
+
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
+def test_profile_import_removes_retired_inline_memory_fields_without_reformatting(
+    tmp_path: Path, newline: bytes,
+) -> None:
+    source = _build_source_home(tmp_path)
+    header = (
+        f"config_version = {config_migration_module.LATEST_CONFIG_VERSION}\n"
+        "# keep operator comments\nport = 18791\n"
+    ).encode()
+    source_config = header + (
+        b'memory = { flush_enabled=true, "flush_triggers"=["manual"], '
+        b"embedding={model='synthetic, } # model'}, capture_assistant = true, "
+        b"repair_enabled=false } # keep memory comment\n"
+    )
+    expected = header + (
+        b"memory = { embedding={model='synthetic, } # model'}, "
+        b"capture_assistant = true} # keep memory comment\n"
+    )
+    source_config = source_config.replace(b"\n", newline)
+    expected = expected.replace(b"\n", newline)
+    (source / "config.toml").write_bytes(source_config)
+    target = tmp_path / "target-home"
+
+    report = _run(source, target, apply=True)
+
+    assert not _errors(report)
+    assert (source / "config.toml").read_bytes() == source_config
+    assert (target / "config.toml").read_bytes() == expected
+    assert tomllib.loads(expected.decode())["memory"] == {
+        "embedding": {"model": "synthetic, } # model"},
+        "capture_assistant": True,
+    }
 
 
 def test_profile_import_losslessly_patches_legacy_paths_and_secret_comments(
@@ -1074,6 +1124,87 @@ def test_schema_ahead_source_refused(tmp_path: Path) -> None:
     assert any("newer OpenSquilla" in item["reason"] for item in errors)
     assert any("V999__future_thing" in item["reason"] for item in errors)
     assert not target.exists()
+
+
+@pytest.mark.parametrize("with_retry", [False, True], ids=["v029", "v029-v030"])
+@pytest.mark.parametrize("with_unknown", [False, True], ids=["legacy", "mixed-unknown"])
+def test_unsupported_goal_lineage_is_not_imported_or_relabelled(
+    tmp_path: Path, with_retry: bool, with_unknown: bool,
+) -> None:
+    # Historical Goal schema is added only to WAL, which every inspection
+    # entry point must preserve along with the original main database.
+    source = _build_source_home(tmp_path)
+    database = source / "state" / "sessions.db"
+    target = tmp_path / "target-home"
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA wal_autocheckpoint=0")
+        migration_ids = ["V029__goal_runs"]
+        if with_retry:
+            migration_ids.append("V030__goal_run_retry")
+        for migration_id in migration_ids:
+            connection.executescript(
+                (LEGACY_GOAL_FIXTURES / f"{migration_id}.sql").read_text(encoding="utf-8")
+            )
+        if with_unknown:
+            migration_ids.append("V999__synthetic_future")
+        connection.executemany(
+            "INSERT INTO _yoyo_migration VALUES (?, ?, '2000-01-01 00:00:00')",
+            [(hashlib.sha256(item.encode()).hexdigest(), item) for item in migration_ids],
+        )
+        connection.commit()
+        rows = connection.execute("SELECT * FROM goal_runs ORDER BY goal_id").fetchall()
+        schema = connection.execute(
+            "SELECT type,name,sql FROM sqlite_master ORDER BY name"
+        ).fetchall()
+        ledger = connection.execute(
+            "SELECT * FROM _yoyo_migration ORDER BY migration_id"
+        ).fetchall()
+        assert len(rows) == 3
+        wal = database.with_name(database.name + "-wal")
+        before = (database.read_bytes(), wal.read_bytes())
+        assert len(before[1]) > 32
+        for apply in (False, True):
+            report = _run(source, target, apply=apply)
+            assert report["preflight"]["schema_ahead"] is True
+            assert any(
+                "unsupported development Goal lineage" in item["reason"]
+                for item in _errors(report)
+            )
+            assert (database.read_bytes(), wal.read_bytes()) == before
+            assert not target.exists()
+        assert connection.execute("SELECT * FROM goal_runs ORDER BY goal_id").fetchall() == rows
+        assert connection.execute(
+            "SELECT type,name,sql FROM sqlite_master ORDER BY name"
+        ).fetchall() == schema
+        assert connection.execute(
+            "SELECT * FROM _yoyo_migration ORDER BY migration_id"
+        ).fetchall() == ledger
+        assert not connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='session_goals'"
+        ).fetchone()
+        assert "V033__goal_runs" not in {row[1] for row in ledger}
+        assert not list((source / "state").glob("*.bak"))
+    finally:
+        connection.close()
+
+
+def test_home_import_recognizes_only_verified_released_alias(tmp_path: Path) -> None:
+    from opensquilla.migration_compatibility import LEGACY_MIGRATION_ALIASES
+
+    migration_id, (_, expected_hash) = next(iter(LEGACY_MIGRATION_ALIASES.items()))
+    source = _build_source_home(tmp_path, applied_ids=(migration_id,))
+    database = source / "state" / "sessions.db"
+    rejected = _run(source, tmp_path / "unverified-target", apply=False)
+    assert rejected["preflight"]["schema_ahead"] is True
+    assert any(
+        "unverified historical migration alias" in item["reason"] for item in _errors(rejected)
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE _yoyo_migration SET migration_hash = ?", (expected_hash,))
+    accepted = _run(source, tmp_path / "verified-target", apply=False)
+    assert accepted["preflight"]["schema_ahead"] is False
 
 
 def test_insufficient_disk_space_refused(tmp_path: Path, monkeypatch) -> None:
@@ -3242,6 +3373,25 @@ def test_windows_lock_reacquire_failure_preserves_profile_transaction(
     assert inspected.stable_code == "transaction_incomplete"
 
 
+@pytest.mark.ci_serial
+def test_gateway_lock_probe_observes_acquire_and_release(tmp_path: Path) -> None:
+    from opensquilla.gateway.pidlock import GatewayPidLock
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    assert _probe_gateway_lock(state_dir) == "acquired"
+
+    lock = GatewayPidLock(state_dir)
+    lock.acquire()
+    try:
+        assert _probe_gateway_lock(state_dir) == "busy"
+    finally:
+        lock.release()
+
+    assert _probe_gateway_lock(state_dir) == "acquired"
+
+
+@pytest.mark.ci_serial
 def test_published_candidate_holds_legacy_gateway_lock_during_validation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3256,16 +3406,7 @@ def test_published_candidate_holds_legacy_gateway_lock_during_validation(
         journal_snapshot: Any,
         journal_payload: dict[str, Any],
     ) -> dict[str, Any]:
-        context = multiprocessing.get_context("spawn" if sys.platform == "win32" else "fork")
-        queue = context.Queue()
-        process = context.Process(
-            target=_probe_gateway_lock,
-            args=(str(target / "state"), queue),
-        )
-        process.start()
-        process.join(timeout=10)
-        assert process.exitcode == 0
-        observed.append(queue.get(timeout=1))
+        observed.append(_probe_gateway_lock(target / "state"))
         return original_validate(migrator, journal_snapshot, journal_payload)
 
     monkeypatch.setattr(

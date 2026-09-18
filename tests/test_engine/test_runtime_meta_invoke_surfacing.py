@@ -1,10 +1,10 @@
 """TurnRunner._build_tools surfaces meta_invoke when meta-skills are loaded.
 
-meta_invoke is registered with ``exposed_by_default=False`` so the tool
+meta_invoke is registered with ``default_access="deny"`` so the tool
 catalogue stays clean in deployments that don't ship meta-skills. When
 at least one ``kind=meta`` skill IS loaded, ``_build_tools`` must add
 ``"meta_invoke"`` to ``ctx.surfaced_tools`` so the registry's visibility
-check at :func:`ToolRegistry._is_visible` lets it through.
+check at :func:`ToolRegistry._iter_visible_tools` lets it through.
 """
 
 from __future__ import annotations
@@ -99,7 +99,7 @@ def test_build_tools_does_not_surface_meta_invoke_without_meta_skills(
     tmp_path: Path,
 ) -> None:
     """When no meta-skills are loaded, meta_invoke stays hidden — its
-    ``exposed_by_default=False`` keeps the catalogue tight for deployments
+    ``default_access="deny"`` keeps the catalogue tight for deployments
     that don't ship meta-skills."""
     registry = get_default_registry()
     loader = _make_loader_without_meta(tmp_path)
@@ -196,7 +196,7 @@ def test_runtime_does_not_hard_auto_invoke_meta_match() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runtime_pipeline_runs_meta_resolution_before_skill_filter(
+async def test_runtime_pipeline_runs_meta_resolution_before_catalog_projection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -232,7 +232,7 @@ async def test_runtime_pipeline_runs_meta_resolution_before_skill_filter(
     )
 
     step_names = [record.step_name for record in turn.metadata["pipeline_steps"]]
-    assert step_names.index("meta_resolution") < step_names.index("filter_skills")
+    assert step_names.index("meta_resolution") < step_names.index("resolve_skill_catalog")
     assert turn.metadata["meta_match"].plan.name == "meta-tiny"
     assert "meta_invoke(name=\"meta-tiny\")" in str(turn.system_prompt)
     assert "meta-tiny" in str(turn.system_prompt)
@@ -279,21 +279,22 @@ async def test_runtime_pipeline_restores_mainline_meta_and_coding_order(
 
     assert [record.step_name for record in turn.metadata["pipeline_steps"]] == [
         "resolve_model",
-        "apply_vision_followup_gate",
         "apply_squilla_router",
         "observe_reasoning_hint",
         "meta_resolution",
         "enforce_coding_mode",
         "meta_command_launch",
-        "filter_skills",
+        "resolve_skill_catalog",
         "inject_subagent_grounding",
         "inject_platform_hint",
         "apply_prompt_cache",
     ]
 
 
+
+
 @pytest.mark.asyncio
-async def test_runtime_pipeline_pins_meta_skill_when_skill_filter_enabled(
+async def test_runtime_pipeline_pins_meta_skill_when_catalog_projection_enabled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -310,8 +311,6 @@ async def test_runtime_pipeline_pins_meta_skill_when_skill_filter_enabled(
 
     loader = _make_loader_with_meta(tmp_path)
     skills_cfg = SimpleNamespace(
-        filter_enabled=True,
-        filter_top_k=5,
         max_skills_prompt_chars=8000,
         injection_mode="system",
     )
@@ -445,7 +444,7 @@ async def test_pipeline_hides_meta_skill_from_prompt_when_auto_trigger_off(
     runner._skill_loader = loader
 
     turn, _provider = await runner._run_pipeline(
-        "what is the capital of France?",  # non-triggering: isolates skills_filter
+        "what is the capital of France?",  # non-triggering: isolates skill_catalog_projection
         "agent:main:test-meta-hidden",
         None,
         None,
@@ -457,7 +456,7 @@ async def test_pipeline_hides_meta_skill_from_prompt_when_auto_trigger_off(
     )
 
     assert "meta-tiny" not in str(turn.system_prompt)
-    assert "meta-tiny" not in (turn.metadata.get("filtered_skill_ids") or [])
+    assert "meta-tiny" not in (turn.metadata.get("skill_catalog_ids") or [])
 
 
 @pytest.mark.asyncio
@@ -476,7 +475,7 @@ async def test_pipeline_shows_meta_skill_when_auto_trigger_on(
     runner._skill_loader = loader
 
     turn, _provider = await runner._run_pipeline(
-        "what is the capital of France?",  # non-triggering: isolates skills_filter
+        "what is the capital of France?",  # non-triggering: isolates skill_catalog_projection
         "agent:main:test-meta-shown",
         None,
         None,
