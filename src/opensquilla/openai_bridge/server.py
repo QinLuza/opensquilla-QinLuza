@@ -41,7 +41,6 @@ import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from opensquilla.cli.gateway_rpc import default_gateway_token
 from opensquilla.gateway_client import GatewayRPCClient, GatewayRPCError
 
 # --------------------------------------------------------------------------
@@ -127,12 +126,21 @@ def _normalize_event_frame(frame: dict[str, Any]) -> dict[str, Any]:
 
 def _gateway_token() -> str:
     token = os.environ.get("OPENSQUILLA_GATEWAY_TOKEN", "").strip()
-    if not token:
-        try:
-            token = default_gateway_token() or ""
-        except Exception:  # noqa: BLE001 - 配置缺失时回退
-            token = ""
-    return token.strip()
+    if token:
+        return token
+    try:
+        # Same resolution order as the CLI's default_gateway_token, but
+        # resolved against the gateway package directly so the bridge does
+        # not import the CLI layer (architecture import contracts).
+        from opensquilla.gateway.config import GatewayConfig
+
+        config_path = os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH", "").strip()
+        cfg = GatewayConfig.load(config_path or None)
+        raw = getattr(getattr(cfg, "auth", None), "token", None)
+        token = raw.strip() if isinstance(raw, str) else ""
+    except Exception:  # noqa: BLE001 - 配置缺失时回退
+        token = ""
+    return token
 
 
 async def _new_client() -> GatewayRPCClient:
