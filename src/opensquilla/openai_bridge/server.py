@@ -219,7 +219,7 @@ async def _create_session(
         {"agentId": agent_id, "displayName": name},
     )
     key = result.get("key") if isinstance(result, dict) else None
-    if not key:
+    if not isinstance(key, str) or not key:
         raise RuntimeError(f"sessions.create 未返回 key: {result!r}")
     return key
 
