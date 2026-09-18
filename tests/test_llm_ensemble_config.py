@@ -47,12 +47,14 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     )
     assert provider.profile_name == "static_openrouter_b5"
     assert [member.provider_config.model for member in provider.proposers] == [
-        "deepseek/deepseek-v4-pro",
-        "z-ai/glm-5.2",
-        "moonshotai/kimi-k2.7-code",
-        "qwen/qwen3.7-max",
+        "deepseek/deepseek-v4.1-flash",
+        "z-ai/glm-5.3-flash",
+        "qwen/qwen3.8-flash",
+        "qwen/qwen3.8-max-0902",
     ]
-    assert provider.aggregator.provider_config.model == "z-ai/glm-5.2"
+    assert provider.aggregator.provider_config.model == "deepseek/deepseek-v4.1-flash"
+    assert {member.thinking for member in provider.proposers} == {"high"}
+    assert provider.aggregator.thinking == "high"
     # The fresh/default shared policy is a one-draft admission floor.
     assert provider.min_successful_proposers == 1
     assert provider.target_successful_proposers == 1
@@ -85,15 +87,15 @@ def test_static_openrouter_b5_does_not_need_model_options() -> None:
 
     assert provider.profile_name == "static_openrouter_b5"
     assert [member.provider_config.model for member in provider.proposers] == [
-        "deepseek/deepseek-v4-pro",
-        "z-ai/glm-5.2",
-        "moonshotai/kimi-k2.7-code",
-        "qwen/qwen3.7-max",
+        "deepseek/deepseek-v4.1-flash",
+        "z-ai/glm-5.3-flash",
+        "qwen/qwen3.8-flash",
+        "qwen/qwen3.8-max-0902",
     ]
-    assert provider.aggregator.provider_config.model == "z-ai/glm-5.2"
+    assert provider.aggregator.provider_config.model == "deepseek/deepseek-v4.1-flash"
 
 
-def test_static_tokenrhythm_b5_mirrors_the_openrouter_lineup() -> None:
+def test_static_tokenrhythm_b5_keeps_its_provider_specific_lineup() -> None:
     cfg = GatewayConfig(
         llm_ensemble={
             "enabled": True,
@@ -114,16 +116,18 @@ def test_static_tokenrhythm_b5_mirrors_the_openrouter_lineup() -> None:
 
     assert provider.profile_name == "static_tokenrhythm_b5"
     assert [member.provider_config.model for member in provider.proposers] == [
-        "deepseek-v4-pro",
-        "glm-5.2",
-        "kimi-k2.7-code",
-        "qwen3.7-max",
+        "deepseek-flash",
+        "glm-5.3-flash",
+        "qwen3.8-flash",
+        "qwen3.8-max",
     ]
     assert all(
         member.provider_config.provider == "tokenrhythm" for member in provider.proposers
     )
+    assert all(member.thinking == "high" for member in provider.proposers)
     assert provider.aggregator.provider_config.provider == "tokenrhythm"
-    assert provider.aggregator.provider_config.model == "glm-5.2"
+    assert provider.aggregator.provider_config.model == "deepseek-flash"
+    assert provider.aggregator.thinking == "high"
     # Same aggregation defaults as the static OpenRouter profile.
     assert provider.min_successful_proposers == 1
     assert provider.proposer_timeout_seconds == 120.0
@@ -154,6 +158,17 @@ def test_static_b5_mode_tables_agree_across_gateway_and_provider() -> None:
         "custom_b5",
         *STATIC_B5_SELECTION_MODE_PROVIDERS,
     }
+
+
+def test_legacy_candidate_roles_alias_stays_importable_from_gateway_config() -> None:
+    # Released extensions import this name directly. It is an alias, not a
+    # second table, so it tracks the canonical two-role contract instead of
+    # resurrecting the retired advisory proposer labels.
+    from opensquilla.gateway.config import LLM_ENSEMBLE_CANDIDATE_ROLES
+    from opensquilla.router_tiers import ENSEMBLE_CANDIDATE_ROLES
+
+    assert LLM_ENSEMBLE_CANDIDATE_ROLES is ENSEMBLE_CANDIDATE_ROLES
+    assert LLM_ENSEMBLE_CANDIDATE_ROLES == ("proposer", "aggregator")
 
 
 def test_router_dynamic_ensemble_allows_empty_custom_model_options() -> None:
@@ -432,10 +447,10 @@ def test_static_openrouter_b5_ensemble_locks_members_across_routed_tiers() -> No
         provider_routing={"z-ai/glm-5.2": "z-ai"},
     )
     expected_proposers = [
-        "deepseek/deepseek-v4-pro",
-        "z-ai/glm-5.2",
-        "moonshotai/kimi-k2.7-code",
-        "qwen/qwen3.7-max",
+        "deepseek/deepseek-v4.1-flash",
+        "z-ai/glm-5.3-flash",
+        "qwen/qwen3.8-flash",
+        "qwen/qwen3.8-max-0902",
     ]
 
     for tier in ("c0", "c1", "c2", "c3"):
@@ -448,12 +463,12 @@ def test_static_openrouter_b5_ensemble_locks_members_across_routed_tiers() -> No
 
         assert provider.profile_name == "static_openrouter_b5"
         assert [member.provider_config.model for member in provider.proposers] == expected_proposers
-        assert provider.aggregator.provider_config.model == "z-ai/glm-5.2"
+        assert provider.aggregator.provider_config.model == "deepseek/deepseek-v4.1-flash"
         assert provider.selection_plan == {
             "strategy": "static_openrouter_b5",
             "profile": "static_openrouter_b5",
             "proposer_models": expected_proposers,
-            "aggregator_model": "z-ai/glm-5.2",
+            "aggregator_model": "deepseek/deepseek-v4.1-flash",
             "proposer_count": 4,
             "configured_min_successful_proposers": 9,
             "effective_min_successful_proposers": 4,
@@ -649,7 +664,7 @@ def _volcengine_inherited() -> ProviderConfig:
     )
 
 
-def test_custom_b5_builds_role_labelled_proposers_and_single_aggregator() -> None:
+def test_custom_b5_builds_canonical_proposers_and_single_aggregator() -> None:
     provider = build_ensemble_provider_from_config(
         config=_custom_b5_config(),
         inherited_provider_config=_volcengine_inherited(),
@@ -658,9 +673,9 @@ def test_custom_b5_builds_role_labelled_proposers_and_single_aggregator() -> Non
 
     assert provider.profile_name == "custom_b5"
     assert [member.label for member in provider.proposers] == [
-        "primary",
-        "fast_check",
-        "contrast",
+        "proposer_1",
+        "proposer_2",
+        "proposer_3",
     ]
     assert [member.provider_config.model for member in provider.proposers] == [
         "doubao-2.0-pro",
@@ -668,6 +683,11 @@ def test_custom_b5_builds_role_labelled_proposers_and_single_aggregator() -> Non
         "kimi-k2.6",
     ]
     assert provider.aggregator.provider_config.model == "deepseek-v4-pro"
+    assert [row["role"] for row in provider.selection_plan["proposers"]] == [
+        "proposer",
+        "proposer",
+        "proposer",
+    ]
     assert provider.selection_plan["aggregator"]["source"] == "candidate_role"
 
 
@@ -796,8 +816,8 @@ def test_candidate_roles_normalize_and_reject_dual_aggregators() -> None:
         }
     )
     assert cfg.llm_ensemble.candidates[0].role == "aggregator"
-    # Unknown roles coerce to unassigned instead of failing gateway boot.
-    assert cfg.llm_ensemble.candidates[1].role == ""
+    # Unknown non-aggregator roles remain safe proposers instead of failing boot.
+    assert cfg.llm_ensemble.candidates[1].role == "proposer"
 
     with pytest.raises(Exception, match="at most one"):
         GatewayConfig(
@@ -808,6 +828,27 @@ def test_candidate_roles_normalize_and_reject_dual_aggregators() -> None:
                 ],
             }
         )
+
+
+def test_released_advisory_roles_normalize_to_proposer() -> None:
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "candidates": [
+                {"provider": "a", "model": f"m{index}", "role": role}
+                for index, role in enumerate(
+                    ("primary", "contrast", "fast_check", "critic"),
+                    start=1,
+                )
+            ],
+        }
+    )
+
+    assert [candidate.role for candidate in cfg.llm_ensemble.candidates] == [
+        "proposer",
+        "proposer",
+        "proposer",
+        "proposer",
+    ]
 
 
 def test_custom_b5_lineup_ready_gates_on_member_credentials(

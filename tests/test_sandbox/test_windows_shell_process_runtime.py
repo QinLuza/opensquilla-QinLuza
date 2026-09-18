@@ -11,11 +11,22 @@ import pytest
 
 from opensquilla.tools.types import CallerKind, ToolContext, current_tool_context
 
+pytestmark = pytest.mark.ci_serial
+
 
 def _windows_runtime() -> SimpleNamespace:
+    # Execution fixtures use workdir="." so a POSIX host's real /tmp workspace
+    # is not interpreted as the simulated Windows backend's virtual /tmp alias.
     return SimpleNamespace(
         effective=SimpleNamespace(sandbox_enabled=True),
         backend=SimpleNamespace(name="windows_default"),
+    )
+
+
+def _noop_runtime() -> SimpleNamespace:
+    return SimpleNamespace(
+        effective=SimpleNamespace(sandbox_enabled=True),
+        backend=SimpleNamespace(name="noop"),
     )
 
 
@@ -76,6 +87,196 @@ def test_windows_exec_command_uses_shell_host_wrapper(monkeypatch, tmp_path) -> 
     assert argv[4] == "Write-Output ok"
     assert argv[5] == str(tmp_path)
     assert argv[6] == str(tmp_path / ".opensquilla-cache" / "shell-host")
+
+
+def test_windows_noop_uses_direct_powershell(monkeypatch) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows direct PowerShell selection is Windows-only")
+
+    from opensquilla.tools.builtin import shell
+
+    powershell_path = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    command = "python -c \"print('ok')\""
+    monkeypatch.setattr(shell, "_trusted_windows_powershell_path", lambda: powershell_path)
+
+    argv = shell._sandbox_shell_backend_argv(command, _noop_runtime())
+
+    assert argv[:-1] == (
+        powershell_path,
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+    )
+    # Python candidates carry the original source as a PowerShell literal for
+    # native AST parsing; doubled apostrophes preserve its exact contents.
+    assert command.replace("'", "''") in argv[-1]
+    assert "exit $global:LASTEXITCODE" in argv[-1]
+    assert "if (-not $?) { exit 1 }" in argv[-1]
+    assert "Invoke-OpenSquillaPythonProcess" not in argv[-1]
+    assert shell._WINDOWS_SANDBOX_SHELL_HOST_CODE not in argv
+
+
+@pytest.mark.parametrize(
+    ("command", "package_bundle"),
+    [
+        ("poetry install", "python-package-install"),
+        ("composer install", "php-package-install"),
+    ],
+)
+def test_windows_noop_package_install_argv_preserves_capability_profile(
+    command: str,
+    package_bundle: str,
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows direct PowerShell classification is Windows-only")
+
+    from opensquilla.sandbox.capability_profile import capability_profile_for_command
+    from opensquilla.tools.builtin import shell
+
+    profile = capability_profile_for_command(
+        shell._sandbox_shell_backend_argv(command, _noop_runtime())
+    )
+
+    assert profile.package_bundles == (package_bundle,)
+    assert profile.network_intent.value == "package_registry"
+    assert profile.confidence.value == "high"
+
+
+def test_posix_noop_keeps_sh() -> None:
+    if os.name == "nt":
+        pytest.skip("POSIX noop shell selection is non-Windows-only")
+
+    from opensquilla.tools.builtin import shell
+
+    argv = shell._sandbox_shell_backend_argv("printf ok", _noop_runtime())
+
+    assert argv == ("sh", "-lc", "printf ok")
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_returncode"),
+    [
+        ("Write-Output opensquilla-noop-exit; exit 7", 7),
+        ("cmd.exe /d /c exit 23", 23),
+    ],
+)
+def test_windows_noop_preserves_final_exit_code(
+    command: str,
+    expected_returncode: int,
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows direct PowerShell execution is Windows-only")
+
+    from opensquilla.tools.builtin import shell
+
+    completed = subprocess.run(
+        shell._sandbox_shell_backend_argv(command, _noop_runtime()),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert completed.returncode == expected_returncode
+
+
+@pytest.mark.asyncio
+async def test_windows_safe_noop_exec_command_runs_without_sh(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows Safe noop execution is Windows-only")
+
+    from opensquilla.gateway.approval_queue import reset_approval_queue
+    from opensquilla.sandbox.config import SandboxSettings
+    from opensquilla.sandbox.integration import configure_runtime, reset_runtime
+    from opensquilla.tools.builtin import shell
+
+    cache_path = os.environ.get("PSModuleAnalysisCachePath")
+    if not cache_path or not Path(cache_path).is_file():
+        pytest.skip("Windows Safe noop cache test requires a prewarmed host cache")
+    _configure_approval_queue(monkeypatch, tmp_path, "auto-approve")
+    configure_runtime(
+        SandboxSettings(run_mode="safe", backend="noop"),
+        workspace=tmp_path,
+    )
+    token = current_tool_context.set(
+        ToolContext(
+            is_owner=True,
+            caller_kind=CallerKind.CLI,
+            workspace_dir=str(tmp_path),
+            session_key="windows-safe-noop-foreground",
+            run_mode="safe",
+        )
+    )
+    try:
+        result = await shell.exec_command(
+            (
+                "Write-Output $env:PSModuleAnalysisCachePath; "
+                "Write-Output opensquilla-noop-foreground; exit 7"
+            ),
+            workdir=str(tmp_path),
+            timeout=15,
+        )
+    finally:
+        current_tool_context.reset(token)
+        reset_runtime()
+        reset_approval_queue()
+
+    assert cache_path in result
+    assert "opensquilla-noop-foreground" in result
+    assert "exit_code=7" in result
+
+
+@pytest.mark.asyncio
+async def test_windows_safe_noop_background_process_runs_without_sh(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows Safe noop execution is Windows-only")
+
+    from opensquilla.gateway.approval_queue import reset_approval_queue
+    from opensquilla.sandbox.config import SandboxSettings
+    from opensquilla.sandbox.integration import configure_runtime, reset_runtime
+    from opensquilla.tools.builtin import shell
+
+    _configure_approval_queue(monkeypatch, tmp_path, "auto-approve")
+    configure_runtime(
+        SandboxSettings(run_mode="safe", backend="noop"),
+        workspace=tmp_path,
+    )
+    token = current_tool_context.set(
+        ToolContext(
+            is_owner=True,
+            caller_kind=CallerKind.CLI,
+            workspace_dir=str(tmp_path),
+            session_key="windows-safe-noop-background",
+            run_mode="safe",
+        )
+    )
+    try:
+        started = await shell.background_process(
+            "Write-Output opensquilla-noop-background; exit 9",
+            workdir=str(tmp_path),
+        )
+        session_id = started.splitlines()[0].split("=", 1)[1]
+        waited = json.loads(await shell.process("wait", session_id=session_id, timeout=10))
+        log = json.loads(await shell.process("log", session_id=session_id))
+    finally:
+        current_tool_context.reset(token)
+        shell._bg_sessions.clear()
+        reset_runtime()
+        reset_approval_queue()
+
+    assert waited["exited"] is True
+    assert waited["session"]["returncode"] == 9
+    assert waited["session"]["timed_out"] is False
+    assert "opensquilla-noop-background" in log["output"]
 
 
 @pytest.mark.asyncio
@@ -560,7 +761,7 @@ async def test_exact_elevation_adds_user_windowsapps_to_host_path(
     try:
         result = await shell.exec_command(
             "winget install Tencent.QQ.NT",
-            workdir=str(tmp_path),
+            workdir=".",
             sandbox_permissions="require_escalated",
             justification="Install the exact package requested by the user.",
         )
@@ -570,8 +771,9 @@ async def test_exact_elevation_adds_user_windowsapps_to_host_path(
 
     assert "host-ok" in result
     assert host_calls
+    assert Path(str(host_calls[0]["cwd"])).resolve() == tmp_path.resolve()
     path_entries = host_calls[0]["env"]["PATH"].split(";")
-    assert path_entries[-1] == str(windows_apps)
+    assert path_entries[-1] == str(windows_apps.resolve())
 
 
 @pytest.mark.asyncio
@@ -1012,7 +1214,7 @@ async def test_exact_windows_host_probe_adds_user_windowsapps_to_host_env(
     try:
         result = await shell.exec_command(
             "where winget",
-            workdir=str(tmp_path),
+            workdir=".",
             sandbox_permissions="require_escalated",
             justification="Locate the exact host executable requested by the user.",
         )
@@ -1022,8 +1224,9 @@ async def test_exact_windows_host_probe_adds_user_windowsapps_to_host_env(
 
     assert "host-ok" in result
     assert host_calls
+    assert Path(str(host_calls[0]["cwd"])).resolve() == tmp_path.resolve()
     assert host_calls[0]["command"] == "where winget"
-    assert host_calls[0]["env"]["PATH"].split(";")[-1] == str(windows_apps)
+    assert host_calls[0]["env"]["PATH"].split(";")[-1] == str(windows_apps.resolve())
 
 
 def test_windows_shell_host_blocks_icmp_diagnostics_when_proxy_allowlist(
@@ -1173,7 +1376,7 @@ async def test_windows_exec_command_does_not_mount_program_files_tools_per_comma
                 "npm view lodash version && "
                 "git ls-remote https://github.com/opensquilla/opensquilla.git HEAD"
             ),
-            workdir=str(tmp_path),
+            workdir=".",
             env={"PATH": f"{node_root}{os.pathsep}{git_root / 'cmd'}"},
         )
     finally:
@@ -1181,6 +1384,7 @@ async def test_windows_exec_command_does_not_mount_program_files_tools_per_comma
 
     assert "ok" in result
     assert backend_requests
+    assert backend_requests[0].cwd == tmp_path.resolve()
     mount_paths = {mount.host_path for mount in backend_requests[0].policy.mounts}
     assert node_root not in mount_paths
     assert git_root not in mount_paths
@@ -1225,6 +1429,7 @@ async def test_windows_exec_command_preserves_terminal_backend_failure(
         return None
 
     async def _fake_run_backend(request, *, runtime=None):
+        assert request.cwd == tmp_path.resolve()
         raise SandboxBackendError("execution lease is busy")
 
     async def _fake_escalation(*args, **kwargs):
@@ -1256,7 +1461,7 @@ async def test_windows_exec_command_preserves_terminal_backend_failure(
     )
     try:
         with pytest.raises(SandboxBackendError, match="execution lease"):
-            await shell.exec_command("Write-Output ok", workdir=str(tmp_path))
+            await shell.exec_command("Write-Output ok", workdir=".")
     finally:
         current_tool_context.reset(token)
 

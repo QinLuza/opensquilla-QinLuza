@@ -1,11 +1,15 @@
 import { describe, expect, it, vi } from 'vitest'
-import { nextTick, ref } from 'vue'
+import { nextTick, ref, type Ref } from 'vue'
+import { createV4SessionReadPort } from '@/adapters/gateway/sessionReadPortV4'
+import type { TransportCallOptions } from '@/adapters/gateway/transportTypes'
 import {
   goalHasRenderedTerminalAnchor,
   normalizeGoal,
   useChatGoals,
   type GoalContinuityStorage,
 } from './useChatGoals'
+import { GoalCenterError, type GoalCapabilities } from '@/modules/goalCenter'
+import type { GoalEvent, GoalReattachInput } from '@/modules/goalContinuity'
 
 const SESSION_KEY = 'agent:main:webchat:test'
 const SESSION_ID = 'session-1'
@@ -94,14 +98,67 @@ function mutation(goal: unknown, extra: Record<string, unknown> = {}) {
   }
 }
 
-function harness(continuityStorage?: GoalContinuityStorage) {
+function harness(
+  continuityStorage?: GoalContinuityStorage,
+  streamGeneration?: Ref<string | null>,
+  connectionEpoch = ref(0),
+) {
   const handlers = new Map<string, (...args: unknown[]) => void>()
+  const toGoalEvent = (value: unknown): GoalEvent => {
+    const source = (value && typeof value === 'object' && !Array.isArray(value))
+      ? value as Record<string, unknown>
+      : {}
+    const nested = Object.prototype.hasOwnProperty.call(source, 'goal')
+      ? source.goal
+      : source
+    const goal = nested && typeof nested === 'object' && !Array.isArray(nested)
+      ? nested as Record<string, unknown>
+      : null
+    const text = (...values: unknown[]) => values.find(item => typeof item === 'string') as string | null ?? null
+    const integer = (...values: unknown[]) => values.find(item => typeof item === 'number') as number | null ?? null
+    return {
+      eventType: text(source.eventType, source.event_type) as GoalEvent['eventType'] ?? 'updated',
+      sessionKey: text(source.sessionKey, source.session_key, source.key, goal?.sessionKey, goal?.session_key),
+      sessionId: text(source.sessionId, source.session_id, goal?.sessionId, goal?.session_id),
+      epoch: integer(source.epoch, source.sessionEpoch, source.session_epoch, goal?.epoch),
+      streamSeq: integer(source.streamSeq, source.stream_seq),
+      streamGeneration: text(source.streamGeneration, source.stream_generation),
+      stateRevision: integer(source.stateRevision, source.state_revision, goal?.stateRevision, goal?.state_revision),
+      progressRevision: integer(source.progressRevision, source.progress_revision, goal?.progressRevision, goal?.progress_revision),
+      objectiveRevision: integer(source.objectiveRevision, source.objective_revision, goal?.objectiveRevision, goal?.objective_revision),
+      previousGoalId: text(source.previousGoalId, source.previous_goal_id),
+      goal: goal as GoalEvent['goal'],
+    }
+  }
   const rpc = {
     call: vi.fn().mockResolvedValue(mutation(goalPayload())),
-    on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
-      handlers.set(event, handler)
-      return () => handlers.delete(event)
+  }
+  const goalCenter = {
+    available: () => true,
+    capabilities: vi.fn(async (): Promise<GoalCapabilities> => ({
+      supported: true,
+      executionEnabled: true,
+      maxTurns: 50,
+      runtimeBudgetSeconds: 3600,
+      methods: ['goals.set'],
+      tokenBudgetSupported: true,
+      backgroundExecutionSupported: true,
+    })),
+    status: async (sessionKey: string) => ({ sessionKey, sessionId: SESSION_ID, epoch: 1, goal: goalPayload() }),
+    set: async (input: { sessionKey: string; objective: string; clientRequestId: string; clientMessageId: string }) => rpc.call('goals.set', input),
+    edit: async (input: any) => rpc.call('goals.edit', input),
+    pause: async (input: any) => rpc.call('goals.pause', input),
+    resume: async (input: any) => rpc.call('goals.resume', input),
+    clear: async (input: any) => rpc.call('goals.clear', input),
+  }
+  const goalContinuity = {
+    reattach: vi.fn((input: GoalReattachInput) => rpc.call('goals.reattach', input)),
+    subscribe: vi.fn((listener: (event: GoalEvent) => void) => {
+      const handler = (payload: unknown) => listener(toGoalEvent(payload))
+      handlers.set('session.event.goal', handler)
+      return { close: () => handlers.delete('session.event.goal') }
     }),
+    dispose: vi.fn(),
   }
   const sessionKey = ref(SESSION_KEY)
   const currentEpoch = ref(0)
@@ -110,9 +167,12 @@ function harness(continuityStorage?: GoalContinuityStorage) {
   const ensureSessionKey = vi.fn(async () => sessionKey.value)
   const ensureSubscribed = vi.fn(async () => true)
   const api = useChatGoals({
-    rpc,
+    goalCenter,
+    goalContinuity,
     sessionKey,
     currentEpoch,
+    streamGeneration,
+    connectionEpoch,
     ensureSessionKey,
     ensureSubscribed,
     onSetAccepted,
@@ -126,6 +186,9 @@ function harness(continuityStorage?: GoalContinuityStorage) {
     currentEpoch,
     notify,
     handlers,
+    goalCenter,
+    connectionEpoch,
+    goalContinuity,
     ensureSessionKey,
     ensureSubscribed,
     onSetAccepted,
@@ -138,6 +201,274 @@ async function flushAsyncWork() {
 }
 
 describe('useChatGoals', () => {
+  it('reuses an unknown Goal set receipt and message identity on retry', async () => {
+    const { api, rpc, currentEpoch } = harness()
+    currentEpoch.value = 1
+    rpc.call.mockRejectedValueOnce(new Error('Connection lost after acceptance'))
+    expect(await api.startGoal('Synthetic uncertain Goal')).toBe(false)
+    const first = rpc.call.mock.calls[0]![1]
+    expect(await api.startGoal('Synthetic uncertain Goal')).toBe(true)
+    expect(rpc.call.mock.calls[1]![1]).toEqual(first)
+    expect(await api.startGoal('Synthetic uncertain Goal')).toBe(true)
+    expect(rpc.call.mock.calls[2]![1].clientRequestId).not.toBe(first.clientRequestId)
+  })
+
+  it('does not replay a removed Goal when the same objective is intentionally created again', async () => {
+    const { api, rpc, currentEpoch } = harness()
+    currentEpoch.value = 1
+    rpc.call.mockRejectedValueOnce(new Error('Connection lost after acceptance'))
+    await api.startGoal('Synthetic clear and recreate')
+    const first = rpc.call.mock.calls[0]![1]
+    api.applyHydration({ key: SESSION_KEY, epoch: 1, goal: goalPayload('active') })
+    rpc.call.mockResolvedValueOnce(mutation(null))
+    await api.clear()
+    await api.startGoal('Synthetic clear and recreate')
+    expect(rpc.call.mock.calls[2]![1].clientRequestId).not.toBe(first.clientRequestId)
+  })
+
+  it('adopts same-revision usage events and preserves pause after late receipts become complete', () => {
+    const { api, handlers } = harness()
+    api.applyHydration({ key: SESSION_KEY, epoch: 1, goalSnapshotStreamSeq: 10,
+      goal: goalPayload('paused', { stateRevision: 3, usageCoverage: 'partial_usage', pauseReason: 'usage_unknown', budgetTokensUsed: 10 }) })
+    const emit = (stream_seq: number, usageCoverage: string, budgetTokensUsed: number) => handlers.get('session.event.goal')?.({
+      session_key: SESSION_KEY, session_id: SESSION_ID, epoch: 1, stream_seq,
+      goal: goalPayload('paused', { stateRevision: 3, usageCoverage, pauseReason: 'usage_unknown', budgetTokensUsed }),
+    })
+    emit(12, 'complete', 45)
+    expect(api.goal.value).toMatchObject({ status: 'paused', usageCoverage: 'complete', budgetTokensUsed: 45 })
+    emit(11, 'partial_usage', 10)
+    expect(api.goal.value).toMatchObject({ status: 'paused', usageCoverage: 'complete', budgetTokensUsed: 45 })
+  })
+
+  it.each(['subscribe', 'hydrate', 'retry'] as const)(
+    'keeps newer Goal events when %s metadata carries an earlier questionnaire cursor',
+    async source => {
+      const metadata = {
+        key: SESSION_KEY,
+        epoch: 1,
+        workspaceId: null,
+        projectWorkspace: null,
+        projectWorkspaceDeferred: false,
+        active_task_group_ids: [],
+        run_mode_lock: { locked: false },
+        pendingUserInputs: [],
+        collaboration: null,
+        routing: null,
+        currentPlan: null,
+        activePlanRun: null,
+        goal: null,
+        goalSnapshotStreamSeq: 0,
+        tasks: [],
+        active_task: null,
+        last_task: null,
+        run_status: 'idle',
+        hydration_complete: true,
+        deferred_fields: [],
+      }
+      const wireResults: Record<string, unknown> = {
+        'sessions.messages.subscribe': {
+          ...metadata,
+          subscribed: true,
+          stream_generation: 'stream-1',
+          current_stream_seq: 0,
+          replay_complete: true,
+          replay_gap_reason: null,
+          replayed_count: 0,
+          ...(source !== 'subscribe' ? {
+            hydration_complete: false,
+            deferred_fields: ['goal', 'goalSnapshotStreamSeq'],
+          } : {}),
+        },
+        'sessions.messages.snapshot': {
+          key: SESSION_KEY,
+          task_id: null,
+          stream_generation: 'stream-1',
+          current_stream_seq: 0,
+          events: [],
+        },
+        'sessions.messages.hydrate': metadata,
+        'sessions.messages.unsubscribe': null,
+      }
+      const transport: Parameters<typeof createV4SessionReadPort>[0] = {
+        generation: 1,
+        request<T>(
+          method: string,
+          _params?: Record<string, unknown>,
+          options?: TransportCallOptions,
+        ): Promise<T> {
+          options?.onSent?.(1)
+          return Promise.resolve(wireResults[method] as T)
+        },
+      }
+      const lease = createV4SessionReadPort(transport).open({
+        sessionKey: SESSION_KEY,
+        includeInitialHistory: false,
+        resumeFrom: { streamGeneration: null, streamSeq: 0 },
+        signal: new AbortController().signal,
+      })
+      try {
+        const live = await lease.live
+        const projected = source === 'subscribe'
+          ? live.initialMetadata
+          : source === 'retry'
+            ? await lease.retryMetadata()
+            : await lease.metadata
+        // A generation-less live event is an authoritative legacy transport
+        // signal. A questionnaire read's older cursor must not change it back.
+        const h = harness(undefined, ref<string | null>(null))
+        h.api.applyHydration(live.initialMetadata)
+        const emit = (revision: number, streamSeq: number, complete = false) => {
+          h.handlers.get('session.event.goal')!({
+            sessionKey: SESSION_KEY,
+            sessionId: SESSION_ID,
+            epoch: 1,
+            streamSeq,
+            goal: goalPayload(complete ? 'complete' : 'active', {
+              stateRevision: revision,
+              progressRevision: revision - 1,
+              ...(complete ? {
+                activeTaskId: null,
+                executionState: 'idle',
+                terminalReason: 'complete',
+              } : {}),
+            }),
+          })
+        }
+        emit(2, 1)
+        emit(3, 2)
+        expect(h.api.activeGoal.value?.stateRevision).toBe(3)
+        expect(h.api.applyHydration(projected)).toBe(false)
+        expect(h.api.activeGoal.value?.stateRevision).toBe(3)
+        emit(4, 3, true)
+        expect(h.api.activeGoal.value).toBeNull()
+        expect(h.api.lastGoal.value).toMatchObject({
+          goalId: 'g1', status: 'complete', stateRevision: 4,
+        })
+      } finally {
+        await lease.close()
+      }
+    },
+  )
+
+  it('loads optional settings only on demand and caches them for the connection', async () => {
+    const { api, goalCenter } = harness()
+    expect(goalCenter.capabilities).not.toHaveBeenCalled()
+    expect(api.tokenBudgetSupported.value).toBe(false)
+    api.arm()
+    await api.prepareExecutionSettings()
+    expect(goalCenter.capabilities).toHaveBeenCalledOnce()
+    expect(api.tokenBudgetSupported.value).toBe(true)
+    expect(api.backgroundExecutionSupported.value).toBe(true)
+    await api.prepareExecutionSettings()
+    expect(goalCenter.capabilities).toHaveBeenCalledOnce()
+  })
+
+  it('omits unconfirmed settings without blocking ordinary Goal creation or editing', async () => {
+    const { api, rpc, goalCenter } = harness()
+    let resolveCapabilities!: (value: GoalCapabilities) => void
+    goalCenter.capabilities.mockImplementationOnce(() => new Promise(resolve => { resolveCapabilities = resolve }))
+    const pending = api.prepareExecutionSettings()
+    api.draftSettings.value = { tokenBudget: null, executionPolicy: 'foreground' }
+    expect(await api.startGoal('Refactor the module')).toBe(true)
+    expect(rpc.call.mock.calls[0]?.[1]).not.toHaveProperty('tokenBudget')
+    expect(rpc.call.mock.calls[0]?.[1]).not.toHaveProperty('executionPolicy')
+    expect(await api.edit('Refactor safely')).toBe(true)
+    expect(rpc.call.mock.calls[1]?.[1]).not.toHaveProperty('tokenBudget')
+    expect(rpc.call.mock.calls[1]?.[1]).not.toHaveProperty('executionPolicy')
+    resolveCapabilities({ supported: true, executionEnabled: true, maxTurns: 50,
+      runtimeBudgetSeconds: 3600, methods: ['goals.set', 'goals.edit'],
+      tokenBudgetSupported: false, backgroundExecutionSupported: false })
+    await pending
+    expect(await api.edit('Refactor on the legacy Gateway')).toBe(true)
+    expect(rpc.call.mock.calls[2]?.[1]).not.toHaveProperty('tokenBudget')
+    expect(rpc.call.mock.calls[2]?.[1]).not.toHaveProperty('executionPolicy')
+  })
+
+  it('keeps an uncertain request identity when reconnect invalidates optional capabilities', async () => {
+    const { api, rpc, goalCenter, connectionEpoch } = harness()
+    await api.prepareExecutionSettings()
+    api.draftSettings.value = { tokenBudget: 10000, executionPolicy: 'background' }
+    rpc.call.mockRejectedValueOnce(new Error('Connection lost after acceptance'))
+    expect(await api.startGoal('Preserve the uncertain Goal identity')).toBe(false)
+    const original = rpc.call.mock.calls[0]![1]
+    connectionEpoch.value += 1
+    expect(await api.startGoal('Preserve the uncertain Goal identity')).toBe(true)
+    expect(goalCenter.capabilities).toHaveBeenCalledTimes(2)
+    expect(rpc.call.mock.calls[1]![1]).toEqual(original)
+    expect(original).toMatchObject({ tokenBudget: 10000, executionPolicy: 'background' })
+  })
+
+  it('keeps an explicit budget draft unsent when the new connection does not support it', async () => {
+    const { api, rpc, goalCenter, notify } = harness()
+    goalCenter.capabilities.mockResolvedValueOnce({ supported: true, executionEnabled: true,
+      maxTurns: 50, runtimeBudgetSeconds: 3600, methods: ['goals.set'],
+      tokenBudgetSupported: false, backgroundExecutionSupported: false })
+    api.draftSettings.value = { tokenBudget: 10000, executionPolicy: 'background' }
+    expect(await api.startGoal('Keep the selected Goal settings')).toBe(false)
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(notify).toHaveBeenCalledOnce()
+    expect(api.draftSettings.value).toEqual({ tokenBudget: 10000, executionPolicy: 'background' })
+  })
+
+  it('does not let an old connection capability response unlock the new connection', async () => {
+    const { api, goalCenter, connectionEpoch } = harness()
+    let resolveOld!: (value: GoalCapabilities) => void
+    goalCenter.capabilities.mockImplementationOnce(() => new Promise(resolve => { resolveOld = resolve }))
+    const oldRequest = api.prepareExecutionSettings()
+    connectionEpoch.value += 1
+    expect(goalCenter.capabilities).toHaveBeenCalledOnce()
+    goalCenter.capabilities.mockResolvedValueOnce({ supported: true, executionEnabled: true,
+      maxTurns: 50, runtimeBudgetSeconds: 3600, methods: ['goals.set'],
+      tokenBudgetSupported: false, backgroundExecutionSupported: false })
+    await api.prepareExecutionSettings()
+    resolveOld({ supported: true, executionEnabled: true, maxTurns: 50,
+      runtimeBudgetSeconds: 3600, methods: ['goals.set'],
+      tokenBudgetSupported: true, backgroundExecutionSupported: true })
+    await oldRequest
+    expect(api.tokenBudgetSupported.value).toBe(false)
+    expect(api.backgroundExecutionSupported.value).toBe(false)
+    expect(goalCenter.capabilities).toHaveBeenCalledTimes(2)
+  })
+
+  it.each([undefined, 'future_coverage', 'partial_usage'])('rejects a new budget for existing untrusted coverage %s without blocking objective edits', async usageCoverage => {
+    const { api, rpc } = harness()
+    await api.prepareExecutionSettings()
+    api.applyHydration({ goal: goalPayload('active', { usageCoverage }), goalSnapshotStreamSeq: 1 })
+    expect(api.goal.value?.usageCoverage).toBe(usageCoverage === 'partial_usage' ? 'partial_usage' : undefined)
+    expect(await api.edit('Keep the objective editable', { tokenBudget: 9000 })).toBe(false)
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(await api.edit('Keep the objective editable')).toBe(true)
+    expect(rpc.call.mock.calls[0]?.[1]).not.toHaveProperty('tokenBudget')
+  })
+
+  it('confirms the current connection before submitting dirty settings after reconnect', async () => {
+    const { api, rpc, goalCenter, connectionEpoch } = harness()
+    api.applyHydration({ goal: goalPayload('active', { usageCoverage: 'complete', tokenBudget: 5000, executionPolicy: 'background' }), goalSnapshotStreamSeq: 1 })
+    await api.prepareExecutionSettings()
+    connectionEpoch.value += 1
+    rpc.call.mockResolvedValueOnce(mutation(goalPayload('active', { usageCoverage: 'complete', tokenBudget: 9000, executionPolicy: 'foreground', stateRevision: 2 })))
+    expect(await api.edit('Preserve the selected changes', { tokenBudget: 9000, executionPolicy: 'foreground' })).toBe(true)
+    expect(goalCenter.capabilities).toHaveBeenCalledTimes(2)
+    expect(rpc.call.mock.calls[0]?.[1]).toMatchObject({ tokenBudget: 9000, executionPolicy: 'foreground' })
+    expect(api.goal.value?.tokenBudget).toBe(9000)
+  })
+
+  it.each([{ tokenBudget: null }, { executionPolicy: 'foreground' as const }, { tokenBudget: 9000 }])('keeps a dirty edit unsent when settings are unsupported: %o', async settings => {
+    const { api, rpc, goalCenter, notify, connectionEpoch } = harness()
+    api.applyHydration({ goal: goalPayload('active', { usageCoverage: 'complete', tokenBudget: 5000, executionPolicy: 'background' }), goalSnapshotStreamSeq: 1 })
+    await api.prepareExecutionSettings()
+    connectionEpoch.value += 1
+    goalCenter.capabilities.mockResolvedValueOnce({ supported: true, executionEnabled: true,
+      maxTurns: 50, runtimeBudgetSeconds: 3600, methods: ['goals.edit'],
+      tokenBudgetSupported: false, backgroundExecutionSupported: false })
+    expect(await api.edit('Keep the edit draft', settings)).toBe(false)
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(notify).toHaveBeenCalledOnce()
+    expect(await api.edit('Update only the objective')).toBe(true)
+    expect(rpc.call.mock.calls[0]?.[1]).not.toHaveProperty('tokenBudget')
+    expect(rpc.call.mock.calls[0]?.[1]).not.toHaveProperty('executionPolicy')
+  })
+
   it('arms and disarms the composer draft', () => {
     const { api } = harness()
     expect(api.draftArmed.value).toBe(false)
@@ -147,10 +478,29 @@ describe('useChatGoals', () => {
     expect(api.draftArmed.value).toBe(false)
   })
 
+  it('applies optional budget and background policy to the initial goal without an extra edit', async () => {
+    const { api, rpc } = harness()
+    await api.prepareExecutionSettings()
+    api.draftSettings.value = { tokenBudget: 10000, executionPolicy: 'background' }
+    expect(await api.startGoal('Refactor the module')).toBe(true)
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(rpc.call.mock.calls[0]?.[1]).toMatchObject({ tokenBudget: 10000, executionPolicy: 'background' })
+    api.disarm()
+    expect(api.draftSettings.value).toEqual({})
+  })
+
+  it.each([0, -1, 1.5, Number.NaN])('does not submit an invalid token budget (%s)', async tokenBudget => {
+    const { api, rpc } = harness()
+    await api.prepareExecutionSettings()
+    api.draftSettings.value = { tokenBudget }
+    expect(await api.startGoal('Refactor the module')).toBe(false)
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
   it('starts from the mutation response after subscription without watchers or polling', async () => {
     vi.useFakeTimers()
     try {
-      const { api, rpc, ensureSubscribed, onSetAccepted } = harness()
+      const { api, rpc, goalContinuity, ensureSubscribed, onSetAccepted } = harness()
       const started = await api.startGoal('  Refactor the module  ')
 
       expect(started).toBe(true)
@@ -181,9 +531,7 @@ describe('useChatGoals', () => {
 
       await vi.advanceTimersByTimeAsync(15_000)
       expect(rpc.call).toHaveBeenCalledTimes(1)
-      expect(rpc.on).toHaveBeenCalledWith('session.event.goal', expect.any(Function))
-      expect(rpc.on).not.toHaveBeenCalledWith('session.event.goal_run', expect.anything())
-      expect(rpc.on).not.toHaveBeenCalledWith('session.event.plan_run', expect.anything())
+      expect(goalContinuity.subscribe).toHaveBeenCalledWith(expect.any(Function))
     } finally {
       vi.useRealTimers()
     }
@@ -409,7 +757,7 @@ describe('useChatGoals', () => {
       goalSnapshotStreamSeq: 4,
       goal: detached,
     })).toBe(true)
-    expect(refreshed.rpc.call).toHaveBeenCalledWith('goals.reattach', {
+    expect(refreshed.goalContinuity.reattach).toHaveBeenCalledWith({
       sessionKey: SESSION_KEY,
       sessionId: SESSION_ID,
       epoch: 1,
@@ -535,7 +883,8 @@ describe('useChatGoals', () => {
     expect(storage.entries()).toHaveLength(0)
   })
 
-  it('offers explicit takeover after automatic reattach fails without using Resume', async () => {
+  it('retries transient reattachment with the same token without takeover or Resume', async () => {
+    vi.useFakeTimers()
     const storage = new MemoryContinuityStorage()
     const first = harness(storage)
     first.rpc.call.mockResolvedValueOnce(mutation(goalPayload(), {
@@ -557,7 +906,7 @@ describe('useChatGoals', () => {
       }),
     })
     await flushAsyncWork()
-    expect(refreshed.api.connectionTakeoverAvailable.value).toBe(true)
+    expect(refreshed.api.connectionTakeoverAvailable.value).toBe(false)
 
     refreshed.rpc.call.mockResolvedValueOnce(mutation(goalPayload('active', {
       continuationDeferredReason: null,
@@ -566,18 +915,19 @@ describe('useChatGoals', () => {
     }), {
       continuityToken: 'continuity-token-2',
     }))
-    expect(await refreshed.api.takeOverConnection()).toBe(true)
-    expect(refreshed.rpc.call).toHaveBeenLastCalledWith('goals.reattach', {
+    await vi.advanceTimersByTimeAsync(500)
+    expect(refreshed.goalContinuity.reattach).toHaveBeenLastCalledWith({
       sessionKey: SESSION_KEY,
       sessionId: SESSION_ID,
       epoch: 1,
       expectedGoalId: 'g1',
-      takeover: true,
+      continuityToken: 'continuity-token-1',
       sourceKind: 'web',
     })
     expect(refreshed.rpc.call).not.toHaveBeenCalledWith('goals.resume', expect.anything())
     expect(refreshed.api.activeGoal.value?.continuationDeferredReason).toBeNull()
     expect(storage.entries()[0]?.[1]).toContain('continuity-token-2')
+    vi.useRealTimers()
   })
 
   it('does not let a cursorless mutation response roll back a newer live execution state', async () => {
@@ -961,9 +1311,10 @@ describe('useChatGoals', () => {
         executionState: 'working',
       }),
     })
-    const error = Object.assign(
-      new Error('The Goal still owns an unsettled task'),
-      { code: 'GOAL_BUSY' },
+    const error = new GoalCenterError(
+      'conflict',
+      'The Goal still owns an unsettled task',
+      { reason: 'busy', retryable: true },
     )
     rpc.call.mockRejectedValueOnce(error)
 

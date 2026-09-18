@@ -1,12 +1,11 @@
 """Router tier presets: config adapter parity, upgrade fixtures, downgrade guard.
 
 The golden fixture (``tests/test_provider/golden/router_tier_profiles.json``)
-was captured from
+originated from
 ``git show staging/provider-overhaul:src/opensquilla/gateway/config.py``
-(the ``_router_tier_profile_defaults`` dict literals at f884d4c9). Every test
-here pins that moving the preset data into packaged TOML changed nothing about
-how existing configs load: the fixture battery shapes come from the upgrade
-audit and must keep loading byte-identically.
+(the ``_router_tier_profile_defaults`` dict literals at f884d4c9) and tracks
+intentional updates to packaged defaults. The fixture battery shapes come
+from the upgrade audit and protect how existing explicit configs load.
 """
 
 from __future__ import annotations
@@ -63,7 +62,7 @@ def test_router_tier_profile_ids_are_exactly_the_legacy_nine() -> None:
 
 
 @pytest.mark.parametrize("profile_id", sorted(LEGACY_NINE))
-def test_profile_defaults_match_pre_registry_dict_literals(profile_id: str) -> None:
+def test_profile_defaults_match_packaged_golden(profile_id: str) -> None:
     assert _router_tier_profile_defaults(profile_id) == _golden()[profile_id]
 
 
@@ -251,9 +250,9 @@ def test_full_default_tree_round_trips_via_to_toml_dict(tmp_path: Path) -> None:
     tiers = cfg.squilla_router.tiers
     assert set(tiers) == {"c0", "c1", "c2", "c3", "image_model"}
     expected_models = {
-        "c0": "qwen3.7-flash",
-        "c1": "deepseek-v4-flash-0731",
-        "c2": "glm-5.2",
+        "c0": "deepseek-v4-flash-0731",
+        "c1": "deepseek-v4-pro-0813",
+        "c2": "kimi-k2.7-code",
         "c3": "glm-5.2",
         "image_model": "kimi-k2.6",
     }

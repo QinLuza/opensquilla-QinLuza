@@ -352,7 +352,87 @@ def test_openai_responses_normal_mode_keeps_tool_name_limit(
         isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
         for event in events
     )
+    assert not any(isinstance(event, ToolUseStartEvent) for event in events)
     assert not any(isinstance(event, DoneEvent) for event in events)
+
+
+def test_openai_responses_malformed_arguments_emit_start_before_terminal_error(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(
+        monkeypatch,
+        captured,
+        httpx.Response(
+            200,
+            json={
+                "id": "resp_incomplete_edit",
+                "model": "gpt-5.4",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_edit",
+                        "name": "write_file",
+                        "arguments": '{"operations":',
+                    }
+                ],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        ),
+    )
+    provider = OpenAIResponsesProvider(api_key="test", model="gpt-5.4")
+
+    events = _collect_events(provider)
+
+    lifecycle = [
+        event
+        for event in events
+        if isinstance(event, ToolUseStartEvent | ToolUseEndEvent | ErrorEvent)
+    ]
+    assert isinstance(lifecycle[0], ToolUseStartEvent)
+    assert lifecycle[0].tool_use_id == "call_edit"
+    assert lifecycle[0].tool_name == "write_file"
+    assert isinstance(lifecycle[1], ErrorEvent)
+    assert lifecycle[1].code == "incomplete_tool_call"
+    assert not any(isinstance(event, ToolUseDeltaEvent | ToolUseEndEvent) for event in events)
+    assert not any(isinstance(event, DoneEvent) for event in events)
+
+
+def test_openai_responses_malformed_call_without_name_does_not_emit_start(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(
+        monkeypatch,
+        captured,
+        httpx.Response(
+            200,
+            json={
+                "id": "resp_missing_name",
+                "model": "gpt-5.4",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_missing_name",
+                        "arguments": '{"operations":',
+                    }
+                ],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        ),
+    )
+    provider = OpenAIResponsesProvider(api_key="test", model="gpt-5.4")
+
+    events = _collect_events(provider)
+
+    assert not any(isinstance(event, ToolUseStartEvent) for event in events)
+    assert any(
+        isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
+        for event in events
+    )
+    assert not any(isinstance(event, ToolUseEndEvent | DoneEvent) for event in events)
 
 
 def test_openai_responses_candidate_mode_retains_semantically_invalid_call(
@@ -1051,3 +1131,26 @@ def test_openai_responses_incomplete_max_output_tokens_reports_length(
 
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.stop_reason == "length"
+
+
+def test_responses_send_enforces_same_physical_token_budget_as_projection(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured, httpx.Response(500))
+    provider = OpenAIResponsesProvider(api_key="test", model="gpt-5.4")
+    config = ChatConfig(
+        max_tokens=8_192,
+        provider_context_window_tokens=8_192,
+        provider_request_max_chars=1_000_000,
+    )
+    projection = provider.project_final_request(
+        [Message(role="user", content="hi")], config=config,
+    )
+    assert not projection.fits
+    events = _collect_events(provider, config=config)
+    assert any(
+        isinstance(event, ErrorEvent) and event.code == "provider_request_budget_exhausted"
+        for event in events
+    )
+    assert captured == {}

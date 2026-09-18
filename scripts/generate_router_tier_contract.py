@@ -17,7 +17,6 @@ from opensquilla.router_tiers import (  # noqa: E402
     CUSTOM_B5_MAX_PROPOSERS,
     CUSTOM_B5_MAX_TOTAL_CALLS,
     CUSTOM_B5_MIN_PROPOSERS,
-    CUSTOM_B5_PROPOSER_ROLES,
     CUSTOM_B5_RECOMMENDED_MAX,
     CUSTOM_B5_RECOMMENDED_MIN,
     CUSTOM_B5_SELECTION_MODE,
@@ -64,6 +63,7 @@ def _profile_block() -> str:
             + f"    proposers: {_json(list(profile.proposer_models))} as const,\n"
             + f"    aggregator: {_json(profile.aggregator_model)},\n"
             + f"    apiKeyEnv: {_json(profile.api_key_env)},\n"
+            + f"    thinkingLevel: {_json(profile.thinking_level)},\n"
             + f"    ownershipRole: {_json(profile.ownership_role)},\n"
             + "  },"
         )
@@ -112,6 +112,7 @@ export interface StaticB5Profile {{
   proposers: readonly string[]
   aggregator: string
   apiKeyEnv: string
+  thinkingLevel: string | null
   ownershipRole: string
 }}
 
@@ -127,7 +128,6 @@ export const SELECTION_MODE_OWNERSHIP_ROLES:
   Readonly<Record<string, string>> = {ownership_roles}
 
 export const ENSEMBLE_CANDIDATE_ROLES = {_json(list(ENSEMBLE_CANDIDATE_ROLES))} as const
-export const ENSEMBLE_PROPOSER_ROLES = {_json(list(CUSTOM_B5_PROPOSER_ROLES))} as const
 export const CUSTOM_B5_MIN_PROPOSERS = {CUSTOM_B5_MIN_PROPOSERS}
 export const CUSTOM_B5_MAX_PROPOSERS = {CUSTOM_B5_MAX_PROPOSERS}
 export const CUSTOM_B5_MAX_TOTAL_CALLS = {CUSTOM_B5_MAX_TOTAL_CALLS}

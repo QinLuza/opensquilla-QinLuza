@@ -40,20 +40,68 @@ describe('App sidebar chrome contract', () => {
     expect(singleDelete).toContain('appStore.removePendingApprovalsForSessions(deleted)')
   })
 
-  it('uses the write-scoped rename RPC for sidebar session titles', () => {
+  it('uses the domain SessionLifecycle for sidebar session titles', () => {
     const renameStart = appSource.indexOf('async function onRenameSession')
     const renameEnd = appSource.indexOf('function removeLocalSessions', renameStart)
     const renameHandler = appSource.slice(renameStart, renameEnd)
 
-    expect(renameHandler).toContain("rpcStore.call('sessions.rename'")
-    expect(renameHandler).not.toContain("rpcStore.call('sessions.patch'")
+    expect(renameHandler).toContain('sessionLifecycle.rename({ key, title: next })')
+    expect(renameHandler).not.toContain("rpcStore.call('sessions.rename'")
   })
 
   it('bounds automatic sidebar RPCs after chat bootstrap admission', () => {
-    expect(appSource).toContain('useSessions(\n  optionalSessionRpcCallOptions,\n)')
-    expect(appSource).toContain('useAgentOptions(optionalSessionRpcCallOptions)')
-    expect(appSource).toContain(
-      'useSessionListSubscription({\n  rpc: rpcStore,\n  callOptions: optionalSessionRpcCallOptions,',
+    expect(appSource).toContain('useSessions(sessionDirectory)')
+    expect(appSource).toContain('useAgentOptions(agentCatalog, optionalSessionReadOptions)')
+    expect(appSource).toContain('SESSION_DIRECTORY_CHANGES_KEY')
+    expect(appSource).toContain('sessionDirectoryChanges.resume()')
+    expect(appSource).not.toContain('useSessionListSubscription')
+  })
+
+  it('admits the app-wide cron lease after critical chat bootstrap traffic', () => {
+    const subscribeStart = appSource.indexOf('function subscribeCronEventsWhenAdmitted')
+    const subscribeEnd = appSource.indexOf('watch(optionalSessionRpcAllowed', subscribeStart)
+    const subscribeCron = appSource.slice(subscribeStart, subscribeEnd)
+    expect(subscribeCron).toContain('optionalSessionRpcAllowed.value')
+    expect(subscribeCron).toContain('cronFinishedSubscription = cronScheduler.subscribe')
+
+    const mountedStart = appSource.indexOf('onMounted(() =>')
+    const mountedEnd = appSource.indexOf('onUnmounted(() =>', mountedStart)
+    expect(appSource.slice(mountedStart, mountedEnd)).not.toContain(
+      'cronFinishedSubscription = cronScheduler.subscribe',
     )
+  })
+
+  it('routes automatic refreshes through the mounted, admitted Gateway lifecycle', () => {
+    expect(appSource).toContain('available: () => gatewayAccess.isAvailable')
+    expect(appSource).toContain('admitted: () => optionalSessionRpcAllowed.value')
+    expect(appSource).toContain('loadSidebar: performSidebarLoad')
+    expect(appSource).toContain('cancelSidebar: cancelPendingRequests')
+    expect(appSource).toContain('return automaticAppRpc.load()')
+    expect(appSource).toContain('automaticAppRpc.schedule()')
+    expect(appSource).toContain('automaticAppRpc.mount()')
+    expect(appSource).toContain('automaticAppRpc.availabilityChanged()')
+    expect(appSource).toContain('automaticAppRpc.admissionChanged()')
+    expect(appSource).toContain('automaticAppRpc.dispose()')
+  })
+
+  it('keeps app-wide approval awareness behind ApprovalCenter', () => {
+    expect(appSource).toContain('APPROVAL_CENTER_KEY')
+    expect(appSource).toContain('approvalCenter.snapshot()')
+    expect(appSource).toContain('approvalCenter.subscribe(onApprovalEvent)')
+    expect(appSource).not.toContain("fetch('/api/approvals'")
+    expect(appSource).not.toContain("rpcStore.on('exec.approval")
+    expect(appSource).not.toContain("rpcStore.on('plugin.approval")
+    expect(appSource).not.toContain("rpcStore.on('_state', onApproval")
+  })
+
+  it('admits approval hydration only after mount and Gateway readiness, rejecting stale results', () => {
+    const seed = appSource.slice(appSource.indexOf('async function seedPendingApprovals()'), appSource.indexOf('function onApprovalEvent('))
+    const request = seed.indexOf('await approvalCenter.snapshot()')
+    expect(seed.slice(0, request)).toContain("if (!appAutomaticRpcMounted || gatewayAccess.availability !== 'available') return")
+    expect(seed.slice(request)).toContain('generation !== approvalSeedGeneration')
+    expect(seed.slice(request)).toContain("gatewayAccess.availability !== 'available'")
+    const availability = appSource.slice(appSource.indexOf('function onApprovalAvailability('), appSource.indexOf('function subscribeApprovals()'))
+    expect(availability).toContain('approvalSeedGeneration++')
+    expect(availability).toContain('void seedPendingApprovals()')
   })
 })

@@ -11,7 +11,8 @@ import re
 import sys
 from collections import Counter
 from collections.abc import AsyncIterator, Iterator, Mapping
-from dataclasses import asdict, dataclass, field
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field, replace
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, cast
 from urllib.parse import urlparse
@@ -20,11 +21,13 @@ from uuid import uuid4
 import httpx
 import structlog
 
+from opensquilla.endpoint_identity import endpoint_replay_source
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.execution_status import compact_provider_status, derive_is_error
 from opensquilla.safety.secret_redaction import redact_secret_text
 from opensquilla.secrets import clean_header_secret
 
+from ._openai_compat_url import _versioned_api_url
 from .app_attribution import is_provider_app_host, provider_app_headers
 from .candidate_artifact import (
     CandidateArtifactBuilder,
@@ -48,11 +51,20 @@ from .error_redaction import (
     redact_upstream_error_text,
     redacted_httpx_error,
 )
-from .failures import retry_after_from_headers
+from .extra_body import merge_extra_body, normalize_extra_body
+from .failures import CONNECTION_FAILED_CODE, is_connection_failure, retry_after_from_headers
 from .fx import TOKENRHYTHM_CNY_PER_USD, TOKENRHYTHM_CNY_PER_USD_NANOS
 from .model_catalog import shared_catalog
-from .model_identity import model_basename
-from .protocol import ProviderConnectionConfig, ProviderMetadata
+from .model_identity import (
+    DEEPSEEK_DIRECT_REASONING_MODEL_IDS,
+    DEEPSEEK_V4_MODEL_IDS,
+    model_basename,
+)
+from .protocol import (
+    ProviderConnectionConfig,
+    ProviderMetadata,
+    ProviderModelListingResponseError,
+)
 from .reasoning_dialects import (
     ReasoningDisableArgs,
     ReasoningEnableArgs,
@@ -64,6 +76,8 @@ from .request_proof import (
     project_final_request_payload,
     protected_tool_result_indexes,
     prove_provider_payload_from_env,
+    provider_request_character_budget,
+    provider_request_token_budget,
 )
 from .stream_assembly import (
     ReasoningAccumulator,
@@ -104,6 +118,7 @@ from .types import (
     ProviderHeartbeatEvent,
     ProviderMessageCountProjection,
     ProviderMessageLimitProof,
+    ProviderReplayState,
     ReasoningDeltaEvent,
     StreamEvent,
     TextDeltaEvent,
@@ -200,47 +215,9 @@ _OPENAI_STREAM_NOOP_CHOICE_KEYS = frozenset(
     {"index", "delta", "finish_reason", "native_finish_reason"}
 )
 _OPENAI_STREAM_NOOP_DELTA_KEYS = frozenset({"content", "role"})
-# Some OpenAI-compatible API roots carry a non-integer version segment before
-# an adapter namespace.  Gemini's documented compatibility root is
-# ``/v1beta/openai``: appending our canonical ``/v1`` again produces the
-# nonexistent ``/v1beta/openai/v1/chat/completions`` endpoint.  Treat these
-# roots exactly like the existing ``/v1`` ... ``/vN`` forms.
-_VERSIONED_BASE_URL_RE = re.compile(
-    r"/v\d+(?:(?:alpha|beta)\d*)?(?:/openai)?$",
-)
-
-
-def _versioned_api_url(base_url: str, path: str) -> str:
-    """Join a canonical ``/v1/...`` path to an API root without duplication."""
-
-    base = base_url.rstrip("/")
-    if path.startswith("/v1/") and _VERSIONED_BASE_URL_RE.search(base):
-        return f"{base}{path[3:]}"
-    return f"{base}{path}"
-
-
 _EPHEMERAL_CACHE_CONTROL: dict[str, str] = {"type": "ephemeral"}
 _DASHSCOPE_MAX_CACHE_MARKERS = 4
 _DASHSCOPE_CACHE_MARKER_ROLES = {"system", "user", "assistant", "tool"}
-_DASHSCOPE_WORKSPACE_MUTATION_TOOLS = frozenset(
-    {
-        "apply_patch",
-        "edit_file",
-        "write_file",
-    }
-)
-_DASHSCOPE_FAILURE_ANCHOR_MARKERS = (
-    "assertionerror",
-    "traceback",
-    "failed",
-    "failure",
-    "error",
-    "exception",
-    "expected",
-    "actual",
-    "exit code:",
-    "exit_code=",
-)
 
 
 def _is_inert_post_terminal_stream_frame(
@@ -281,7 +258,7 @@ def _is_inert_post_terminal_stream_frame(
         return False
 
     if not raw_choices:
-        return has_usage
+        return has_usage or policy.allow_post_terminal_empty_choices
     if not policy.allow_post_terminal_noop_choice or len(raw_choices) != 1:
         return False
 
@@ -408,6 +385,17 @@ def _model_listing_max_output(row: Mapping[str, Any]) -> int:
     return _positive_model_listing_int(top_provider.get("max_completion_tokens"))
 
 
+def _model_listing_supports_vision(row: Mapping[str, Any]) -> bool:
+    """Read the standard OpenRouter modality declaration when present."""
+    architecture = row.get("architecture")
+    if not isinstance(architecture, Mapping):
+        return False
+    modalities = architecture.get("input_modalities")
+    if not isinstance(modalities, list):
+        return False
+    return any(str(modality).strip().lower() == "image" for modality in modalities)
+
+
 def _dashscope_endpoint_family(base_url: str) -> str:
     url = base_url.strip().lower()
     if "coding-intl.dashscope.aliyuncs.com" in url:
@@ -478,6 +466,89 @@ def _openrouter_generation_id_from_headers(
 
 
 _OPENAI_REASONING_TEXT_FIELDS = ("reasoning_content", "reasoning")
+_OPENAI_REPLAY_PROTOCOL = "openai_chat_completions"
+
+
+def _openai_replay_source(provider_kind: str, base_url: str) -> str:
+    endpoint = _versioned_api_url(base_url.rstrip("/"), "/v1/chat/completions")
+    return endpoint_replay_source("openai_compat", provider_kind, endpoint)
+
+
+def _append_openai_reasoning_details(
+    collected: list[dict[str, Any]] | None,
+    payload: Mapping[str, Any],
+    *,
+    streaming: bool = False,
+) -> list[dict[str, Any]] | None:
+    """Assemble logical native blocks without merging opaque encrypted data.
+
+    OpenRouter streams text/summary blocks as consecutive deltas, sometimes
+    all with index zero. Sending those fragments as separate logical blocks
+    breaks continuation (OpenRouterTeam/ai-sdk-provider#520). Type transitions
+    preserve sequence boundaries; conflicting explicit identities do too.
+    Non-streaming responses already contain complete logical blocks.
+    """
+    details = payload.get("reasoning_details")
+    if details is None:
+        return collected
+    if not isinstance(details, list) or any(not isinstance(item, dict) for item in details):
+        raise ValueError("Provider returned malformed reasoning_details")
+    if collected is None:
+        collected = []
+    for detail in deepcopy(details):
+        text_field = {"reasoning.text": "text", "reasoning.summary": "summary"}.get(
+            detail.get("type")
+        )
+        if text_field is not None and text_field in detail:
+            value = detail[text_field]
+            if not isinstance(value, str) and not (text_field == "text" and value is None):
+                raise ValueError("Provider returned malformed reasoning_details")
+        previous = collected[-1] if collected else None
+        if (
+            not streaming
+            or text_field is None
+            or previous is None
+            or previous.get("type") != detail.get("type")
+        ):
+            collected.append(detail)
+            continue
+        metadata_conflicts = any(
+            key != text_field
+            and value not in (None, "")
+            and previous.get(key) not in (None, "")
+            and previous[key] != value
+            for key, value in detail.items()
+        )
+        if metadata_conflicts:
+            collected.append(detail)
+            continue
+        for key, value in detail.items():
+            if key == text_field:
+                previous_text = previous.get(key, "")
+                if text_field == "text":
+                    # OpenRouter permits null text on signature-only frames.
+                    # It contributes no text, regardless of arrival order.
+                    if value is None:
+                        continue
+                    if previous_text is None:
+                        previous_text = ""
+                if not isinstance(value, str) or not isinstance(previous_text, str):
+                    raise ValueError("Provider returned malformed reasoning_details")
+                previous[key] = previous_text + value
+            elif previous.get(key) in (None, ""):
+                previous[key] = value
+    return collected
+
+
+def _has_openai_reasoning_text(payload: Mapping[str, Any]) -> bool:
+    """Distinguish an explicitly empty response field from absent reasoning."""
+    if any(isinstance(payload.get(key), str) for key in _OPENAI_REASONING_TEXT_FIELDS):
+        return True
+    details = payload.get("reasoning_details")
+    return isinstance(details, list) and any(
+        isinstance(detail, Mapping) and isinstance(detail.get("text"), str)
+        for detail in details
+    )
 
 
 def _openai_reasoning_fragments(payload: Mapping[str, Any]) -> tuple[str, ...]:
@@ -498,6 +569,10 @@ def _openai_reasoning_fragments(payload: Mapping[str, Any]) -> tuple[str, ...]:
             text = detail.get("text")
             if isinstance(text, str) and text:
                 fragments.append(text)
+    # Gateways may expose both an alias and the same text in native details.
+    # Read one representation so UI deltas do not duplicate the reasoning.
+    if fragments:
+        return tuple(fragments)
     for reasoning_field in _OPENAI_REASONING_TEXT_FIELDS:
         text = payload.get(reasoning_field)
         if isinstance(text, str) and text:
@@ -635,6 +710,94 @@ def _strip_tool_schema_keywords(value: Any, unsupported: frozenset[str]) -> Any:
     return value
 
 
+_SINGLE_CHILD_SCHEMA_KEYWORDS = frozenset(
+    {
+        "additionalItems",
+        "additionalProperties",
+        "contains",
+        "contentSchema",
+        "else",
+        "if",
+        "items",
+        "not",
+        "propertyNames",
+        "then",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    }
+)
+_SCHEMA_ARRAY_KEYWORDS = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
+_SCHEMA_MAP_KEYWORDS = frozenset(
+    {
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+        "patternProperties",
+        "properties",
+    }
+)
+
+
+def _complete_itemless_arrays_with_string_items(value: Any) -> Any:
+    """Project itemless schema arrays to Gemini's typed wire format.
+
+    Callers must gate this lossy projection to tools whose values have safe
+    textual wire semantics. Only schema-bearing keywords are traversed, so
+    schema-shaped literal values under ``default``, ``enum``, or ``const``
+    remain unchanged.
+    """
+
+    if not isinstance(value, dict):
+        return value
+
+    rebuilt = dict(value)
+    for key in _SINGLE_CHILD_SCHEMA_KEYWORDS:
+        child = rebuilt.get(key)
+        if isinstance(child, dict):
+            rebuilt[key] = _complete_itemless_arrays_with_string_items(child)
+        elif key == "items" and isinstance(child, list):
+            rebuilt[key] = [
+                _complete_itemless_arrays_with_string_items(item)
+                if isinstance(item, dict)
+                else item
+                for item in child
+            ]
+    for key in _SCHEMA_ARRAY_KEYWORDS:
+        children = rebuilt.get(key)
+        if isinstance(children, list):
+            rebuilt[key] = [
+                _complete_itemless_arrays_with_string_items(item)
+                if isinstance(item, dict)
+                else item
+                for item in children
+            ]
+    for key in _SCHEMA_MAP_KEYWORDS:
+        children = rebuilt.get(key)
+        if isinstance(children, dict):
+            rebuilt[key] = {
+                name: _complete_itemless_arrays_with_string_items(child)
+                if isinstance(child, dict)
+                else child
+                for name, child in children.items()
+            }
+    dependencies = rebuilt.get("dependencies")
+    if isinstance(dependencies, dict):
+        rebuilt["dependencies"] = {
+            name: _complete_itemless_arrays_with_string_items(child)
+            if isinstance(child, dict)
+            else child
+            for name, child in dependencies.items()
+        }
+
+    declared_type = rebuilt.get("type")
+    is_array = declared_type == "array" or (
+        isinstance(declared_type, list) and "array" in declared_type
+    )
+    if is_array and "items" not in rebuilt:
+        rebuilt["items"] = {"type": "string"}
+    return rebuilt
+
+
 _DASHSCOPE_THINKING_BUDGET_ENV = "OPENSQUILLA_DASHSCOPE_THINKING_BUDGET"
 _DASHSCOPE_THINKING_BUDGET_MIN = 1024
 _DASHSCOPE_THINKING_BUDGET_MAX = 38_912
@@ -712,13 +875,6 @@ def _extract_think_tags(text: str) -> str:
     """Extract content from <think> tags. Returns empty string if none found."""
     matches = re.findall(r"<think>([\s\S]*?)</think>", text)
     return "\n".join(matches) if matches else ""
-
-
-def _strip_think_tags(text: str) -> str:
-    """Remove <think> tags from text, including unclosed trailing tags."""
-    result = re.sub(r"<think>[\s\S]*?</think>", "", text)
-    result = re.sub(r"<think>[\s\S]*$", "", result)
-    return result.strip()
 
 
 def _on_official_host(policy: OpenAICompatPolicy, base_url: str) -> bool:
@@ -870,13 +1026,6 @@ def _apply_compat_request_constraints(
     tool_choice_auto_only = policy.thinking_tool_choice_auto_only or bool(
         reasoning_rule and reasoning_rule.thinking_tool_choice_auto_only
     )
-    prefer_pinned_over_thinking = (
-        policy.prefer_pinned_tool_choice_over_thinking
-        or bool(
-            reasoning_rule
-            and reasoning_rule.prefer_pinned_tool_choice_over_thinking
-        )
-    )
     if (
         tool_choice_auto_only
         and (
@@ -887,34 +1036,12 @@ def _apply_compat_request_constraints(
         and "tool_choice" in payload
     ):
         tool_choice = payload["tool_choice"]
-        pinned_tool_choice = False
         if isinstance(tool_choice, Mapping):
             tool_choice_type = tool_choice.get("type")
-            pinned_tool_choice = tool_choice_type in {"tool", "function"}
         else:
             tool_choice_type = tool_choice
         if tool_choice_type in {"auto", "none"}:
             payload["tool_choice"] = tool_choice_type
-        elif (
-            prefer_pinned_over_thinking
-            and pinned_tool_choice
-            and not force_thinking
-        ):
-            if reasoning_rule and reasoning_rule.reasoning_format:
-                apply_reasoning_disable(
-                    payload,
-                    reasoning_rule.reasoning_format,
-                    ReasoningDisableArgs(model=model),
-                )
-            else:
-                payload["enable_thinking"] = False
-            payload.pop("thinking_budget", None)
-            payload.pop("reasoning_effort", None)
-            payload.pop("preserve_thinking", None)
-            if reasoning_rule is None:
-                for message in payload.get("messages", ()):
-                    if isinstance(message, dict):
-                        message.pop("reasoning_content", None)
         else:
             # The endpoint rejects required/pinned choices while thinking.
             # Preserve the requested reasoning mode and degrade the selector
@@ -1983,6 +2110,20 @@ def _segment_text_tool_events(
                 events.append(TextDeltaEvent(text=segment.text))
             continue
         if isinstance(segment, RejectedTextToolSegment):
+            id_prefix = {
+                TEXT_TOOL_DIALECT_QWEN_TAG: "qwen_text_rejected",
+                TEXT_TOOL_DIALECT_MINIMAX_XML: "minimax_compat_rejected",
+                TEXT_TOOL_DIALECT_PLAIN_JSON: "text_compat_rejected",
+                TEXT_TOOL_DIALECT_DEEPSEEK_DSML: "deepseek_dsml_rejected",
+            }[segment.dialect]
+            for tool_name in segment.recognized_tool_names:
+                events.append(
+                    ToolUseStartEvent(
+                        tool_use_id=f"{id_prefix}_{uuid4().hex[:12]}",
+                        tool_name=tool_name,
+                        synthetic_from_text=True,
+                    )
+                )
             continue
         if isinstance(segment, InertDsmlSegment):
             raise AssertionError("inert DSML reached executable event conversion")
@@ -2054,14 +2195,14 @@ def _text_tool_rejection_error(
     cache_shape: Mapping[str, Any],
     trace: LLMTraceRecorder,
 ) -> ErrorEvent | None:
-    """Convert one rejected DSML response into a payload-free terminal error."""
+    """Convert rejected text-tool output into a payload-free terminal error."""
 
     details = _text_tool_rejection_details(segments)
     if details is None:
         return None
     reasons, call_count = details
     log.warning(
-        "provider.deepseek_dsml_tool_call_rejected",
+        "provider.text_tool_call_rejected",
         provider=provider_kind,
         model=model,
         reasons=reasons,
@@ -2069,7 +2210,7 @@ def _text_tool_rejection_error(
     )
     trace.record_error(
         code="incomplete_tool_call",
-        message="Provider returned rejected DeepSeek DSML tool-call text",
+        message="Provider returned rejected text-encoded tool-call output",
         metadata={
             "phase": phase,
             "cache_shape": cache_shape,
@@ -2079,7 +2220,7 @@ def _text_tool_rejection_error(
     )
     return ErrorEvent(
         message=(
-            f"{display_name} returned an invalid DeepSeek DSML tool call; "
+            f"{display_name} returned an invalid text-encoded tool call; "
             "no text-encoded tools were executed"
         ),
         code="incomplete_tool_call",
@@ -2092,6 +2233,7 @@ def _synthesize_text_tool_events(
     *,
     provider_kind: str,
     model: str,
+    base_url: str = "",
 ) -> list[ToolUseStartEvent | ToolUseEndEvent]:
     """Compatibility helper backed by the scoped, atomic classifier."""
 
@@ -2099,7 +2241,7 @@ def _synthesize_text_tool_events(
     segments = classify_text_tool_segments(
         full_text,
         tools,
-        dialects=policy.text_tool_profile.dialects_for_model(model),
+        dialects=policy.text_tool_profile.dialects_for_model(model, base_url),
         provider_kind=provider_kind,
         model=model,
     )
@@ -2118,9 +2260,12 @@ def _build_openai_tool(
     tool: ToolDefinition,
     *,
     unsupported_keywords: frozenset[str] = frozenset(),
+    complete_itemless_arrays_with_string_items: bool = False,
 ) -> dict[str, Any]:
     schema = tool.input_schema.model_dump(exclude_none=True, by_alias=True)
     schema = _strip_tool_schema_keywords(schema, unsupported_keywords)
+    if complete_itemless_arrays_with_string_items:
+        schema = _complete_itemless_arrays_with_string_items(schema)
     return {
         "type": "function",
         "function": {
@@ -2151,6 +2296,7 @@ def _dashscope_model_likely_supports_explicit_prompt_cache(model: str) -> bool:
         return True
     return model_name.startswith(
         (
+            "qwen3.8-max",
             "qwen3.7-max",
             "qwen3.6-max-preview",
             "qwen3.7-plus",
@@ -2166,6 +2312,13 @@ def _dashscope_model_likely_supports_explicit_prompt_cache(model: str) -> bool:
     )
 
 
+def _tokenrhythm_model_supports_explicit_prompt_cache(model: str) -> bool:
+    """Return True only for TokenRhythm models with live cache-control proof."""
+
+    model_name = model.rsplit("/", 1)[-1].strip().lower()
+    return model_name in {"qwen3.7-max", "qwen3.8-max"}
+
+
 def _supports_explicit_prompt_cache(
     provider_kind: str,
     model: str,
@@ -2177,6 +2330,8 @@ def _supports_explicit_prompt_cache(
         return cache_mode == "on" or _openrouter_model_likely_supports_explicit_prompt_cache(model)
     if provider_kind == "dashscope":
         return cache_mode == "on" or _dashscope_model_likely_supports_explicit_prompt_cache(model)
+    if provider_kind == "tokenrhythm":
+        return _tokenrhythm_model_supports_explicit_prompt_cache(model)
     return False
 
 
@@ -2189,19 +2344,6 @@ def _openrouter_model_uses_alibaba_message_cache(model: str) -> bool:
     model_name = model_l.rsplit("/", 1)[-1]
     return model_l.startswith("qwen/") or model_name.startswith(
         ("qwen3.6-flash", "qwen3.5-flash", "qwen3-coder")
-    )
-
-
-def _openrouter_anthropic_should_use_top_level_cache(
-    *,
-    provider_kind: str,
-    model: str,
-    cfg: ChatConfig,
-) -> bool:
-    return (
-        provider_kind == "openrouter"
-        and cfg.cache_mode in {"auto", "on"}
-        and _openrouter_model_is_anthropic(model)
     )
 
 
@@ -2292,7 +2434,7 @@ def _log_provider_cache_usage(
     cache_write_tokens: int,
     cache_shape: Mapping[str, Any],
 ) -> None:
-    if provider_kind != "dashscope":
+    if provider_kind not in {"dashscope", "tokenrhythm"}:
         return
     log.info(
         f"{provider_kind}.prompt_cache_usage",
@@ -2369,263 +2511,6 @@ def _attach_cache_control_to_latest_text_messages(
             markers_remaining -= 1
             if markers_remaining <= 0:
                 return
-
-
-def _disambiguate_repeated_tool_call_arguments_for_dashscope(
-    messages: list[dict[str, Any]],
-) -> None:
-    def _content_text(content: Any) -> str:
-        if isinstance(content, str):
-            return content
-        return json.dumps(content, ensure_ascii=False, sort_keys=True)
-
-    def _preview_tool_result(tool_call_id: str) -> str:
-        result = result_messages_by_id.get(tool_call_id)
-        if result is None:
-            return "missing"
-        content = _content_text(result.get("content", ""))
-        preview = content.replace("\n", "\\n")
-        if len(preview) > 160:
-            preview = preview[:157] + "..."
-        return preview
-
-    def _provider_result_details(tool_call_id: str) -> dict[str, Any]:
-        result = result_messages_by_id.get(tool_call_id)
-        if result is None:
-            return {
-                "result_is_error": None,
-                "exit_code": None,
-                "execution_reason": "missing_tool_result",
-                "result_sha256": None,
-                "result_chars": 0,
-                "failure_anchors": [],
-            }
-
-        content = _content_text(result.get("content", ""))
-        result_text = content
-        execution_status: dict[str, Any] | None = None
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError:
-            parsed = None
-        if isinstance(parsed, dict):
-            status = parsed.get("execution_status")
-            if isinstance(status, dict):
-                execution_status = status
-            output = parsed.get("output")
-            if isinstance(output, str):
-                result_text = output
-
-        lowered = result_text.lower()
-        failure_anchors = [
-            line.strip()
-            for line in result_text.splitlines()
-            if line.strip()
-            and any(marker in line.lower() for marker in _DASHSCOPE_FAILURE_ANCHOR_MARKERS)
-        ][:3]
-
-        status_value = (
-            str(execution_status.get("status") or "") if execution_status is not None else ""
-        )
-        inferred_failure = bool(failure_anchors) or bool(
-            re.search(r"\bexit(?: code|_code)[:=]\s*[1-9][0-9]*\b", lowered)
-        )
-        result_is_error = (
-            status_value in {"error", "timeout", "cancelled"}
-            if execution_status is not None
-            else inferred_failure
-        )
-        execution_reason = (
-            str(execution_status.get("reason") or "") if execution_status is not None else ""
-        )
-        if not execution_reason:
-            execution_reason = "failure_anchor" if inferred_failure else "unknown"
-
-        return {
-            "result_is_error": result_is_error,
-            "exit_code": (
-                execution_status.get("exit_code") if execution_status is not None else None
-            ),
-            "execution_reason": execution_reason,
-            "result_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest()[:16],
-            "result_chars": len(content),
-            "failure_anchors": failure_anchors,
-        }
-
-    def _summary_for_omitted_duplicate(
-        *,
-        name: str,
-        arguments: dict[str, Any],
-        repeat_index: int,
-        tool_call_id: str,
-        workspace_epoch: int,
-        latest_workspace_epoch: int,
-    ) -> str:
-        result_details = _provider_result_details(tool_call_id)
-        anchors = json.dumps(
-            result_details["failure_anchors"],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        exit_code = result_details["exit_code"]
-        exit_code_text = "null" if exit_code is None else str(exit_code)
-        result_sha256 = result_details["result_sha256"] or "missing"
-        return (
-            "[Earlier duplicate tool interaction omitted for DashScope replay "
-            f"compatibility: tool={name}, arguments_sha256={_stable_json_hash(arguments)}, "
-            f"repeat_index={repeat_index}, workspace_epoch={workspace_epoch}, "
-            f"latest_workspace_epoch={latest_workspace_epoch}, "
-            f"result_is_error={str(result_details['result_is_error']).lower()}, "
-            f"exit_code={exit_code_text}, "
-            f"execution_reason={result_details['execution_reason']}, "
-            f"result_sha256={result_sha256}, result_chars={result_details['result_chars']}, "
-            f"failure_anchors={anchors}, result_preview="
-            f"{json.dumps(_preview_tool_result(tool_call_id), ensure_ascii=False)}]"
-        )
-
-    result_messages_by_id = {
-        message["tool_call_id"]: message
-        for message in messages
-        if message.get("role") == "tool" and isinstance(message.get("tool_call_id"), str)
-    }
-    tool_name_by_id: dict[str, str] = {}
-    for message in messages:
-        if message.get("role") != "assistant":
-            continue
-        tool_calls = message.get("tool_calls")
-        if not isinstance(tool_calls, list):
-            continue
-        for tool_call in tool_calls:
-            if not isinstance(tool_call, dict):
-                continue
-            tool_call_id = tool_call.get("id")
-            function = tool_call.get("function")
-            name = function.get("name") if isinstance(function, dict) else None
-            if isinstance(tool_call_id, str) and isinstance(name, str):
-                tool_name_by_id[tool_call_id] = name
-
-    occurrences: list[dict[str, Any]] = []
-    seen: dict[tuple[str, str], int] = {}
-    workspace_epoch = 0
-    for message_index, message in enumerate(messages):
-        if message.get("role") == "tool":
-            tool_call_id = message.get("tool_call_id")
-            if (
-                isinstance(tool_call_id, str)
-                and tool_name_by_id.get(tool_call_id) in _DASHSCOPE_WORKSPACE_MUTATION_TOOLS
-                and _provider_result_details(tool_call_id)["result_is_error"] is not True
-            ):
-                workspace_epoch += 1
-            continue
-        if message.get("role") != "assistant":
-            continue
-        tool_calls = message.get("tool_calls")
-        if not isinstance(tool_calls, list):
-            continue
-        for tool_call in tool_calls:
-            if not isinstance(tool_call, dict):
-                continue
-            function = tool_call.get("function")
-            if not isinstance(function, dict):
-                continue
-            name = function.get("name")
-            arguments = function.get("arguments")
-            if not isinstance(name, str) or not isinstance(arguments, str):
-                continue
-            try:
-                parsed_arguments = json.loads(arguments) if arguments else {}
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(parsed_arguments, dict):
-                continue
-            canonical_arguments = json.dumps(
-                parsed_arguments,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            key = (name, canonical_arguments)
-            repeat_index = seen.get(key, 0)
-            seen[key] = repeat_index + 1
-            occurrences.append(
-                {
-                    "key": key,
-                    "message_index": message_index,
-                    "tool_call": tool_call,
-                    "tool_call_id": tool_call.get("id"),
-                    "tool": name,
-                    "arguments": parsed_arguments,
-                    "repeat_index": repeat_index,
-                    "workspace_epoch": workspace_epoch,
-                }
-            )
-
-    if not occurrences:
-        return
-
-    last_occurrence_by_key: dict[tuple[str, str], dict[str, Any]] = {}
-    for occurrence in occurrences:
-        last_occurrence_by_key[occurrence["key"]] = occurrence
-
-    omitted_summaries_by_id: dict[str, str] = {}
-    for occurrence in occurrences:
-        if last_occurrence_by_key.get(occurrence["key"]) is occurrence:
-            continue
-        tool_call_id = occurrence.get("tool_call_id")
-        if not isinstance(tool_call_id, str) or not tool_call_id:
-            continue
-        omitted_summaries_by_id[tool_call_id] = _summary_for_omitted_duplicate(
-            name=str(occurrence["tool"]),
-            arguments=cast(dict[str, Any], occurrence["arguments"]),
-            repeat_index=int(occurrence["repeat_index"]),
-            tool_call_id=tool_call_id,
-            workspace_epoch=int(occurrence["workspace_epoch"]),
-            latest_workspace_epoch=int(
-                last_occurrence_by_key[occurrence["key"]].get("workspace_epoch", 0)
-            ),
-        )
-
-    if not omitted_summaries_by_id:
-        return
-
-    rewritten: list[dict[str, Any]] = []
-    for message in messages:
-        if message.get("role") == "tool" and message.get("tool_call_id") in omitted_summaries_by_id:
-            continue
-        tool_calls = message.get("tool_calls")
-        if message.get("role") != "assistant" or not isinstance(tool_calls, list):
-            rewritten.append(message)
-            continue
-
-        kept_calls: list[dict[str, Any]] = []
-        summaries: list[str] = []
-        for tool_call in tool_calls:
-            if not isinstance(tool_call, dict):
-                kept_calls.append(tool_call)
-                continue
-            tool_call_id = tool_call.get("id")
-            if isinstance(tool_call_id, str) and tool_call_id in omitted_summaries_by_id:
-                summaries.append(omitted_summaries_by_id[tool_call_id])
-            else:
-                kept_calls.append(tool_call)
-        if not summaries:
-            rewritten.append(message)
-            continue
-
-        summary_text = "\n".join(summaries)
-        if kept_calls:
-            next_message = dict(message)
-            next_message["tool_calls"] = kept_calls
-            existing_content = next_message.get("content")
-            next_message["content"] = (
-                f"{existing_content}\n{summary_text}"
-                if isinstance(existing_content, str) and existing_content
-                else summary_text
-            )
-            rewritten.append(next_message)
-        else:
-            rewritten.append({"role": "assistant", "content": summary_text})
-    messages[:] = rewritten
 
 
 def _stable_json_hash(value: Any) -> str:
@@ -2898,8 +2783,10 @@ def _build_openai_messages(
     per tool result, while opensquilla packs multiple tool results into a single
     Message.
 
-    Invariant: tool_result blocks never coexist with text/image blocks in the
-    same Message (agent.py always packs tool results into a dedicated message).
+    Tool results normally arrive in a dedicated message.  The autonomous
+    document loop may additionally place a screenshot image in that message;
+    it is emitted as a trailing user image message because OpenAI-compatible
+    APIs accept only text in a ``role=tool`` payload.
     """
     if isinstance(msg.content, str):
         return [
@@ -2952,8 +2839,14 @@ def _build_openai_messages(
                 }
             )
 
-    # Tool results → one message per result (OpenAI requirement)
+    # Tool results → one message per result (OpenAI requirement).  A browser
+    # screenshot is carried as a separate user image message because the
+    # Chat Completions API accepts only text in a ``role=tool`` payload; doing
+    # this here preserves the tool-call/result pairing while still giving a
+    # vision-capable model the pixels.
     if tool_results:
+        if parts:
+            tool_results.append({"role": "user", "content": parts})
         return tool_results
 
     # Assistant message with tool_calls (preserve text alongside calls)
@@ -3016,6 +2909,8 @@ def _build_openai_wire_messages(
     logical_index_map: dict[int, int] | None = None,
     reasoning_rule: ReasoningModelRule | None = None,
     reasoning_replay_stats: _ReasoningReplayStats | None = None,
+    replay_source: str | None = None,
+    replay_captured_reasoning_content: bool = False,
 ) -> list[dict[str, Any]]:
     """Build the exact OpenAI-compatible wire-message array, without I/O."""
     openai_messages: list[dict[str, Any]] = []
@@ -3042,27 +2937,35 @@ def _build_openai_wire_messages(
             content_blocks = _build_cache_breakpoint_blocks(
                 cfg.cache_breakpoints,
                 max_cache_markers=(
-                    _DASHSCOPE_MAX_CACHE_MARKERS if provider_kind == "dashscope" else None
+                    _DASHSCOPE_MAX_CACHE_MARKERS
+                    if provider_kind in {"dashscope", "tokenrhythm"}
+                    else None
                 ),
             )
             openai_messages.append({"role": "system", "content": content_blocks})
         else:
             openai_messages.append({"role": "system", "content": cfg.system})
-    reasoning_echo_allowed = (
-        _reasoning_echo_allowed_indexes(messages, reasoning_echo_turns)
-        if include_reasoning_content
-        else None
-    )
+    reasoning_echo_allowed = _reasoning_echo_allowed_indexes(messages, reasoning_echo_turns)
     for message_index, message in enumerate(messages):
         if logical_index_map is not None:
             logical_index_map[message_index] = len(openai_messages)
         effective_thinking = _effective_policy_thinking(
             policy, model, thinking=cfg.thinking
         )
+        state = message.provider_replay
+        message_replays_provider_state = replay_provider_state and (
+            state is None
+            or (
+                state.protocol == _OPENAI_REPLAY_PROTOCOL
+                and state.source == replay_source
+                and state.model == model
+            )
+        )
+        echo_allowed = (
+            reasoning_echo_allowed is None or message_index in reasoning_echo_allowed
+        )
         message_replays_reasoning = (
-            include_reasoning_content
-            if reasoning_echo_allowed is None
-            else message_index in reasoning_echo_allowed
+            include_reasoning_content and message_replays_provider_state and echo_allowed
         )
         if (
             reasoning_rule is not None
@@ -3104,8 +3007,39 @@ def _build_openai_wire_messages(
                     policy, model, thinking=effective_thinking
                 )
             ),
-            replay_provider_state=replay_provider_state,
+            replay_provider_state=message_replays_provider_state,
         )
+        if (
+            replay_captured_reasoning_content
+            and provider_kind == "tokenrhythm"
+            and reasoning_rule is None
+            and message.role == "assistant"
+            and message_replays_provider_state
+            and echo_allowed
+            and state is not None
+            and state.native_reasoning_content is not None
+        ):
+            # The official relay accepts captured reasoning independently of
+            # its model's thinking-control dialect. Replay only the original
+            # field from this route, never normalized display text. Exact V4
+            # rules retain precedence, including their tool scope and limit.
+            for built_message in built_messages:
+                if built_message.get("role") == "assistant":
+                    built_message["reasoning_content"] = state.native_reasoning_content
+        if (
+            message.role == "assistant"
+            and message_replays_provider_state
+            and echo_allowed
+            and provider_kind == "openrouter"
+            and state is not None
+            and state.reasoning_details is not None
+        ):
+            for built_message in built_messages:
+                if built_message.get("role") == "assistant":
+                    built_message["reasoning_details"] = deepcopy(state.reasoning_details)
+                    # These are two representations of the same reasoning.
+                    # Native details retain the signatures and block order.
+                    built_message.pop("reasoning_content", None)
         if reasoning_replay_stats is not None and limit is not None:
             for built_message in built_messages:
                 tool_calls = built_message.get("tool_calls")
@@ -3122,7 +3056,11 @@ def _build_openai_wire_messages(
                         (_reasoning_replay_signature(built_message), suppressed_units)
                     )
         openai_messages.extend(built_messages)
-    if provider_kind == "dashscope" and cfg.cache_mode == "on":
+    if (
+        provider_kind in {"dashscope", "tokenrhythm"}
+        and cfg.cache_mode == "on"
+        and explicit_cache_supported
+    ):
         _attach_cache_control_to_latest_text_messages(
             openai_messages,
             max_cache_markers=_DASHSCOPE_MAX_CACHE_MARKERS,
@@ -3192,6 +3130,7 @@ class OpenAIProvider:
         compat: OpenAICompatPolicy | None = None,
         replay_provider_state: bool = True,
         provider_id: str | None = None,
+        extra_body: Mapping[str, Any] | None = None,
     ) -> None:
         self._api_key = clean_header_secret(api_key, label="LLM API key")
         self._model = model
@@ -3210,10 +3149,29 @@ class OpenAIProvider:
         # Keep configured deployment identity separate from the adapter family
         # (``provider_name``) and wire dialect (``_provider_kind``).  A
         # DashScope or DeepSeek instance still needs OpenAI-family behavior,
-        # but must never be attributed to OpenAI in telemetry.
-        self.provider_id = (provider_id or self.provider_name).strip()
-        self._compat = compat or compat_policy_for_kind(self._provider_kind)
+        # but must never be attributed to OpenAI in telemetry.  Direct
+        # construction (tests, ad-hoc embedding) falls back to the dialect
+        # rather than to ``provider_name``: this adapter serves every
+        # OpenAI-compatible dialect, so ``provider_name`` would attribute a
+        # DashScope or OpenRouter instance to OpenAI, which is exactly what
+        # this field exists to prevent.
+        self.provider_id = (provider_id or self._provider_kind).strip()
+        if extra_body and self.provider_id.lower() != "custom":
+            raise ValueError("extra_body is supported only for provider 'custom'")
+        self._extra_body = normalize_extra_body(extra_body)
+        compat_policy = compat or compat_policy_for_kind(self._provider_kind)
+        if self.provider_id.lower() == "custom":
+            compat_policy = replace(
+                compat_policy,
+                allow_post_terminal_empty_choices=True,
+            )
+        self._compat = compat_policy
         self._replay_provider_state = replay_provider_state
+        self._replay_source = _openai_replay_source(self._provider_kind, self._base_url)
+        self._replay_captured_reasoning_content = (
+            self._provider_kind == "tokenrhythm"
+            and is_official_tokenrhythm_endpoint(self._base_url)
+        )
         self._provider_routing: Mapping[str, str] = provider_routing or {}
         # Strict routing pin: send {"only": [...], "allow_fallbacks": false}
         # instead of the default {"order": [...], "allow_fallbacks": true},
@@ -3243,6 +3201,49 @@ class OpenAIProvider:
         """Prevent provider-private reasoning/signature replay for this turn."""
 
         self._replay_provider_state = False
+
+    def can_replay_reasoning(self, message: Message) -> bool:
+        """Whether a captured assistant belongs to this continuation route.
+
+        This provenance check also accepts a captured response without any
+        reasoning. The wire projection separately applies field presence,
+        endpoint contracts, and request-local echo limits.
+        """
+        state = message.provider_replay
+        return bool(
+            self._replay_provider_state
+            and message.role == "assistant"
+            and state is not None
+            and state.protocol == _OPENAI_REPLAY_PROTOCOL
+            and state.source == self._replay_source
+            and state.model == self._model
+        )
+
+    def requires_complete_reasoning_history(
+        self, *, tools: list[ToolDefinition] | bool | None, thinking: bool
+    ) -> bool:
+        """Whether this known route requires reasoning on every past assistant.
+
+        This is a request contract, not a request to mutate stored history.
+        Aggregators with their own narrower rules (notably TokenRhythm) do
+        not inherit DeepSeek's direct-API contract merely from a model name.
+        """
+        if not tools or not thinking:
+            return False
+        model_id = model_basename(self._model)
+        if self._provider_kind == "deepseek":
+            return (
+                model_id in DEEPSEEK_DIRECT_REASONING_MODEL_IDS
+                and self._replay_source
+                == _openai_replay_source("deepseek", "https://api.deepseek.com")
+            )
+        if self._provider_kind == "openrouter" and self._model.startswith("deepseek/"):
+            return (
+                model_id in DEEPSEEK_V4_MODEL_IDS
+                and self._replay_source
+                == _openai_replay_source("openrouter", "https://openrouter.ai/api/v1")
+            )
+        return False
 
     def provider_metadata(self) -> ProviderMetadata:
         """Return read-only non-secret provider metadata for consumers."""
@@ -3302,6 +3303,8 @@ class OpenAIProvider:
             replay_provider_state=self._replay_provider_state,
             reasoning_echo_turns=self._reasoning_echo_turns,
             reasoning_rule=reasoning_rule,
+            replay_source=self._replay_source,
+            replay_captured_reasoning_content=self._replay_captured_reasoning_content,
         )
         return ProviderMessageCountProjection(
             actual_wire_messages=len(wire_messages) + additional_messages,
@@ -3356,6 +3359,8 @@ class OpenAIProvider:
             logical_index_map=logical_index_map,
             reasoning_rule=reasoning_rule,
             reasoning_replay_stats=reasoning_replay_stats,
+            replay_source=self._replay_source,
+            replay_captured_reasoning_content=self._replay_captured_reasoning_content,
         )
         wire_active_user_index = (
             logical_index_map.get(cfg.active_user_message_index)
@@ -3432,6 +3437,13 @@ class OpenAIProvider:
                 _build_openai_tool(
                     tool,
                     unsupported_keywords=self._compat.tool_schema_unsupported_keywords,
+                    complete_itemless_arrays_with_string_items=(
+                        tool.allow_string_item_schema_projection
+                        and self._compat.allows_string_item_schema_projection(
+                            tool.name,
+                            self._base_url,
+                        )
+                    ),
                 )
                 for tool in tools
             ]
@@ -3563,6 +3575,7 @@ class OpenAIProvider:
             cfg=cfg,
             has_tools=bool(tools),
         )
+        merge_extra_body(payload, self._extra_body)
         fallback_reason = (
             "native_is_error_unavailable"
             if any(message.get("role") == "tool" for message in openai_messages)
@@ -3600,7 +3613,8 @@ class OpenAIProvider:
         return project_final_request_payload(
             payload,
             projection_adapter=self._provider_kind,
-            proof_budget=cfg.provider_request_max_chars,
+            proof_budget=provider_request_character_budget(payload, cfg),
+            token_budget=provider_request_token_budget(payload, cfg),
             status_projection_mode="content_envelope",
             fallback_reason=fallback_reason,
             active_user_message_index=wire_active_user_index,
@@ -3716,10 +3730,11 @@ class OpenAIProvider:
 
         from opensquilla.engine.context_budget import coordinate_provider_context_budget
 
-        budget_decision = coordinate_provider_context_budget(
-            payload,
+        budget_decision = await asyncio.to_thread(
+            coordinate_provider_context_budget, payload,
             projection_adapter=self._provider_kind,
-            proof_budget=cfg.provider_request_max_chars,
+            proof_budget=provider_request_character_budget(payload, cfg),
+            token_budget=provider_request_token_budget(payload, cfg),
             status_projection_mode="content_envelope",
             fallback_reason=fallback_reason,
             active_user_message_index=wire_active_user_index,
@@ -3744,8 +3759,9 @@ class OpenAIProvider:
         if budget_decision.proof is not None:
             log.info("provider.request_proof", **budget_decision.proof)
         try:
-            prove_provider_payload_from_env(
-                payload,
+            await asyncio.to_thread(
+                prove_provider_payload_from_env, payload,
+                token_budget=provider_request_token_budget(payload, cfg),
                 projection_adapter=self._provider_kind,
                 status_projection_mode="content_envelope",
                 fallback_reason=fallback_reason,
@@ -3822,8 +3838,14 @@ class OpenAIProvider:
         # poison the next-index computation with a TypeError.
         streamed_thought_signature: str | None = None
         reasoning = ReasoningAccumulator()
+        reasoning_details: list[dict[str, Any]] | None = None
+        native_reasoning_content_parts: list[str] = []
+        reasoning_text_present = False
         tools_by_name = _tool_by_name(tools)
-        text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(self._model)
+        text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(
+            self._model,
+            self._base_url,
+        )
         text_tool_normalizer: TextToolStreamNormalizer | InertCandidateTextNormalizer
         if inert_candidate_output:
             assert candidate_artifact is not None
@@ -3855,6 +3877,7 @@ class OpenAIProvider:
         emitted_stream_event = False
         saw_done_sentinel = False
         finish_reasons: list[str] = []
+        refusal = False
         deferred_native_events = _DeferredStreamEventBuffer()
         deferred_post_native_events = _DeferredStreamEventBuffer()
         pending_native_identity_events: dict[Any, _DeferredStreamEventBuffer] = {}
@@ -4370,6 +4393,8 @@ class OpenAIProvider:
                                 )
                                 return
 
+                            refusal = refusal or bool(delta.get("refusal"))
+
                             # Reasoning content (always parsed, not gated on thinking).
                             # Streamed in real time as ReasoningDeltaEvent; the
                             # accumulator also retains the joined text for DoneEvent.
@@ -4377,6 +4402,24 @@ class OpenAIProvider:
                             # has received reasoning deltas, an empty-stream or
                             # timeout fallback retry would deliver (and bill)
                             # the turn twice.
+                            try:
+                                reasoning_details = _append_openai_reasoning_details(
+                                    reasoning_details, delta, streaming=True
+                                )
+                            except ValueError:
+                                yield ErrorEvent(
+                                    message="Provider returned malformed reasoning_details",
+                                    code="invalid_stream_frame",
+                                )
+                                return
+                            reasoning_text_present |= _has_openai_reasoning_text(delta)
+                            native_reasoning_content = delta.get("reasoning_content")
+                            if isinstance(native_reasoning_content, str):
+                                native_reasoning_content_parts.append(native_reasoning_content)
+                            if delta.get("reasoning_details"):
+                                # Opaque reasoning is still response progress;
+                                # do not retry and replace it as an empty stream.
+                                emitted_stream_event = True
                             for fragment in _openai_reasoning_fragments(delta):
                                 reasoning_event = reasoning.emit(fragment)
                                 if reasoning_event is None:
@@ -5085,6 +5128,19 @@ class OpenAIProvider:
                         trace=trace,
                     )
                     if rejection_error is not None:
+                        for event in _segment_text_tool_events(
+                            normalized_segments,
+                            provider_kind=self._provider_kind,
+                            model=self._model,
+                        ):
+                            if isinstance(event, ToolUseEndEvent):
+                                raise AssertionError(
+                                    "rejected text tool output produced a completed call"
+                                )
+                            emitted_stream_event = True
+                            if isinstance(event, TextDeltaEvent):
+                                visible_assistant_text_parts.append(event.text)
+                            yield event
                         yield rejection_error
                         return
                     for event in _segment_text_tool_events(
@@ -5223,9 +5279,12 @@ class OpenAIProvider:
                         yield TextDeltaEvent(text=candidate_artifact_text)
                     yield DoneEvent(
                         stop_reason=stop_reason,
+                        refusal=refusal,
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
-                        reasoning_content=reasoning_text or None,
+                        reasoning_content=(
+                            reasoning_text or ("" if reasoning_text_present else None)
+                        ),
                         thinking_signature=gemini_thought_sig,
                         reasoning_tokens=reasoning_tokens,
                         cached_tokens=cached_tokens,
@@ -5235,6 +5294,16 @@ class OpenAIProvider:
                         cost_source=cost_source,
                         provider=self.provider_id,
                         billing_receipt=billing_receipt,
+                        provider_replay=ProviderReplayState(
+                            protocol=_OPENAI_REPLAY_PROTOCOL,
+                            source=self._replay_source,
+                            model=self._model,
+                            reasoning_details=reasoning_details,
+                            native_reasoning_content=(
+                                "".join(native_reasoning_content_parts)
+                                if native_reasoning_content_parts else None
+                            ),
+                        ),
                     )
 
         except asyncio.CancelledError:
@@ -5245,17 +5314,22 @@ class OpenAIProvider:
             )
             raise
         except httpx.TimeoutException as exc:
+            code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "timeout"
             safe_error = redact_upstream_error_text(
                 f"Request timed out: {str(exc) or repr(exc)}",
                 api_key=self._api_key,
                 max_len=2000,
             )
             trace.record_error(
-                code="timeout",
+                code=code,
                 message=safe_error,
                 metadata={"phase": "stream", "cache_shape": cache_shape},
             )
-            if stream_timeout_fallback and not emitted_stream_event:
+            if (
+                stream_timeout_fallback
+                and not emitted_stream_event
+                and code != CONNECTION_FAILED_CODE
+            ):
                 event_name = (
                     "openrouter.stream_timeout_fallback_started"
                     if self._provider_kind == "openrouter"
@@ -5345,15 +5419,16 @@ class OpenAIProvider:
                     visible_assistant_text_parts.append(deferred_event.text)
                 yield deferred_event
             deferred_post_native_events.clear()
-            yield ErrorEvent(message=safe_error, code="timeout")
+            yield ErrorEvent(message=safe_error, code=code)
         except httpx.RequestError as exc:
+            code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "request_error"
             safe_error = redact_upstream_error_text(
                 f"Request error: {str(exc) or repr(exc)}",
                 api_key=self._api_key,
                 max_len=2000,
             )
             trace.record_error(
-                code="request_error",
+                code=code,
                 message=safe_error,
                 metadata={"phase": "stream", "cache_shape": cache_shape},
             )
@@ -5372,7 +5447,7 @@ class OpenAIProvider:
                     visible_assistant_text_parts.append(deferred_event.text)
                 yield deferred_event
             deferred_post_native_events.clear()
-            yield ErrorEvent(message=safe_error, code="request_error")
+            yield ErrorEvent(message=safe_error, code=code)
         except CandidateArtifactLimitError as exc:
             message = "Candidate artifact exceeded bounded assembly limits"
             log.warning(
@@ -5539,6 +5614,8 @@ class OpenAIProvider:
                     json=fallback_payload,
                 )
         except httpx.TimeoutException:
+            # The earlier stream may have been accepted; keep compatibility retries finite.
+            code = "timeout"
             safe_error = redact_upstream_error_text(
                 f"Request timed out: {str(timeout_exc) or repr(timeout_exc)}",
                 api_key=self._api_key,
@@ -5551,24 +5628,25 @@ class OpenAIProvider:
                 timeout_phase=type(timeout_exc).__name__,
             )
             trace.record_error(
-                code="timeout",
+                code=code,
                 message=safe_error,
                 metadata={"phase": "non_stream_fallback", "cache_shape": cache_shape},
             )
-            yield ErrorEvent(message=safe_error, code="timeout")
+            yield ErrorEvent(message=safe_error, code=code)
             return
         except httpx.RequestError as exc:
+            code = "request_error"
             safe_error = redact_upstream_error_text(
                 f"Request error: {str(exc) or repr(exc)}",
                 api_key=self._api_key,
                 max_len=2000,
             )
             trace.record_error(
-                code="request_error",
+                code=code,
                 message=safe_error,
                 metadata={"phase": "non_stream_fallback", "cache_shape": cache_shape},
             )
-            yield ErrorEvent(message=safe_error, code="request_error")
+            yield ErrorEvent(message=safe_error, code=code)
             return
 
         response_ids: set[str] = set()
@@ -5745,6 +5823,9 @@ class OpenAIProvider:
         assistant_text_parts: list[str] = []
         visible_assistant_text_parts: list[str] = []
         reasoning = ReasoningAccumulator()
+        reasoning_details: list[dict[str, Any]] | None = None
+        native_reasoning_content_parts: list[str] = []
+        reasoning_text_present = False
         inert_candidate_output = cfg.candidate_output_mode == "inert_artifact"
         candidate_artifact = (
             CandidateArtifactBuilder() if inert_candidate_output else None
@@ -5753,7 +5834,11 @@ class OpenAIProvider:
         trace_tool_calls: list[dict[str, Any]] = []
         tools_by_name = _tool_by_name(tools)
         finish_reasons: list[str] = []
-        text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(self._model)
+        refusal = False
+        text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(
+            self._model,
+            self._base_url,
+        )
         text_tool_normalizer: TextToolStreamNormalizer | InertCandidateTextNormalizer
         if inert_candidate_output:
             assert candidate_artifact is not None
@@ -5778,6 +5863,7 @@ class OpenAIProvider:
                 stop_reason = choice["finish_reason"]
                 finish_reasons.append(str(choice["finish_reason"]))
             message = choice.get("message") or {}
+            refusal = refusal or bool(message.get("refusal"))
 
             text = message.get("content")
             if isinstance(text, str) and text:
@@ -5786,6 +5872,18 @@ class OpenAIProvider:
                     visible_assistant_text_parts.append(visible_text)
                     yield TextDeltaEvent(text=visible_text)
 
+            try:
+                reasoning_details = _append_openai_reasoning_details(reasoning_details, message)
+            except ValueError:
+                yield ErrorEvent(
+                    message="Provider returned malformed reasoning_details",
+                    code="invalid_stream_frame",
+                )
+                return
+            reasoning_text_present |= _has_openai_reasoning_text(message)
+            native_reasoning_content = message.get("reasoning_content")
+            if isinstance(native_reasoning_content, str):
+                native_reasoning_content_parts.append(native_reasoning_content)
             for fragment in _openai_reasoning_fragments(message):
                 reasoning_event = reasoning.emit(fragment)
                 if reasoning_event is not None:
@@ -6018,6 +6116,9 @@ class OpenAIProvider:
                 if isinstance(event, TextDeltaEvent):
                     visible_assistant_text_parts.append(event.text)
                 yield event
+            for deferred_event in deferred_native_events:
+                if isinstance(deferred_event, ToolUseStartEvent):
+                    yield deferred_event
             trace.record_error(
                 code="incomplete_tool_call",
                 message=(
@@ -6047,6 +6148,9 @@ class OpenAIProvider:
                 if isinstance(event, TextDeltaEvent):
                     visible_assistant_text_parts.append(event.text)
                 yield event
+            for deferred_event in deferred_native_events:
+                if isinstance(deferred_event, ToolUseStartEvent):
+                    yield deferred_event
             trace.record_error(
                 code="incomplete_tool_call",
                 message="Provider returned invalid native tool arguments",
@@ -6082,6 +6186,18 @@ class OpenAIProvider:
             trace=trace,
         )
         if rejection_error is not None:
+            for event in _segment_text_tool_events(
+                normalized_segments,
+                provider_kind=self._provider_kind,
+                model=self._model,
+            ):
+                if isinstance(event, ToolUseEndEvent):
+                    raise AssertionError(
+                        "rejected text tool output produced a completed call"
+                    )
+                if isinstance(event, TextDeltaEvent):
+                    visible_assistant_text_parts.append(event.text)
+                yield event
             yield rejection_error
             return
         for event in _segment_text_tool_events(
@@ -6155,9 +6271,10 @@ class OpenAIProvider:
             yield TextDeltaEvent(text=candidate_artifact_text)
         yield DoneEvent(
             stop_reason=stop_reason,
+            refusal=refusal,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            reasoning_content=reasoning_text or None,
+            reasoning_content=reasoning_text or ("" if reasoning_text_present else None),
             thinking_signature=cast(
                 "str | None",
                 tools_acc.first_metadata("thought_signature"),
@@ -6170,6 +6287,16 @@ class OpenAIProvider:
             cost_source=cost_source,
             provider=self.provider_id,
             billing_receipt=billing_receipt,
+            provider_replay=ProviderReplayState(
+                protocol=_OPENAI_REPLAY_PROTOCOL,
+                source=self._replay_source,
+                model=self._model,
+                reasoning_details=reasoning_details,
+                native_reasoning_content=(
+                    "".join(native_reasoning_content_parts)
+                    if native_reasoning_content_parts else None
+                ),
+            ),
         )
 
     async def list_models(self, *, raise_on_error: bool = False) -> list[ModelInfo]:
@@ -6218,12 +6345,12 @@ class OpenAIProvider:
                     if self._provider_kind == "tokenrhythm"
                     else resp.json()
                 )
+                if not isinstance(data, Mapping):
+                    raise TypeError("Provider model catalog must be a JSON object")
                 raw_rows = data.get("data", [])
-                rows = (
-                    [row for row in raw_rows if isinstance(row, Mapping)]
-                    if isinstance(raw_rows, list)
-                    else []
-                )
+                if not isinstance(raw_rows, list):
+                    raise TypeError("Provider model catalog data must be a list")
+                rows = [row for row in raw_rows if isinstance(row, Mapping)]
                 if self._compat.model_listing_excluded_ids:
                     excluded_model_ids = {
                         model_id.lower()
@@ -6305,7 +6432,7 @@ class OpenAIProvider:
                             reasoning = published_capabilities.reasoning
                         result.append(
                             ModelInfo(
-                                provider=self._provider_kind,
+                                provider=self.provider_id,
                                 model_id=model.model_id,
                                 display_name=model.display_name,
                                 context_window=(
@@ -6363,13 +6490,29 @@ class OpenAIProvider:
                         )
                     models = result
                 else:
+                    from .model_capacity import custom_listing_capacity
+
                     models = [
                         ModelInfo(
-                            provider=self._provider_kind,
+                            provider=self.provider_id,
                             model_id=m["id"],
                             display_name=m.get("name", m.get("id", "")),
-                            context_window=m.get("context_length", 0),
-                            max_output_tokens=_model_listing_max_output(m),
+                            context_window=(
+                                custom_listing_capacity(m).get("context_window", 0)
+                                if self.provider_id == "custom"
+                                else m.get("context_length", 0)
+                            ),
+                            max_output_tokens=(
+                                custom_listing_capacity(m).get("max_output_tokens", 0)
+                                if self.provider_id == "custom"
+                                else _model_listing_max_output(m)
+                            ),
+                            metadata=(
+                                {"capacity": custom_listing_capacity(m)}
+                                if self.provider_id == "custom"
+                                else None
+                            ),
+                            supports_vision=_model_listing_supports_vision(m),
                         )
                         for m in rows
                         if m.get("id")
@@ -6384,7 +6527,13 @@ class OpenAIProvider:
                 )
         except Exception as exc:
             if raise_on_error:
-                if isinstance(exc, json.JSONDecodeError):
+                response_status = getattr(resp, "status_code", None)
+                if isinstance(response_status, int):
+                    safe_request_error = ProviderModelListingResponseError(
+                        "Provider model catalog response could not be parsed",
+                        status_code=response_status,
+                    )
+                elif isinstance(exc, json.JSONDecodeError):
                     safe_document = redact_tokenrhythm_install_ids(exc.doc)
                     if safe_document != exc.doc:
                         safe_request_error = RuntimeError(

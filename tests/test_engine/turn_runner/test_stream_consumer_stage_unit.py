@@ -33,6 +33,7 @@ from opensquilla.engine.turn_runner.stream_consumer_stage import (
     StreamConsumerStage,
     StreamConsumerStageInput,
     _ArtifactHandler,
+    _cancel_pending_user_input_results,
     _CompactionHandler,
     _DoneHandler,
     _ErrorHandler,
@@ -52,6 +53,7 @@ from opensquilla.engine.types import (
     TextDeltaEvent,
     ThinkingEvent,
     ToolResultEvent,
+    ToolUseEndEvent,
     ToolUseStartEvent,
     WarningEvent,
 )
@@ -65,6 +67,43 @@ from opensquilla.tools.types import ToolContext
 # ---------------------------------------------------------------------------
 # Recording fakes
 # ---------------------------------------------------------------------------
+
+
+def test_tool_presentation_enrichment_is_best_effort() -> None:
+    event = ToolUseStartEvent(tool_use_id="tool-1", tool_name="read_file")
+    presentation = {
+        "category": "file_read",
+        "primaryArguments": ["path"],
+        "argumentDisplay": "primary",
+        "lifecycleDisplay": "boundary",
+    }
+
+    enriched = StreamConsumerStage._with_tool_presentation(
+        event,
+        SimpleNamespace(tool_presentation_payload=lambda _name: presentation),
+    )
+
+    assert enriched is not event
+    assert enriched.tool_presentation == presentation
+
+
+def test_tool_presentation_enrichment_never_breaks_execution() -> None:
+    event = ToolUseStartEvent(tool_use_id="tool-1", tool_name="read_file")
+
+    def fail(_name: str) -> dict[str, Any]:
+        raise ValueError("invalid presentation rule")
+
+    enriched = StreamConsumerStage._with_tool_presentation(
+        event,
+        SimpleNamespace(tool_presentation_payload=fail),
+    )
+
+    assert enriched.tool_presentation == {
+        "category": "generic",
+        "primaryArguments": [],
+        "argumentDisplay": "primary",
+        "lifecycleDisplay": "boundary",
+    }
 
 
 @dataclass
@@ -126,8 +165,11 @@ class _RecordingCompactionPersist:
         removed_count: int = 0,
         source_entries: tuple[Any, ...] | None = None,
         source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+        source_context_fingerprint: str | None = None,
         source_boundary_message_id: str | None = None,
         source_boundary_entry_id: int | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> bool | None:
         self.calls.append(
             {
@@ -147,8 +189,11 @@ class _RecordingCompactionPersist:
                 "removed_count": removed_count,
                 "source_entries": source_entries,
                 "source_preimage": source_preimage,
+                "source_context_fingerprint": source_context_fingerprint,
                 "source_boundary_message_id": source_boundary_message_id,
                 "source_boundary_entry_id": source_boundary_entry_id,
+                "expected_session_id": expected_session_id,
+                "expected_session_epoch": expected_session_epoch,
             }
         )
         if self.raises is not None:
@@ -253,8 +298,11 @@ def _make_input(
     tool_context: Any | None = None,
     compaction_source_entries: tuple[Any, ...] | None = None,
     compaction_source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+    compaction_source_context_fingerprint: str | None = None,
     compaction_source_boundary_message_id: str | None = None,
     compaction_source_boundary_entry_id: int | None = None,
+    expected_session_id: str | None = None,
+    expected_session_epoch: int | None = None,
     execution_context: TurnExecutionContext | None = None,
 ) -> StreamConsumerStageInput:
     return StreamConsumerStageInput(
@@ -280,10 +328,13 @@ def _make_input(
         tool_context=tool_context,
         compaction_source_entries=compaction_source_entries,
         compaction_source_preimage=compaction_source_preimage,
+        compaction_source_context_fingerprint=compaction_source_context_fingerprint,
         compaction_source_boundary_message_id=(
             compaction_source_boundary_message_id
         ),
         compaction_source_boundary_entry_id=compaction_source_boundary_entry_id,
+        expected_session_id=expected_session_id,
+        expected_session_epoch=expected_session_epoch,
         input_mode=input_mode,
         execution_context=execution_context,
     )
@@ -755,6 +806,7 @@ def test_tool_use_start_handler_preserves_canonical_details_text_segment() -> No
     assert state.turn_segments[0] == {
         "type": "text",
         "text": expected,
+        "presentation": "intermediate",
     }
     assert "".join(state.final_text_parts) == expected
 
@@ -773,11 +825,47 @@ def test_tool_use_start_handler_flushes_text_and_appends_segment() -> None:
         state,
     )
     assert state.turn_segments == [
-        {"type": "text", "text": "pre"},
+        {"type": "text", "text": "pre", "presentation": "intermediate"},
         {"type": "tool_use", "tool_use_id": "t1", "name": "echo", "input": ""},
     ]
     assert state.current_text_parts == []
     assert state.final_text_parts == ["pre"]  # unchanged when not synthetic
+
+
+@pytest.mark.asyncio
+async def test_tool_use_end_persists_input_before_execution_result() -> None:
+    state = _make_state()
+    presentation = {
+        "category": "file_read",
+        "primaryArguments": ["path"],
+        "argumentDisplay": "primary",
+        "lifecycleDisplay": "boundary",
+    }
+    stage, _recordings = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                ToolUseStartEvent(tool_use_id="read-1", tool_name="read_file"),
+                ToolUseEndEvent(
+                    tool_use_id="read-1",
+                    tool_name="read_file",
+                    arguments={"path": "src/app.py", "offset": 500},
+                    tool_presentation=presentation,
+                ),
+            ]
+        )
+    )
+
+    await _drain(stage, _make_input(state=state))
+
+    assert state.turn_segments == [
+        {
+            "type": "tool_use",
+            "tool_use_id": "read-1",
+            "name": "read_file",
+            "input": {"path": "src/app.py", "offset": 500},
+            "tool_presentation": presentation,
+        }
+    ]
 
 
 def test_tool_result_handler_projects_large_write_file_arguments() -> None:
@@ -1276,6 +1364,41 @@ def test_tool_result_handler_preserves_initial_user_input_request() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    "boundary",
+    ["foreign-task", "foreign-tool", "unpaired-tool", "missing-request", "answered", "cancelled"],
+)
+def test_cancelled_user_input_projection_preserves_other_ownership_and_terminal_results(
+    boundary: str,
+) -> None:
+    state = _make_state()
+    pending = {
+        "status": "input_required", "kind": "user_input", "paused": True,
+        "request_id": "request-1", "run_id": "task-1",
+    }
+    if boundary == "foreign-task":
+        pending["run_id"] = "other-task"
+    elif boundary == "missing-request":
+        pending.pop("request_id")
+    elif boundary in {"answered", "cancelled"}:
+        pending.update(status=boundary, paused=False)
+    state.turn_segments.extend([
+        {"type": "tool_use", "tool_use_id": "call-1",
+         "name": "lookup" if boundary == "foreign-tool" else "request_user_input"},
+        {"type": "tool_result", "name": "request_user_input",
+         "tool_use_id": "other-call" if boundary == "unpaired-tool" else "call-1",
+         "result": json.dumps(pending), "is_error": False},
+    ])
+    before = json.dumps(state.turn_segments, sort_keys=True)
+    replay = {"version": 1, "messages": []}
+    for _ in range(2):
+        result = _cancel_pending_user_input_results(
+            state, task_id="task-1", assistant_replay=replay,
+        )
+        assert result is replay
+        assert json.dumps(state.turn_segments, sort_keys=True) == before
+
+
 def test_artifact_handler_appends_payload() -> None:
     state = _make_state()
     handler = _ArtifactHandler()
@@ -1295,13 +1418,85 @@ def test_artifact_handler_appends_payload() -> None:
     assert len(state.turn_artifacts) == 1
 
 
+@pytest.mark.asyncio
+async def test_generated_artifact_is_adopted_before_public_yield() -> None:
+    order: list[tuple[str, str]] = []
+
+    async def adopt(event: ArtifactEvent) -> None:
+        order.append(("adopt", event.id))
+
+    artifact = ArtifactEvent(
+        id="art-editable",
+        name="page.html",
+        mime="text/html",
+        size=32,
+    )
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[artifact, DoneEvent(text="ready", text_snapshot="ready")]
+        )
+    )
+    inp = _make_input(
+        tool_context=ToolContext(generated_artifact_adopter=adopt),
+    )
+
+    yielded: list[Any] = []
+    async for event in stage.run(inp):
+        if isinstance(event, ArtifactEvent):
+            order.append(("yield", event.id))
+        yielded.append(event)
+
+    assert order == [("adopt", "art-editable"), ("yield", "art-editable")]
+    assert any(isinstance(event, ArtifactEvent) for event in yielded)
+    assert inp.state.turn_artifacts[0]["id"] == "art-editable"
+
+
+@pytest.mark.asyncio
+async def test_generated_artifact_adoption_failure_keeps_delivery() -> None:
+    async def fail_adoption(_event: ArtifactEvent) -> None:
+        raise RuntimeError("synthetic adoption failure")
+
+    artifact = ArtifactEvent(
+        id="art-fallback",
+        name="page.html",
+        mime="text/html",
+        size=32,
+    )
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[artifact, DoneEvent(text="ready", text_snapshot="ready")]
+        )
+    )
+    inp = _make_input(
+        tool_context=ToolContext(generated_artifact_adopter=fail_adoption),
+    )
+
+    yielded = await _drain(stage, inp)
+
+    assert any(isinstance(event, ArtifactEvent) for event in yielded)
+    assert inp.state.turn_artifacts[0]["id"] == "art-fallback"
+
+
 def test_error_handler_rewrites_timeout_envelope() -> None:
     state = _make_state()
     handler = _ErrorHandler()
-    result = handler.handle(ErrorEvent(message="x", code="timeout"), state)
+    event = ErrorEvent(
+        message="x", code="timeout", error_id="abcd1234",
+        failure_kind="transport_transient", generation_epoch=3,
+        retry_after_ms=8000, usage_call_index=2,
+        no_prior_provider_dispatch=False, replay_safe=False,
+    )
+    result = handler.handle(event, state)
     assert result is _SUPPRESS
     assert state.pending_error_event is not None
     assert state.pending_error_event.code == "llm_timeout"
+    assert state.pending_error_event.error_id == event.error_id
+    assert state.pending_error_event.failure_kind == event.failure_kind
+    assert state.pending_error_event.generation_epoch == event.generation_epoch
+    assert state.pending_error_event.retry_after_ms == event.retry_after_ms
+    assert state.pending_error_event.usage_call_index == event.usage_call_index
+    assert state.pending_error_event.no_prior_provider_dispatch is False
+    assert state.pending_error_event.replay_safe is False
 
 
 def test_error_handler_drops_unpaired_tool_use_on_incomplete_stream() -> None:
@@ -1542,8 +1737,11 @@ async def test_compaction_handler_runs_persist_snapshot_prompt_in_order() -> Non
     inp = _make_input(
         compaction_source_entries=source_entries,
         compaction_source_preimage=source_preimage,
+        compaction_source_context_fingerprint="frozen-context",
         compaction_source_boundary_message_id="source-boundary",
         compaction_source_boundary_entry_id=7,
+        expected_session_id="session-admitted",
+        expected_session_epoch=7,
     )
     await handler.handle(
         CompactionEvent(
@@ -1561,8 +1759,11 @@ async def test_compaction_handler_runs_persist_snapshot_prompt_in_order() -> Non
     assert persist.calls[0]["removed_count"] == 4
     assert persist.calls[0]["source_entries"] is source_entries
     assert persist.calls[0]["source_preimage"] is source_preimage
+    assert persist.calls[0]["source_context_fingerprint"] == "frozen-context"
     assert persist.calls[0]["source_boundary_message_id"] == "source-boundary"
     assert persist.calls[0]["source_boundary_entry_id"] == 7
+    assert persist.calls[0]["expected_session_id"] == "session-admitted"
+    assert persist.calls[0]["expected_session_epoch"] == 7
     assert len(snapshot.calls) == 1
     assert len(prompt.calls) == 1
 
@@ -2050,7 +2251,11 @@ async def test_system_event_normalization_preserves_text_around_tool_boundary(
         "tool_use",
         "tool_result",
     ]
-    assert inp.state.turn_segments[0] == {"type": "text", "text": "Preparing."}
+    assert inp.state.turn_segments[0] == {
+        "type": "text",
+        "text": "Preparing.",
+        "presentation": "intermediate",
+    }
     assert inp.state.current_text_parts == ["Finished."]
     assert "NO_REPLY" not in str(inp.state.turn_segments)
 
@@ -2128,6 +2333,7 @@ async def test_system_event_removes_bare_marker_after_tool_without_newline() -> 
     assert inp.state.turn_segments[0] == {
         "type": "text",
         "text": "Visible body.",
+        "presentation": "intermediate",
     }
     assert inp.state.current_text_parts == []
     assert inp.state.final_text_parts == ["Visible body."]
@@ -2171,6 +2377,42 @@ async def test_system_event_keeps_bare_marker_on_a_middle_tool_boundary() -> Non
         segment.get("type") == "text" and segment.get("text") == "NO_REPLY"
         for segment in inp.state.turn_segments
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("returncode", [0, 1])
+async def test_completed_background_process_does_not_emit_stale_notice(returncode: int) -> None:
+    state = _make_state()
+    state.turn_segments.extend([
+        {
+            "type": "tool_result",
+            "name": "background_process",
+            "result": "session_id=process-a\ncommand: synthetic-job\nstatus: running",
+            "execution_status": {"status": "unknown", "reason": "background_running"},
+        },
+        {
+            "type": "tool_result",
+            "name": "process",
+            "result": json.dumps({
+                "status": "ok",
+                "action": "wait",
+                "exited": True,
+                "session": {"session_id": "process-a", "returncode": returncode},
+            }),
+            "execution_status": {"status": "success" if returncode == 0 else "error"},
+        },
+    ])
+    final_text = "Process completed." if returncode == 0 else "Process exited unsuccessfully."
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(events=[DoneEvent(text=final_text, text_snapshot=final_text)])
+    )
+
+    yielded = await _drain(stage, _make_input(state=state))
+
+    assert all("could not confirm" not in getattr(event, "text", "") for event in yielded)
+    assert isinstance(yielded[-1], DoneEvent)
+    assert yielded[-1].text == final_text
+    assert yielded[-1].text_snapshot == final_text
 
 
 @pytest.mark.asyncio
@@ -2588,6 +2830,40 @@ def _make_publish_tool_context(tmp_path: Path) -> tuple[ToolContext, Path]:
 
 
 @pytest.mark.asyncio
+async def test_auto_published_artifact_is_adopted_before_public_yield(
+    tmp_path: Path,
+) -> None:
+    order: list[tuple[str, str]] = []
+
+    async def adopt(event: ArtifactEvent) -> None:
+        order.append(("adopt", event.id))
+
+    ctx, _media_root = _make_publish_tool_context(tmp_path)
+    ctx.generated_artifact_adopter = adopt
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="Wrote report.csv"),
+                DoneEvent(text="Wrote report.csv"),
+            ]
+        )
+    )
+
+    yielded: list[Any] = []
+    async for event in stage.run(_make_input(tool_context=ctx)):
+        if isinstance(event, ArtifactEvent):
+            order.append(("yield", event.id))
+        yielded.append(event)
+    artifact_events = [event for event in yielded if isinstance(event, ArtifactEvent)]
+
+    assert len(artifact_events) == 1
+    assert order == [
+        ("adopt", artifact_events[0].id),
+        ("yield", artifact_events[0].id),
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     (
         "run_status",
@@ -2602,7 +2878,7 @@ def _make_publish_tool_context(tmp_path: Path) -> tuple[ToolContext, Path]:
             "step-1",
             "in_progress",
             "task-artifact",
-            0,
+            1,
             id="running-current-step",
         ),
         pytest.param(
@@ -2618,7 +2894,7 @@ def _make_publish_tool_context(tmp_path: Path) -> tuple[ToolContext, Path]:
             None,
             "completed",
             "other-task",
-            0,
+            1,
             id="running-delivery-ready-other-owner",
         ),
         pytest.param(
@@ -2631,7 +2907,7 @@ def _make_publish_tool_context(tmp_path: Path) -> tuple[ToolContext, Path]:
         ),
     ],
 )
-async def test_plan_run_auto_publish_requires_live_delivery_ready_state(
+async def test_plan_run_auto_publish_uses_normal_delivery_rules_without_checkpoint_reads(
     tmp_path: Path,
     run_status: str,
     current_step_id: str | None,
@@ -2675,25 +2951,23 @@ async def test_plan_run_auto_publish_requires_live_delivery_ready_state(
 
     await _drain(stage, _make_input(state=state, tool_context=ctx))
 
-    assert storage.calls == ["run-artifact"]
+    assert storage.calls == []
     assert len(ctx.published_artifacts) == expected_artifact_count
     assert state.turn_artifacts == ctx.published_artifacts
 
 
 def _gate_real_publish(
     stage: StreamConsumerStage,
-) -> tuple[threading.Event, threading.Event, threading.Event, list[threading.Thread]]:
+) -> tuple[threading.Event, threading.Event, threading.Event]:
     """Wrap the bound ``run_publish`` with an Event handshake: signal entry,
     block until released, then run the REAL publish (real ArtifactStore
     writes) and signal completion."""
     publish_started = threading.Event()
     release_publish = threading.Event()
     publish_finished = threading.Event()
-    worker_threads: list[threading.Thread] = []
     real_publish = stage._done_handler.run_publish
 
     def gated_publish(inner_inp: Any, accumulated_text: str) -> Any:
-        worker_threads.append(threading.current_thread())
         publish_started.set()
         assert release_publish.wait(timeout=5.0), "publish was never released"
         result = real_publish(inner_inp, accumulated_text)
@@ -2701,7 +2975,7 @@ def _gate_real_publish(
         return result
 
     stage._done_handler.run_publish = gated_publish  # type: ignore[method-assign]
-    return publish_started, release_publish, publish_finished, worker_threads
+    return publish_started, release_publish, publish_finished
 
 
 @pytest.mark.asyncio
@@ -2723,7 +2997,7 @@ async def test_single_cancel_records_completed_publish(tmp_path: Path) -> None:
         ]
     )
     stage, _ = _make_stage(agent_run=agent_run)
-    publish_started, release_publish, publish_finished, _ = _gate_real_publish(stage)
+    publish_started, release_publish, publish_finished = _gate_real_publish(stage)
     state = _make_state()
     inp = _make_input(state=state, tool_context=ctx)
 
@@ -2764,9 +3038,7 @@ async def test_double_cancel_waits_for_worker_before_unwind(tmp_path: Path) -> N
         ]
     )
     stage, _ = _make_stage(agent_run=agent_run)
-    publish_started, release_publish, publish_finished, worker_threads = (
-        _gate_real_publish(stage)
-    )
+    publish_started, release_publish, publish_finished = _gate_real_publish(stage)
     state = _make_state()
     inp = _make_input(state=state, tool_context=ctx)
 
@@ -2798,8 +3070,10 @@ async def test_double_cancel_waits_for_worker_before_unwind(tmp_path: Path) -> N
     # ctx.published_artifacts append happened strictly before the unwind.
     published_snapshot = list(ctx.published_artifacts)
     files_snapshot = sorted(str(p) for p in media_root.rglob("*") if p.is_file())
-    for thread in worker_threads:
-        await asyncio.to_thread(thread.join, 5.0)
+    # ``publish_task`` cannot complete until the worker callable returns. The
+    # callable runs on asyncio's long-lived default executor, so joining that
+    # worker here would either wait for executor shutdown or schedule a
+    # self-join on the same executor thread.
     for _ in range(10):
         await asyncio.sleep(0)
     assert list(ctx.published_artifacts) == published_snapshot
@@ -2835,7 +3109,7 @@ async def test_outer_stage_persists_literal_text_before_native_tool_segment() ->
     await _drain(stage, _make_input(state=state))
 
     assert state.turn_segments[:2] == [
-        {"type": "text", "text": literal},
+        {"type": "text", "text": literal, "presentation": "intermediate"},
         {
             "type": "tool_use",
             "tool_use_id": "native-1",

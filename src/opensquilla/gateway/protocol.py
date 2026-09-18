@@ -6,9 +6,13 @@ from collections.abc import Collection, Mapping
 from dataclasses import asdict
 from typing import Annotated, Any, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
 
-from opensquilla.contracts.gateway_transport import ANSWER_GENERATION_RESET_CAPABILITY
+from opensquilla.contracts.gateway_transport import (
+    ANSWER_GENERATION_RESET_CAPABILITY,
+    TURN_COMMITTED_CAPABILITY,
+    TURN_COMMITTED_EVENT,
+)
 from opensquilla.contracts.turn_execution import StickyExecutionRole
 from opensquilla.engine.types import (
     AnswerGenerationResetEvent,
@@ -111,6 +115,28 @@ class ControlTerminalWire(BaseModel):
     terminal: Literal[True] = True
 
 
+class TurnCommittedWire(BaseModel):
+    """Public proof that one successful turn reached durable storage."""
+
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    schema_version: int = Field(strict=True, ge=1, le=1)
+    session_key: str = Field(min_length=1)
+    session_id: str | None = None
+    epoch: int | None = Field(default=None, ge=0)
+    task_id: str = Field(min_length=1)
+    turn_id: str = Field(min_length=1)
+    status: Literal["succeeded"]
+    terminal_reason: Literal["completed"]
+    finished_at: int = Field(ge=0)
+    client_message_id: str | None = None
+    user_message_id: str | None = None
+    surface_id: str | None = None
+    stream_generation: str | None = None
+    stream_seq: int | None = Field(default=None, ge=0)
+    emitted_at: int | None = Field(default=None, ge=0)
+
+
 # Naming aliases keep the event-payload terminology available to callers while
 # retaining the explicit ``Wire`` names used by this module's frame types.
 ProviderAttemptFailurePayload = ProviderAttemptFailureWire
@@ -175,8 +201,11 @@ def project_session_event_for_client(
     payload: Any,
     *,
     client_caps: Collection[str] | None = None,
-) -> tuple[str, Any]:
+) -> tuple[str, Any] | None:
     """Project one public session event to a client's negotiated capabilities.
+
+    Durable-success receipts are omitted for clients that did not negotiate
+    their capability. Capable clients receive only the strict public fields.
 
     A terminal answer-generation reset is the runtime's sole visible failed
     outcome.  Clients that explicitly understand replacement semantics receive
@@ -184,6 +213,20 @@ def project_session_event_for_client(
     Capability-less clients receive the equivalent legacy ``session.event.error``
     frame instead, never both frames.
     """
+
+    if event_name == TURN_COMMITTED_EVENT:
+        if TURN_COMMITTED_CAPABILITY not in (client_caps or ()):
+            return None
+        if not isinstance(payload, Mapping):
+            return None
+        try:
+            public_payload = TurnCommittedWire.model_validate(payload).model_dump(
+                mode="json",
+                exclude_none=True,
+            )
+        except ValidationError:
+            return None
+        return event_name, public_payload
 
     if event_name != _ANSWER_GENERATION_RESET_EVENT or not isinstance(payload, Mapping):
         return event_name, payload
@@ -276,10 +319,12 @@ class EventFrame(BaseModel):
 
 class PingFrame(BaseModel):
     type: Literal["ping"] = "ping"
+    nonce: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[\x20-\x7e]+$")
 
 
 class PongFrame(BaseModel):
     type: Literal["pong"] = "pong"
+    nonce: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[\x20-\x7e]+$")
 
 
 # ---------------------------------------------------------------------------
@@ -339,10 +384,14 @@ class PolicyInfo(BaseModel):
     tick_interval_ms: int = TICK_INTERVAL_MS
     concurrent_history_reads: bool = False
     concurrent_optional_read_methods: list[str] = []
+    cancellable_request_methods: list[str] = []
+    provider_probe_modes: list[str] = []
     agent_stream_heartbeat_interval_ms: int = 15_000
     agent_stream_idle_timeout_ms: int = 600_000
     webui_stream_idle_grace_ms: int = 630_000
-    client_ws_keepalive_timeout_ms: int = 120_000
+    client_ws_keepalive_timeout_ms: int = 0
+    transport_probe_nonce: bool = False
+    transport_flow: dict[str, Any] | None = None
 
 
 class HelloOk(BaseModel):

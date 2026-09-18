@@ -9,6 +9,13 @@ from typing import Any
 
 import pytest
 
+from opensquilla.artifact_session import (
+    Actor,
+    ActorKind,
+    ArtifactBlobRef,
+    ArtifactKind,
+    ArtifactSessionService,
+)
 from opensquilla.project_workspaces import (
     ProjectWorkspaceGuard,
     ProjectWorkspaceStateError,
@@ -23,6 +30,7 @@ from opensquilla.session.models import (
 from opensquilla.session.storage import (
     MetaLaunchDraftDiscardedError,
     SessionStorage,
+    StaleEpochError,
     StorageBusyError,
     TurnIngressConflictError,
 )
@@ -113,6 +121,12 @@ async def _receipt_rows(storage: SessionStorage) -> list[dict[str, Any]]:
     ) as cur:
         rows = await cur.fetchall()
     return [dict(row) for row in rows]
+
+
+
+
+
+
 
 
 @pytest.mark.asyncio
@@ -224,8 +238,24 @@ async def test_reset_epoch_invalidates_staged_and_fences_recent_accepted_control
 @pytest.mark.asyncio
 async def test_atomic_turn_reset_invalidates_staged_meta_controls(tmp_path) -> None:
     storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    artifact_service: ArtifactSessionService | None = None
     try:
         await storage.upsert_session(_session())
+        artifact_service = await ArtifactSessionService.from_session_storage(storage)
+        await artifact_service.create_document(
+            session_key=SESSION_KEY,
+            session_id=SESSION_ID,
+            name="old working draft",
+            kind=ArtifactKind.HTML,
+            initial_artifact=ArtifactBlobRef(
+                artifact_id="art-old-working-draft",
+                sha256="a" * 64,
+                filename="draft.html",
+                media_type="text/html",
+                byte_size=10,
+            ),
+            actor=Actor(ActorKind.USER, "user-1"),
+        )
         staged, _ = await storage.stage_meta_control_intent(
             session_key=SESSION_KEY,
             control_kind="manual",
@@ -281,6 +311,13 @@ async def test_atomic_turn_reset_invalidates_staged_meta_controls(tmp_path) -> N
         assert rotated is not None
         assert rotated.session_id == reset_node.session_id
         assert rotated.epoch == 1
+        assert (
+            await artifact_service.list_documents(
+                session_key=SESSION_KEY,
+                session_id=SESSION_ID,
+            )
+            == ()
+        )
         with pytest.raises(MetaLaunchDraftDiscardedError):
             await storage.stage_meta_launch_draft(
                 session_key=SESSION_KEY,
@@ -289,6 +326,8 @@ async def test_atomic_turn_reset_invalidates_staged_meta_controls(tmp_path) -> N
                 launch_text="/meta meta-paper-write -- stale collision with reset ingress",
             )
     finally:
+        if artifact_service is not None:
+            await artifact_service.close()
         await storage.close()
 
 
@@ -614,6 +653,8 @@ async def test_accept_turn_commits_message_session_task_and_receipt_together(tmp
         assert task.details["persisted_user_message_id"] == "message-one"
         assert task.details["persisted_user_message_ids"] == ["message-one"]
         assert task.details["message_count"] == 1
+        assert task.details["session_id"] == SESSION_ID
+        assert task.details["session_epoch"] == 0
         assert len(receipts) == 1
         receipt = receipts[0]
         assert receipt["receipt_id"]
@@ -645,6 +686,75 @@ async def test_accept_turn_commits_message_session_task_and_receipt_together(tmp
         assert _result_value(result, "message_id") == "message-one"
         assert _result_value(result, "task_id") == "task-one"
         assert _result_value(result, "session_id") == SESSION_ID
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_details",
+    [
+        {"session_id": None},
+        {"session_id": ""},
+        {"session_id": 17},
+        {"session_epoch": None},
+        {"session_epoch": True},
+        {"session_epoch": -1},
+    ],
+)
+async def test_accept_turn_rejects_present_invalid_task_owner_fields(
+    tmp_path: Path,
+    invalid_details: dict[str, Any],
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        await storage.upsert_session(_session())
+        task = _task("task-invalid-owner")
+        task.details = invalid_details
+
+        with pytest.raises(ValueError, match="session owner"):
+            await storage.accept_turn(
+                _entry("message-invalid-owner"),
+                expected_epoch=0,
+                updated_at=200,
+                task_record=task,
+                source_scope="webui",
+                request_session_key=SESSION_KEY,
+                client_request_id="request-invalid-owner",
+                request_fingerprint="sha256:request-invalid-owner",
+            )
+
+        assert await storage.get_transcript(SESSION_ID) == []
+        assert await storage.get_agent_task("task-invalid-owner") is None
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_accept_turn_rejects_mismatched_task_owner(tmp_path: Path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        await storage.upsert_session(_session())
+        task = _task("task-stale-owner")
+        task.details = {
+            "session_id": "retired-session",
+            "session_epoch": 0,
+        }
+
+        with pytest.raises(StaleEpochError, match="owner"):
+            await storage.accept_turn(
+                _entry("message-stale-owner"),
+                expected_epoch=0,
+                updated_at=200,
+                task_record=task,
+                source_scope="webui",
+                request_session_key=SESSION_KEY,
+                client_request_id="request-stale-owner",
+                request_fingerprint="sha256:request-stale-owner",
+            )
+
+        assert await storage.get_transcript(SESSION_ID) == []
+        assert await storage.get_agent_task("task-stale-owner") is None
     finally:
         await storage.close()
 
@@ -1106,6 +1216,8 @@ async def test_accept_turn_collects_into_existing_task_in_the_same_transaction(
         ]
         assert task.details["fresh_user_session"] is True
         assert task.details["existing_only"] == "preserved"
+        assert task.details["session_id"] == SESSION_ID
+        assert task.details["session_epoch"] == 0
         assert [
             entry.message_id for entry in await storage.get_transcript(SESSION_ID)
         ] == ["message-collected"]

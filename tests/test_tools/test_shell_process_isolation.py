@@ -497,7 +497,10 @@ async def test_windows_job_owns_descendant_after_leader_exit(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.ci_serial
 async def test_exec_command_writes_optional_stdin() -> None:
+    # Keep the real PowerShell/Python EOF contract's five-second deadline
+    # independent of the parallel CI workers' subprocess startup contention.
     command = _python_shell_command(
         "import sys; data = sys.stdin.read(); print('STDIN:' + data)"
     )
@@ -505,7 +508,7 @@ async def test_exec_command_writes_optional_stdin() -> None:
     result = await shell.exec_command(command, stdin="payload", timeout=5.0)
 
     exit_line, stdout = result.split("\n", 1)
-    assert exit_line == "exit_code=0"
+    assert exit_line == "exit_code=0", result
     assert stdout.splitlines() == ["STDIN:payload"]
 
 
@@ -640,14 +643,14 @@ async def test_wait_exec_stdin_writer_accepts_process_exit_before_pipe_close() -
 @pytest.mark.asyncio
 @pytest.mark.skipif(os.name != "posix", reason="large pipe backpressure is POSIX-specific")
 async def test_exec_command_stdin_write_obeys_timeout() -> None:
-    command = _python_shell_command("import time; time.sleep(5)")
+    command = _python_shell_command("import time; time.sleep(10)")
 
     started = time.monotonic()
     result = await shell.exec_command(command, stdin="x" * 1_000_000, timeout=0.2)
     elapsed = time.monotonic() - started
 
     assert "[timeout after 0.2s]" in result
-    assert elapsed < 3.0, "timeout path should return before the 5s child sleep"
+    assert elapsed < 5.0, "timeout path should return well before the 10s child sleep"
 
 
 @pytest.mark.asyncio

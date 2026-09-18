@@ -9,6 +9,7 @@ from opensquilla.gateway.llm_runtime import resolve_llm_runtime_config
 from opensquilla.onboarding.mutations import (
     LlmProfileActivationError,
     MutationResult,
+    _tiers_equal_after_canonical_normalization,
     list_channel_entries,
     remove_channel,
     set_channel_enabled,
@@ -501,13 +502,13 @@ def test_tokenrhythm_provider_save_seeds_curated_inline_ladder():
         api_key="sk-test",
     )
     assert res.config.llm.provider == "tokenrhythm"
-    assert res.config.llm.model == "deepseek-v4-flash-0731"
+    assert res.config.llm.model == "deepseek-v4-pro-0813"
     assert res.config.squilla_router.enabled is True
     assert res.config.squilla_router.tier_profile is None
     expected = {
-        "c0": "qwen3.7-flash",
-        "c1": "deepseek-v4-flash-0731",
-        "c2": "glm-5.2",
+        "c0": "deepseek-v4-flash-0731",
+        "c1": "deepseek-v4-pro-0813",
+        "c2": "kimi-k2.7-code",
         "c3": "glm-5.2",
         "image_model": "kimi-k2.6",
     }
@@ -518,6 +519,8 @@ def test_tokenrhythm_provider_save_seeds_curated_inline_ladder():
     assert "tier_profile" not in persisted
     assert persisted["tiers"]["c3"]["model"] == "glm-5.2"
     assert persisted["tiers"]["c3"]["ensemble_enabled"] is True
+    assert persisted["tiers"]["c0"]["supports_image"] is False
+    assert persisted["tiers"]["c2"]["supports_image"] is False
     assert "ensemble_selection_mode" not in persisted["tiers"]["c3"]
 
 
@@ -705,13 +708,17 @@ def test_upsert_llm_ensemble_accepts_structured_candidates_partial_merge():
     assert res.config.llm_ensemble.selection_mode == "router_dynamic"
     assert res.config.llm_ensemble.model_options == ["legacy/model"]
     assert res.config.llm_ensemble.min_successful_proposers == 2
+    # An omitted role canonicalizes to "proposer": the two-role contract in
+    # router_tiers.ENSEMBLE_CANDIDATE_ROLES has no unassigned member, and the
+    # generated web contract plus normalizeEnsembleMemberRole already coerce
+    # the same way, so the public payload must not leak an empty role.
     assert [candidate.model_dump() for candidate in res.config.llm_ensemble.candidates] == [
         {
             "provider": "openrouter",
             "model": "qwen/qwen3.7-max",
             "source": "custom",
             "enabled": True,
-            "role": "",
+            "role": "proposer",
             "thinking_level": "",
         }
     ]
@@ -721,7 +728,7 @@ def test_upsert_llm_ensemble_accepts_structured_candidates_partial_merge():
             "model": "qwen/qwen3.7-max",
             "source": "custom",
             "enabled": True,
-            "role": "",
+            "role": "proposer",
             "thinking_level": "",
         }
     ]
@@ -1465,8 +1472,8 @@ def test_upsert_llm_provider_preset_id_applies_default_model_when_model_omitted(
         api_key_env="DEEPSEEK_API_KEY",
     )
 
-    # deepseek preset default_model is deepseek-v4-flash.
-    assert res.config.llm.model == "deepseek-v4-flash"
+    # DeepSeek official preset uses the current Flash model ID.
+    assert res.config.llm.model == "deepseek-flash"
 
 
 def test_upsert_llm_provider_preset_id_synthesized_writes_custom_shape():
@@ -1654,6 +1661,21 @@ def test_upsert_router_persists_explicit_single_model_over_the_recommended_c3_de
     assert res.public_payload["mode"] == "custom"
 
 
+@pytest.mark.parametrize("legacy_field", ["supports_image", "supportsImage"])
+@pytest.mark.parametrize("legacy_value", [True, False])
+def test_retired_image_switch_does_not_customize_a_preset(
+    legacy_field: str, legacy_value: bool,
+):
+    preset = {"c2": {"provider": "synthetic", "model": "configured-model"}}
+    saved = {"c2": {**preset["c2"], legacy_field: legacy_value}}
+
+    assert _tiers_equal_after_canonical_normalization(saved, preset)
+    assert saved["c2"][legacy_field] is legacy_value
+    assert not _tiers_equal_after_canonical_normalization(
+        {"c2": {**saved["c2"], "model": "different-model"}}, preset
+    )
+
+
 def test_upsert_router_forces_image_model_role_invariants():
     cfg = GatewayConfig(llm={"provider": "openrouter", "model": "z-ai/glm-5.1"})
 
@@ -1674,6 +1696,45 @@ def test_upsert_router_forces_image_model_role_invariants():
     assert image_tier["model"] == "anthropic/claude-opus-4.8"
     assert image_tier["supports_image"] is True
     assert image_tier["image_only"] is True
+
+
+def test_upsert_router_warns_and_round_trips_legacy_image_model():
+    cfg = GatewayConfig(llm={"provider": "openrouter", "model": "configured/text-model"})
+    tiers = {
+        name: {"provider": "openrouter", "model": f"configured/{name}", "supports_image": False}
+        for name in ("c0", "c1", "c2", "c3")
+    }
+    tiers["image_model"] = {
+        "provider": "openai",
+        "model": "saved/vision-model",
+        "description": "Saved legacy image setting",
+        "thinking_level": "high",
+        "supports_image": True,
+        "image_only": True,
+    }
+    cfg.squilla_router.tiers = tiers
+    cfg.squilla_router.tier_profile = None
+
+    saved = upsert_router(cfg, mode="custom")
+    assert len(saved.warnings) == 1
+    assert "image_model" in saved.warnings[0]
+    assert "not used for image input" in saved.warnings[0]
+    assert "c0-c3" in saved.warnings[0]
+    assert saved.config.squilla_router.tiers["image_model"] == tiers["image_model"]
+    assert saved.public_payload["tiers"]["image_model"] == tiers["image_model"]
+    assert all(
+        saved.config.squilla_router.tiers[name]["model"] == tiers[name]["model"]
+        for name in ("c0", "c1", "c2", "c3")
+    )
+
+    reloaded = GatewayConfig.model_validate(saved.config.to_toml_dict())
+    resaved = upsert_router(reloaded, mode="custom")
+    assert resaved.config.squilla_router.tiers["image_model"] == tiers["image_model"]
+    assert resaved.warnings == saved.warnings
+
+    disabled = upsert_router(resaved.config, mode="disabled")
+    assert disabled.warnings == []
+    assert disabled.config.squilla_router.tiers["image_model"] == tiers["image_model"]
 
 
 def test_upsert_router_can_disable():
@@ -1704,7 +1765,7 @@ def test_upsert_router_custom_is_accepted_for_any_provider():
     assert res.config.squilla_router.enabled is True
     assert res.config.squilla_router.tier_profile is None
     assert res.config.squilla_router.tiers["c0"]["provider"] == "deepseek"
-    assert res.config.squilla_router.tiers["c0"]["model"] == "deepseek-v4-flash"
+    assert res.config.squilla_router.tiers["c0"]["model"] == "deepseek-flash"
     assert res.public_payload["mode"] == "custom"
     assert res.public_payload["tier_profile"] is None
     # With no persisted profile the effective tiers persist expanded inline.
@@ -1826,8 +1887,10 @@ def test_upsert_router_custom_accepts_explicit_tiers_for_synthesized_presets():
         "description": (
             "groq balanced route (synthesized default; no curated per-tier model ladder)."
         ),
-        "supports_image": False,
     }
+    # An omitted declaration remains probeable instead of becoming a false
+    # capability claim for an unknown custom deployment.
+    assert "supports_image" not in res.config.squilla_router.tiers["c1"]
     # Router tier selection is independent from the direct/fallback model.
     assert res.config.llm.model == "m"
 

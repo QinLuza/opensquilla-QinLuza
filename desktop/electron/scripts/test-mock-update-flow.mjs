@@ -122,8 +122,15 @@ try {
   const page = await app.firstWindow({ timeout: 60_000 })
   await page.waitForLoadState('domcontentloaded', { timeout: 60_000 }).catch(() => {})
   await waitFor(
-    async () => page.url().includes('/control/chat'),
-    'Control UI to load on Chat',
+    async () => page.url().startsWith('opensquilla-app://desktop/chat'),
+    'Desktop renderer to load on Chat',
+    60_000,
+  )
+  await waitFor(
+    async () => (await page.evaluate(
+      () => window.opensquillaDesktop?.getGatewayConnection?.(),
+    ))?.status === 'ready',
+    'Desktop Gateway readiness',
     60_000,
   )
 
@@ -134,6 +141,11 @@ try {
 
   const updateBannerCount = await page.locator('[data-testid="update-banner"]').count()
   assert.equal(updateBannerCount, 0, 'desktop native update should suppress the web release banner')
+
+  // Startup profile consolidation can still hold the writer gate when the
+  // one-second mock timer fires. Exercise the renderer update flow after
+  // readiness; automatic scheduling has its own deterministic contract tests.
+  await page.evaluate(() => window.opensquillaDesktop.checkForUpdates())
 
   const availableState = await waitFor(async () => {
     return await page.evaluate(async () => {
@@ -180,7 +192,7 @@ try {
 
   await delay(500)
   assert.equal(page.isClosed(), false, 'mock install should not quit the app')
-  assert.match(await page.title(), /OpenSquilla/, 'Control UI should remain available after mock install')
+  assert.match(await page.title(), /OpenSquilla/, 'Desktop renderer should remain available after mock install')
 
   if (process.platform === 'darwin') {
     const labelsAfterClick = await menuLabels(app)
@@ -189,6 +201,15 @@ try {
       'mock install keeps the pending relaunch menu available for repeated inspection',
     )
   } else {
+    // Native applying temporarily hides the indicator. Reopen its popover
+    // once the mock install returns, as a user would for another inspection.
+    await waitFor(async () => (await page.evaluate(
+      () => window.opensquillaDesktop.getUpdateState(),
+    ))?.status === 'downloaded', 'mock install to return to downloaded')
+    await updateIndicator.waitFor({ state: 'visible', timeout: 30_000 })
+    if (await updateIndicator.getAttribute('aria-expanded') !== 'true') {
+      await updateIndicator.click({ force: true })
+    }
     await page.locator('[data-testid="desktop-update-relaunch"]').waitFor({
       state: 'visible',
       timeout: 30_000,

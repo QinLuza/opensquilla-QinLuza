@@ -16,6 +16,25 @@ OpenSquilla reads configuration in this order:
 Use `--config ./opensquilla.toml` when you want to write or inspect a
 project-local config file.
 
+## Release Profiles and Older Databases
+
+Stable Desktop releases keep their existing profile. Preview and nightly
+binaries use separate profiles selected from the running binary's version.
+Changing the update feed does not move the current profile or its database.
+
+An unsupported development Goal database is preserved, including its SQLite
+WAL, and is rejected consistently by Gateway startup, home import and recovery.
+Open it with the build that created it. The current release does not convert
+that Goal lineage or mark its migrations as already applied.
+
+To start separately in the CLI, select a new named profile, for example
+`opensquilla --profile clean onboard`, then use the same `--profile clean`
+option for subsequent commands. Use a directory without a project-local
+configuration, and remove explicit config/state path overrides that point to
+the old profile. Keep the original profile intact; do not copy its database
+into the new profile. See [independent CLI state](cli.md) for explicit state
+directory configuration.
+
 ## Task Runtime Concurrency
 
 Fresh installations allow up to eight cross-session turns to run at once:
@@ -305,7 +324,6 @@ opensquilla memory list
 opensquilla memory search "project preference"
 opensquilla memory show <path>
 opensquilla memory dream
-opensquilla memory flush-session <session-key>
 ```
 
 Configure embedding behavior:
@@ -371,6 +389,44 @@ Only subnets of `198.18.0.0/15` are accepted in this setting. Loopback, RFC
 1918 private ranges, link-local addresses, and other internal ranges remain
 hard-blocked even if configured. If a public hostname resolves to one of those
 hard-blocked ranges, fix the DNS or proxy setup instead of bypassing the guard.
+
+## Environment Proxies
+
+Outbound HTTP clients ignore `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` by
+default so a stray proxy in a parent shell cannot reroute agent traffic. Set
+`OPENSQUILLA_TRUST_ENV=1` (for example in `~/.opensquilla/.env`) to opt in.
+That gate is shared by channel adapters, providers, `http_request`, and
+`web_fetch`.
+
+`web_search` has a separate `search_use_env_proxy` / `OPENSQUILLA_GATEWAY_SEARCH_USE_ENV_PROXY`
+switch; it does not enable `web_fetch`.
+
+`web_fetch` pins direct and environment-proxied requests to the locally
+SSRF-vetted address by default. With trust-env enabled, `SSL_CERT_FILE` and
+`SSL_CERT_DIR` remain available for custom TLS certificate authorities.
+
+If local DNS is poisoned or intercepted and your proxy needs to resolve the
+original hostname, explicitly enable both options:
+
+```dotenv
+OPENSQUILLA_TRUST_ENV=1
+OPENSQUILLA_WEB_FETCH_TRUST_PROXY_DNS=1
+HTTPS_PROXY=http://127.0.0.1:7890
+```
+
+`OPENSQUILLA_WEB_FETCH_TRUST_PROXY_DNS` is off by default. It only applies when
+an environment proxy is selected for that URL. It delegates DNS resolution
+and **final destination access control to the proxy**. A local SSRF check
+cannot prevent that proxy from subsequently resolving a hostname to a private,
+loopback, or link-local address. Use this mode only when you trust the proxy's
+destination policy; a proxy being on localhost does not itself provide that
+protection.
+
+Local URL/DNS checks still run before fetching and on every redirect, so URLs
+that locally resolve to blocked addresses remain blocked, and local DNS must
+still succeed. `NO_PROXY` matches continue to use direct, pinned connections.
+This option does not change sandbox-managed proxy routing or permissions.
+Restart the gateway after changing these environment settings.
 
 ## Gateway Binding
 
@@ -480,15 +536,31 @@ turn, active-time, and token totals. Goal mode does not replay a failed or timed
 out whole turn: tools may already have produced side effects. Provider/core
 request retries remain governed by their existing policies.
 
-An execution lease belongs to the subscribed Web UI or CLI connection that
-started or resumed the Goal. Losing that client connection detaches the lease:
-the Goal stays active, its current accepted turn may finish, and no new
-automatic continuation starts until an authorized client reattaches. A Web UI
-refresh reattaches with a tab-local continuity token; an explicit takeover is
-available when that token was lost. Disabling execution or restarting the
-Gateway still pauses unattended work. Read the complete workflow, state model,
-Plan-mode interaction, upgrade notes, and recovery guidance in
-[`goal-mode.md`](goal-mode.md).
+Goal token budgets are disabled by default and are configured per Goal with
+optional `tokenBudget`, not through a global TOML ceiling. Budget usage is
+`max(0, input_tokens - cache_read_tokens) + output_tokens`, counted once per
+physical root/descendant request at finalization, including late receipts.
+Upgraded Goals can set a budget for usage recorded after the accounting boundary;
+earlier incomplete history is not included. Missing receipts within the current
+accounting period prevent setting a budget or resuming a budgeted Goal.
+Snapshots expose `usageAccountingStartedAtMs`: the creation time for new Goals,
+or the first newly attributed request time for upgraded Goals (`null` until then).
+This boundary does not make an upgraded Goal's earlier history complete.
+Reaching a budget pauses continuation and steers the current task to wrap up;
+already-started requests and safe finalization can exceed it.
+
+The default per-Goal `executionPolicy` is `foreground`: losing the owning Web UI
+or CLI subscription defers continuation until authorized reattachment. Explicit
+`background` execution keeps its process-local authorization across transport
+disconnects and uses the same ordinary task scheduler, sandbox and approval
+checks. Both policies pause on Gateway restart and require explicit resume.
+Questions and approvals keep their existing task while releasing its compute
+slot; they never authorize another automatic Goal turn. Natural create, edit
+and resume controls reuse the current task. Progress uses ordinary `update_plan`.
+Three proven empty automatic turns pause rather than loop indefinitely.
+
+Read the complete workflow, coverage semantics, state model, Plan interaction
+and recovery guidance in [`goal-mode.md`](goal-mode.md).
 
 ## Raw Config Editing
 
@@ -505,4 +577,4 @@ opensquilla gateway status
 
 ---
 
-[Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/opensquilla/opensquilla/issues/new?template=docs_report.yml)
+[Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/TokenRhythm/opensquilla/issues/new?template=docs_report.yml)

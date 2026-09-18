@@ -1,43 +1,11 @@
-import { customRef, ref, shallowRef, watch, type Ref } from 'vue'
+import { customRef, watch, type Ref } from 'vue'
 import type {
-  ChatStreamTimelineItem,
   ChatToolCall,
   ChatToolCallGroup,
 } from '@/types/chat'
 import type { InterruptViewState } from '@/types/parts'
-import type { ArtifactPayload } from '@/types/rpc'
 import type { Frame, FrameInput } from '@/types/turnlog'
 import { TurnAccumulator, type FoldedTurn } from '@/utils/chat/foldTurn'
-import { diffFoldVsLegacy } from '@/composables/chat/turnParity'
-
-// Three-mode flag: ON (true, prod default) appends frames and renders the live
-// work-card from the fold; SHADOW ('shadow', DEV default) appends + asserts
-// fold-vs-legacy parity while legacy stays the rendered source; OFF (false, the
-// `foldLiveTurn=0` kill switch) stops appends and renders legacy — the one-flag
-// rollback lever.
-export type FoldLiveTurnMode = false | 'shadow' | true
-
-const USE_REDUCER_KEY = 'opensquilla.chat.foldLiveTurn'
-
-// Default ON in production: the fold is authoritative for the live work-card.
-// Setting the key to '0' forces the legacy render (kept as a one-flag rollback
-// lever for one release); any other value, or no key, is ON.
-function readFlag(): FoldLiveTurnMode {
-  try {
-    return localStorage.getItem(USE_REDUCER_KEY) === '0' ? false : true
-  } catch {
-    return true
-  }
-}
-
-/** Legacy live render surface the shadow parity check compares the fold against. */
-export interface TurnLogLegacySurface {
-  timelineItems: Ref<ChatStreamTimelineItem[]>
-  rawText: Ref<string>
-  toolCalls: Ref<ChatToolCall[]>
-  artifacts: Ref<ArtifactPayload[]>
-  thinkingText: Ref<string>
-}
 
 export interface UseChatTurnLogOptions {
   renderMarkdown: (
@@ -55,11 +23,10 @@ export interface UseChatTurnLogOptions {
 }
 
 export function useChatTurnLog(options: UseChatTurnLogOptions) {
-  const events = shallowRef<Frame[]>([])
-  const useReducer = ref<FoldLiveTurnMode>(import.meta.env.DEV ? 'shadow' : readFlag())
   const accumulator = new TurnAccumulator()
   let acceptedFrames: Frame[] = []
   let appendIndex = 0
+  let acceptedActivityOrder: number | undefined
   let snapshotDirty = false
   let publishPending = false
   let triggerSnapshot: () => void = () => {}
@@ -75,8 +42,8 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
     options.toolCallGroups,
     undefined,
     options.interruptState?.value,
-    useReducer.value !== true,
-    useReducer.value !== true,
+    false,
+    false,
   )
 
   function refreshSnapshot(): void {
@@ -85,8 +52,8 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
       options.toolCallGroups,
       undefined,
       options.interruptState?.value,
-      useReducer.value !== true,
-      useReducer.value !== true,
+      false,
+      false,
     )
     snapshotDirty = false
   }
@@ -126,11 +93,18 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
   }
 
   function appendFrame(frame: FrameInput) {
-    const accepted = { ...frame, seq: appendIndex++ } as Frame
+    const accepted = {
+      ...frame,
+      seq: appendIndex++,
+      ...(frame.activityOrder !== undefined
+        ? { activityOrder: frame.activityOrder }
+        : acceptedActivityOrder !== undefined
+          ? { activityOrder: acceptedActivityOrder }
+          : {}),
+    } as Frame
     accumulator.append(accepted)
-    // The published frame stream is diagnostic-only in production, but the
-    // compact accepted log is needed to rebuild the accumulator after an answer
-    // generation reset.
+    // The compact accepted log is retained only to rebuild the accumulator
+    // after an answer-generation reset; it is never a second render source.
     coalesceAcceptedFrame(accepted)
     snapshotDirty = true
     publishPending = true
@@ -139,14 +113,6 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
   function publish() {
     if (!publishPending) return
     if (snapshotDirty) refreshSnapshot()
-    // A shallow immutable publication prevents accepted deltas from mutating a
-    // reactive array between display frames. The production reducer has no
-    // frame-array consumer: publishing it there retained the previous growing
-    // text/tool string until the next flush in addition to the accumulator's
-    // canonical state. Keep the diagnostic stream only for SHADOW/rollback.
-    events.value = useReducer.value === true
-      ? []
-      : acceptedFrames.map(frame => ({ ...frame }))
     publishPending = false
     triggerSnapshot()
   }
@@ -154,28 +120,23 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
   function resetLog() {
     accumulator.reset()
     acceptedFrames = []
-    events.value = []
     appendIndex = 0
+    acceptedActivityOrder = undefined
     snapshotDirty = true
     publishPending = false
     refreshSnapshot()
     triggerSnapshot()
   }
 
+  function setAcceptedActivityOrder(value: number | undefined): void {
+    acceptedActivityOrder = Number.isSafeInteger(value) && Number(value) > 0
+      ? Number(value)
+      : undefined
+  }
+
   function checkpointText() {
-    if (useReducer.value === true) {
-      accumulator.checkpointText()
-      acceptedFrames = []
-      snapshotDirty = true
-      publishPending = true
-      publish()
-      return
-    }
-    acceptedFrames = acceptedFrames.filter(
-      frame => frame.kind !== 'text' && frame.kind !== 'final-text',
-    )
-    accumulator.reset()
-    for (const frame of acceptedFrames) accumulator.append(frame)
+    accumulator.checkpointText()
+    acceptedFrames = []
     snapshotDirty = true
     publishPending = true
     publish()
@@ -231,6 +192,22 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
     return accumulator.currentRawText()
   }
 
+  function peekToolCall(toolId: string): ChatToolCall | null {
+    return accumulator.currentToolCall(toolId)
+  }
+
+  function peekRunningToolCall(): ChatToolCall | null {
+    return accumulator.currentRunningToolCall()
+  }
+
+  function hasToolBoundary(): boolean {
+    return accumulator.hasToolBoundary()
+  }
+
+  function peekToolTiming(toolId: string): { startedAt: number; endedAt?: number } | null {
+    return accumulator.currentToolTiming(toolId)
+  }
+
   function finalizeToolInputs(): void {
     if (!accumulator.finalizeToolInputs()) return
     snapshotDirty = true
@@ -247,49 +224,19 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
     })
   }
 
-  // DEV/SHADOW parity: compare the fold against the legacy live surface and log
-  // the parity marker on divergence so the console-clarity e2e turns any drift into
-  // a hard failure. Wrapped so it never throws into the render pipeline.
-  function checkParity(legacy: TurnLogLegacySurface): string[] {
-    try {
-      // Unwrap the live refs into plain values and delegate to the pure diff so
-      // the comparison (including the full tool-call `result`, not just its
-      // 200-char preview) is exercised the same way the unit tests exercise it.
-      return diffFoldVsLegacy(
-        foldedTurn.value,
-        {
-          timelineItems: legacy.timelineItems.value,
-          rawText: legacy.rawText.value,
-          toolCalls: legacy.toolCalls.value,
-          artifacts: legacy.artifacts.value,
-          thinkingText: legacy.thinkingText.value,
-        },
-        options.interruptState?.value,
-      )
-    } catch (err) {
-      return [`parity threw: ${String(err)}`]
-    }
-  }
-
-  function assertParity(legacy: TurnLogLegacySurface): void {
-    if (!import.meta.env.DEV || useReducer.value === false) return
-    const problems = checkParity(legacy)
-    if (problems.length) {
-      console.error('[live-turn parity]', { live: true, problems })
-    }
-  }
-
   return {
-    events,
-    useReducer,
     appendFrame,
+    setAcceptedActivityOrder,
     publish,
     resetLog,
     checkpointText,
     peekRawText,
+    peekToolCall,
+    peekRunningToolCall,
+    hasToolBoundary,
+    peekToolTiming,
     finalizeToolInputs,
     resetGeneration,
     foldedTurn,
-    assertParity,
   }
 }

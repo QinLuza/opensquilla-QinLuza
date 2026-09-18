@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { foldTurn, TurnAccumulator } from './foldTurn'
 import type { ChatToolCall, ChatToolCallGroup } from '@/types/chat'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type { Frame } from '@/types/turnlog'
 import type { InterruptViewState } from '@/types/parts'
 
@@ -124,6 +124,32 @@ describe('foldTurn — text, thinking, status, artifacts', () => {
       expect.objectContaining({ type: 'text', rawText: 'Checking.', presentation: 'intermediate' }),
       expect.objectContaining({ type: 'text', rawText: 'Answer', presentation: 'answer' }),
     ])
+    expect(f.timelineSegments).toEqual([
+      expect.objectContaining({ type: 'tool-group' }),
+      { type: 'text', raw: 'Checking.', presentation: 'intermediate' },
+      { type: 'text', raw: 'Answer', presentation: 'answer' },
+    ])
+  })
+
+  it('does not merge an authoritative answer suffix into intermediate commentary', () => {
+    const f = fold([
+      { kind: 'tool-result', seq: 0, toolId: 't', name: 'bash', result: 'ok', isError: false, input: '{}', at: 1 },
+      { kind: 'text', seq: 1, text: 'Working note.', presentation: 'intermediate' },
+      { kind: 'final-text', seq: 2, text: 'Working note.Final answer.' },
+    ])
+
+    expect(f.rawText).toBe('Working note.Final answer.')
+    expect(f.timelineItems).toHaveLength(3)
+    expect(f.timelineItems[1]).toMatchObject({
+      type: 'text',
+      rawText: 'Working note.',
+      presentation: 'intermediate',
+    })
+    expect(f.timelineItems[2]).toMatchObject({
+      type: 'text',
+      rawText: 'Final answer.',
+      presentation: 'answer',
+    })
   })
 
   it('replaces stale text around tools with one canonical terminal segment', () => {
@@ -463,5 +489,22 @@ describe('TurnAccumulator — incremental live projection', () => {
       rawText: 'Draft candidate.',
       html: '<p>Draft candidate.</p>',
     })
+  })
+})
+
+describe('execution log reference preservation', () => {
+  it('keeps the original log handle in both live and replay projections', () => {
+    const handle = `tr-${'a'.repeat(32)}`
+    const event: Frame = {
+      kind: 'tool-result', seq: 0, toolId: 'execution', name: 'exec', input: '{}',
+      result: 'model-sized preview', executionLogHandle: handle, isError: true, at: 1,
+    }
+    const accumulator = new TurnAccumulator()
+    accumulator.append(event)
+    for (const projection of [fold([event]), accumulator.snapshot(renderMarkdown, toolCallGroups)]) {
+      expect(projection.toolCalls[0]).toMatchObject({
+        executionLogHandle: handle, result: 'model-sized preview', status: 'error',
+      })
+    }
   })
 })

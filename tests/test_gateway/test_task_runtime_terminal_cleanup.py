@@ -15,6 +15,7 @@ import gc
 import inspect
 import json
 import tracemalloc
+import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
@@ -23,6 +24,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from structlog.testing import capture_logs
 
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.gateway import task_runtime
@@ -107,6 +109,14 @@ def _make_storage() -> Any:
     storage.update_transcript_turn_context = update_turn_context
     storage.turn_context_updates = turn_context_updates
     return storage
+
+
+
+
+
+
+
+
 
 
 def _make_runtime(
@@ -363,7 +373,10 @@ async def _make_durable_plan_run(
 
 
 @pytest.mark.asyncio
-async def test_plan_run_is_running_only_during_its_execution_turn() -> None:
+@pytest.mark.parametrize("storage_busy", [False, True])
+async def test_plan_run_is_running_only_during_its_execution_turn(
+    storage_busy: bool, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     session_key = "agent-1::plan-runtime"
     task_id = "task-plan-runtime"
     storage, run = await _make_durable_plan_run(
@@ -374,7 +387,9 @@ async def test_plan_run_is_running_only_during_its_execution_turn() -> None:
     entered = asyncio.Event()
     release = asyncio.Event()
     observed_statuses: list[str] = []
+    terminal_plan_statuses: list[str] = []
     events: list[tuple[str, str, dict[str, Any]]] = []
+    gate_held = False
 
     async def _handler(_run: Any) -> None:
         current = await storage.get_plan_run(run.run_id)
@@ -384,7 +399,15 @@ async def test_plan_run_is_running_only_during_its_execution_turn() -> None:
         await release.wait()
 
     async def _emit(session: str, name: str, payload: dict[str, Any]) -> None:
+        nonlocal gate_held
         events.append((session, name, payload))
+        if name == "task.succeeded":
+            if gate_held:
+                storage._operation_lock.release()
+                gate_held = False
+            current = await storage.get_plan_run(run.run_id)
+            assert current is not None
+            terminal_plan_statuses.append(current.status)
 
     rt = TaskRuntime(storage=storage, turn_handler=_handler, event_emitter=_emit)
     envelope = replace(
@@ -397,21 +420,42 @@ async def test_plan_run_is_running_only_during_its_execution_turn() -> None:
     running = await storage.get_plan_run(run.run_id)
     assert running is not None
     assert running.status == "running"
-    assert running.current_step_id == "inspect"
-    assert running.step_states[0]["status"] == "in_progress"
+    assert running.current_step_id is None
+    assert all(step["status"] == "pending" for step in running.step_states)
     assert observed_statuses == ["running"]
 
+    if storage_busy:
+        storage._busy_budget_seconds = 0.02
+        original_settle = storage.settle_agent_task
+        blocked_once = False
+
+        async def settle_with_busy_writer(task_id: str, **fields: Any) -> Any:
+            nonlocal gate_held, blocked_once
+            if not blocked_once:
+                await storage._operation_lock.acquire()
+                gate_held = blocked_once = True
+            return await original_settle(task_id, **fields)
+
+        monkeypatch.setattr(storage, "settle_agent_task", settle_with_busy_writer)
     release.set()
-    await rt.wait(handle.task_id, timeout=2.0)
-    paused = await storage.get_plan_run(run.run_id)
-    assert paused is not None
-    assert paused.status == "paused"
-    assert paused.active_task_id is None
+    try:
+        await rt.wait(handle.task_id, timeout=2.0)
+    finally:
+        if gate_held:
+            storage._operation_lock.release()
+            gate_held = False
+        await rt.shutdown(timeout=2)
+    completed = await storage.get_plan_run(run.run_id)
+    assert completed is not None
+    assert completed.status == "completed"
+    assert completed.active_task_id is None
+    assert all(step["status"] == "pending" for step in completed.step_states)
+    assert terminal_plan_statuses == (["running"] if storage_busy else ["completed"])
     assert [
         payload["plan_run"]["status"]
         for _session, name, payload in events
         if name == "session.event.plan_run"
-    ] == ["running", "paused"]
+    ] == ["running", "completed"]
     await storage.close()
 
 
@@ -429,20 +473,11 @@ async def test_plan_run_completes_only_after_owning_task_succeeds() -> None:
     async def _handler(_run: Any) -> None:
         current = await storage.get_plan_run(run.run_id)
         assert current is not None
-        advanced = await storage.checkpoint_plan_run(
-            run.run_id,
-            expected_state_revision=current.state_revision,
-            expected_active_task_id=task_id,
-            step_id="inspect",
-            step_status="completed",
-        )
-        final_checkpoint = await storage.checkpoint_plan_run(
-            run.run_id,
-            expected_state_revision=advanced.state_revision,
-            expected_active_task_id=task_id,
-            step_id="implement",
-            step_status="completed",
-        )
+        await _run.envelope.runtime_services["update_progress"]([
+            {"step": "Inspect", "status": "completed"},
+            {"step": "Implement", "status": "completed"},
+        ])
+        final_checkpoint = await storage.get_plan_run(run.run_id)
         observed_after_final_checkpoint.append(
             (
                 final_checkpoint.status,
@@ -474,7 +509,7 @@ async def test_plan_run_completes_only_after_owning_task_succeeds() -> None:
 
 
 @pytest.mark.asyncio
-async def test_failed_delivery_after_final_checkpoint_remains_resumable() -> None:
+async def test_failed_delivery_after_completed_progress_remains_resumable() -> None:
     session_key = "agent-1::plan-runtime-delivery-failure"
     task_id = "task-plan-runtime-delivery-failure"
     storage, run = await _make_durable_plan_run(
@@ -486,20 +521,11 @@ async def test_failed_delivery_after_final_checkpoint_remains_resumable() -> Non
     async def _handler(_run: Any) -> None:
         current = await storage.get_plan_run(run.run_id)
         assert current is not None
-        advanced = await storage.checkpoint_plan_run(
-            run.run_id,
-            expected_state_revision=current.state_revision,
-            expected_active_task_id=task_id,
-            step_id="inspect",
-            step_status="completed",
-        )
-        final_checkpoint = await storage.checkpoint_plan_run(
-            run.run_id,
-            expected_state_revision=advanced.state_revision,
-            expected_active_task_id=task_id,
-            step_id="implement",
-            step_status="completed",
-        )
+        await _run.envelope.runtime_services["update_progress"]([
+            {"step": "Inspect", "status": "completed"},
+            {"step": "Implement", "status": "completed"},
+        ])
+        final_checkpoint = await storage.get_plan_run(run.run_id)
         assert final_checkpoint.status == "running"
         assert final_checkpoint.current_step_id is None
         raise RuntimeError("artifact delivery failed")
@@ -530,7 +556,7 @@ async def test_failed_delivery_after_final_checkpoint_remains_resumable() -> Non
 
 
 @pytest.mark.asyncio
-async def test_goal_owned_plan_run_yields_for_later_driver_attempt() -> None:
+async def test_goal_owned_plan_run_projects_success_without_checkpoint() -> None:
     session_key = "agent-1::goal-plan-runtime"
     task_id = "task-goal-plan-runtime"
     storage, run = await _make_durable_plan_run(
@@ -560,15 +586,15 @@ async def test_goal_owned_plan_run_yields_for_later_driver_attempt() -> None:
     )
 
     task = await runtime.wait(handle.task_id, timeout=2.0)
-    paused = await storage.get_plan_run(run.run_id)
+    completed = await storage.get_plan_run(run.run_id)
 
     assert str(task.status) == "succeeded"
-    assert paused is not None
-    assert paused.status == "paused"
-    assert paused.driver_kind == "goal"
-    assert paused.driver_id == "goal-1"
-    assert paused.pause_reason == "goal_turn_finished"
-    assert paused.active_task_id is None
+    assert completed is not None
+    assert completed.status == "completed"
+    assert completed.driver_kind == "goal"
+    assert completed.driver_id == "goal-1"
+    assert completed.pause_reason is None
+    assert completed.active_task_id is None
     await storage.close()
 
 
@@ -582,18 +608,26 @@ async def test_resumed_plan_run_progress_is_injected_into_provider_prompt() -> N
         run_id="run-plan-resume",
         task_id=first_task_id,
     )
+    await storage.create_agent_task(AgentTaskRecord(
+        task_id=first_task_id,
+        session_key=session_key,
+        status=AgentTaskStatus.RUNNING,
+        details={"metadata": {"plan_run_id": run.run_id}},
+    ))
     running = await storage.mark_plan_run_running(
         run.run_id,
         expected_state_revision=run.state_revision,
         active_task_id=first_task_id,
     )
-    advanced = await storage.checkpoint_plan_run(
-        run.run_id,
-        expected_state_revision=running.state_revision,
-        expected_active_task_id=first_task_id,
-        step_id="inspect",
-        step_status="completed",
+    await storage.update_task_progress(
+        first_task_id, session_key=running.session_key, session_id=running.session_id,
+        session_epoch=running.session_epoch,
+        steps=[
+            {"step": "Inspect", "status": "completed"},
+            {"step": "Implement", "status": "pending"},
+        ],
     )
+    advanced = await storage.get_plan_run(run.run_id)
     paused = await storage.pause_plan_run(
         run.run_id,
         expected_state_revision=advanced.state_revision,
@@ -627,14 +661,14 @@ async def test_resumed_plan_run_progress_is_injected_into_provider_prompt() -> N
     )
     await runtime.wait(handle.task_id, timeout=2.0)
 
-    progress = captured_context["PlanRun Progress"]
-    payload = json.loads(progress[progress.index("{") :])
+    progress = captured_context["Previous Plan Progress"]
+    reference = ET.fromstring(progress)
+    assert reference.tag == "untrusted"
+    assert reference.attrib == {"source": "plan_progress"}
+    payload = json.loads(reference.text or "")
     assert payload["runId"] == run.run_id
-    assert payload["currentStepId"] == "implement"
-    assert payload["steps"] == [
-        {"stepId": "inspect", "status": "completed"},
-        {"stepId": "implement", "status": "in_progress"},
-    ]
+    assert payload["currentStepId"] is None
+    assert [step["status"] for step in payload["steps"]] == ["completed", "pending"]
     await storage.close()
 
 
@@ -677,7 +711,7 @@ async def test_cancel_plan_run_stops_the_implementation_task(
             is_owner=True,
             authenticated=True,
         ),
-        config=GatewayConfig(memory={"flush_enabled": False}),
+        config=GatewayConfig(memory={}),
         task_runtime=rt,
     )
     ctx.session_manager = manager
@@ -1392,12 +1426,20 @@ async def test_applied_steer_retries_failed_durable_ack_before_terminal() -> Non
         started.set()
         await release.wait()
         assert provider.drain_pending() == ["change direction"]
-        application = provider.mark_applied(
-            iteration=2,
-            model_call_id="call-retry-applied",
+        # Capture the injected failure without formatting Rich tracebacks on
+        # the event loop while the terminal-settlement watchdog is running.
+        with capture_logs() as failure_logs:
+            application = provider.mark_applied(
+                iteration=2,
+                model_call_id="call-retry-applied",
+            )
+            if inspect.isawaitable(application):
+                await application
+        assert any(
+            event["event"] == "task_runtime.steer_disposition_persist_failed"
+            and event["log_level"] == "warning"
+            for event in failure_logs
         )
-        if inspect.isawaitable(application):
-            await application
 
     storage = _make_storage()
     durable_update = storage.update_transcript_turn_context
@@ -2033,6 +2075,101 @@ async def test_undrained_late_steer_is_promoted_to_followup() -> None:
 
 
 @pytest.mark.asyncio
+async def test_late_steer_commit_precedes_session_routing_set() -> None:
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    followup_seen = asyncio.Event()
+    promotion_committed = asyncio.Event()
+    release_promotion_commit = asyncio.Event()
+    setting_entered = asyncio.Event()
+    current_mode = "direct"
+    seen: list[tuple[str, str | None]] = []
+    committed_audits: list[dict[str, Any]] = []
+    promoted_task_ids: list[str] = []
+
+    def accepted_config(*, session_key: str, run_kind: str) -> Any:
+        assert session_key == "agent-1::steer-routing-linearization"
+        assert run_kind == "session_turn"
+        return SimpleNamespace(
+            squilla_router=SimpleNamespace(
+                enabled=current_mode == "router",
+                rollout_phase="enforce" if current_mode == "router" else "observe",
+            ),
+            llm_ensemble=SimpleNamespace(enabled=False, selection_mode=""),
+            session_mode=current_mode,
+            session_routing_revision=1 if current_mode == "direct" else 2,
+            session_routing_source="session_override",
+        )
+
+    async def handler(run: Any) -> None:
+        seen.append((run.message, getattr(run.accepted_config, "session_mode", None)))
+        if run.message == "first":
+            first_started.set()
+            await release_first.wait()
+            return
+        followup_seen.set()
+
+    storage = _make_storage()
+    create_agent_task = storage.create_agent_task
+
+    async def create_with_blocked_promotion_return(record: AgentTaskRecord) -> None:
+        details = record.details if isinstance(record.details, dict) else {}
+        metadata = details.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("steer_restart_recovery") is True:
+            # The durable boundary has crossed, but the runtime has not yet
+            # activated the promoted task or returned its admission gate.
+            await create_agent_task(record)
+            committed_audits.append(dict(details["accepted_model_routing"]))
+            promoted_task_ids.append(record.task_id)
+            promotion_committed.set()
+            await release_promotion_commit.wait()
+            return
+        await create_agent_task(record)
+
+    storage.create_agent_task = create_with_blocked_promotion_return
+    runtime = TaskRuntime(
+        storage=storage,
+        turn_handler=handler,
+        accepted_config_provider=accepted_config,
+    )
+    envelope = _make_envelope("agent-1::steer-routing-linearization")
+    first = await runtime.enqueue(
+        envelope,
+        "first",
+        run_kind="session_turn",
+    )
+    await asyncio.wait_for(first_started.wait(), timeout=2.0)
+    assert await runtime.steer(
+        envelope.session_key,
+        "late correction",
+        persisted_user_message_id="message-routing-linearization",
+    ) == first.task_id
+
+    release_first.set()
+    await asyncio.wait_for(promotion_committed.wait(), timeout=2.0)
+
+    async def set_session_mode() -> None:
+        nonlocal current_mode
+        async with runtime.collect_admission(envelope.session_key):
+            setting_entered.set()
+            current_mode = "router"
+
+    setting = asyncio.create_task(set_session_mode())
+    await asyncio.sleep(0)
+    assert setting_entered.is_set() is False
+    assert committed_audits[0]["effective_mode"] == "direct"
+    assert committed_audits[0]["session_revision"] == 1
+
+    release_promotion_commit.set()
+    await asyncio.wait_for(setting, timeout=2.0)
+    await runtime.wait(first.task_id, timeout=2.0)
+    await asyncio.wait_for(followup_seen.wait(), timeout=2.0)
+    await runtime.wait(promoted_task_ids[0], timeout=2.0)
+
+    assert seen == [("first", "direct"), ("late correction", "direct")]
+
+
+@pytest.mark.asyncio
 async def test_terminal_waits_for_late_steer_handoff_and_publishes_in_order() -> None:
     first_started = asyncio.Event()
     release_first = asyncio.Event()
@@ -2628,6 +2765,7 @@ async def test_exception_path_clears_dicts() -> None:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+@pytest.mark.ci_serial
 async def test_no_leak_under_load(monkeypatch: pytest.MonkeyPatch) -> None:
     """10 000 tasks, each <=50 ms; dict sizes after GC must be within ±2 of baseline."""
     num_tasks = 10_000
@@ -2654,18 +2792,24 @@ async def test_no_leak_under_load(monkeypatch: pytest.MonkeyPatch) -> None:
     baseline_envelope = len(rt._last_envelope_by_session)
 
     # --- run 10 000 tasks ---
-    handles = []
-    for i in range(num_tasks):
-        sk = f"agent-1::sess-load-{i % session_count}"
-        env = _make_envelope(sk)
-        h = await rt.enqueue(env, f"msg-{i}")
-        handles.append(h)
-
-    # Wait for all to complete under one shared deadline. Giving every waiter
-    # its own timer schedules 10 000 timeout callbacks and makes this leak
-    # check sensitive to event-loop scheduling on slower CI runners.
-    async with asyncio.timeout(60.0):
-        await asyncio.gather(*(rt.wait(h.task_id) for h in handles))
+    # Keep the workload at 10 000 tasks, but drain it in bounded batches. A
+    # single gather of 10 000 ``runtime.wait`` calls creates another 10 000
+    # waiter tasks and timer bookkeeping on top of the runtime workload; that
+    # amplification is what made this quantitative check consume a minute on
+    # loaded Windows runners. The shared deadline still catches a stuck task.
+    batch_size = 500
+    deadline = asyncio.get_running_loop().time() + 60.0
+    for batch_start in range(0, num_tasks, batch_size):
+        handles = []
+        for i in range(batch_start, min(batch_start + batch_size, num_tasks)):
+            sk = f"agent-1::sess-load-{i % session_count}"
+            env = _make_envelope(sk)
+            handles.append(await rt.enqueue(env, f"msg-{i}"))
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise TimeoutError("task runtime leak workload exceeded its shared deadline")
+        async with asyncio.timeout(remaining):
+            await asyncio.gather(*(rt.wait(h.task_id) for h in handles))
 
     # --- post-GC snapshot ---
     gc.collect()

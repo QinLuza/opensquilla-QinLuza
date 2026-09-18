@@ -1,5 +1,8 @@
+import { copySelectedSkills, isSelectedSkills } from '@/types/selectedSkills'
+import type { SelectedSkillRef } from '@/types/selectedSkills'
+import { normalizePageContext, type ChatPageContext } from '@/types/pageContext'
 import type { Attachment } from '@/types/chat'
-import type { ChatSendParams } from '@/types/rpc'
+import type { TurnSendParams } from '@/modules/turnCommands'
 
 const DATABASE_NAME = 'opensquilla-chat-pending-inputs'
 const DATABASE_VERSION = 2
@@ -20,6 +23,13 @@ export interface PendingInputWalRecord {
   clientRequestId: string
   clientMessageId: string
   text: string
+  /** Annotation batch retained across IndexedDB/WAL queue recovery. */
+  draftIds?: string[]
+  /** Read-only upgrade input; never sent to Gateway. */
+  promptAnnotationIds?: string[]
+  retiredAnnotationInput?: boolean
+  selectedSkills?: SelectedSkillRef[]
+  pageContext?: ChatPageContext
   attachments: Attachment[]
   intent: string | null
   confirmedPlainText?: boolean
@@ -27,6 +37,8 @@ export interface PendingInputWalRecord {
   state: PendingInputWalState
   /** True once enqueue may have crossed the browser/Gateway boundary. */
   mayHaveServerCopy?: boolean
+  /** Credential-free Gateway/subject fingerprint for a never-sent offline draft. */
+  deliveryIdentity?: string
   /** Complete an in-flight tombstone by preserving the text as a local draft. */
   retainAfterCancel?: boolean
   requestFingerprint?: string
@@ -45,7 +57,7 @@ export interface ResponseHandoffWalRecord {
   requestSessionKey: string
   clientRequestId: string
   clientMessageId: string
-  params: ChatSendParams
+  params: TurnSendParams
   composerText: string
   recoveryAttachments: Attachment[]
   /** A protocol-owned replay must never be restored into the user composer. */
@@ -103,7 +115,9 @@ export interface PendingInputWal {
   acceptHandoff?: (
     ownerRequestId: string,
     acceptedSessionKey: string,
-  ) => Promise<AcceptedHandoffCommit>
+    shouldAccept?: () => boolean,
+    handoffSignal?: AbortSignal,
+  ) => Promise<AcceptedHandoffCommit | null>
   deleteHandoff?: (ownerRequestId: string) => Promise<void>
   close: () => void
 }
@@ -115,6 +129,16 @@ const WAL_STATES = new Set<PendingInputWalState>([
   'retryable',
   'cancelling',
 ])
+
+function validAnnotationDraftIds(value: unknown): boolean {
+  if (value === undefined) return true
+  if (!Array.isArray(value) || value.length > 16) return false
+  return value.every((item, index) => (
+    typeof item === 'string'
+    && item.trim().length > 0
+    && value.indexOf(item) === index
+  ))
+}
 
 function isPendingInputWalRecord(value: unknown): value is PendingInputWalRecord {
   if (!value || typeof value !== 'object') return false
@@ -129,6 +153,13 @@ function isPendingInputWalRecord(value: unknown): value is PendingInputWalRecord
     && typeof record.clientMessageId === 'string'
     && record.clientMessageId.length > 0
     && typeof record.text === 'string'
+    && (record.deliveryIdentity === undefined || (
+      typeof record.deliveryIdentity === 'string'
+      && record.deliveryIdentity.length > 0
+    ))
+    && validAnnotationDraftIds(record.draftIds)
+    && (record.selectedSkills === undefined || isSelectedSkills(record.selectedSkills))
+    && (record.pageContext === undefined || normalizePageContext(record.pageContext) !== null)
     && Array.isArray(record.attachments)
     && record.attachments.every(attachment => (
       attachment !== null && typeof attachment === 'object'
@@ -165,7 +196,7 @@ function isPendingInputWalRecord(value: unknown): value is PendingInputWalRecord
 function isResponseHandoffWalRecord(value: unknown): value is ResponseHandoffWalRecord {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   const record = value as Partial<ResponseHandoffWalRecord>
-  const params = record.params as Partial<ChatSendParams> | undefined
+  const params = record.params as Partial<TurnSendParams> | undefined
   return record.schemaVersion === 1
     && typeof record.ownerRequestId === 'string'
     && record.ownerRequestId.length > 0
@@ -179,6 +210,7 @@ function isResponseHandoffWalRecord(value: unknown): value is ResponseHandoffWal
     && params?.clientRequestId === record.clientRequestId
     && params?.clientMessageId === record.clientMessageId
     && params?.sessionKey === record.requestSessionKey
+    && (params?.selectedSkills === undefined || isSelectedSkills(params.selectedSkills))
     && typeof record.composerText === 'string'
     && Array.isArray(record.recoveryAttachments)
     && record.recoveryAttachments.every(attachment => (
@@ -220,8 +252,15 @@ function isResponseHandoffWalRecord(value: unknown): value is ResponseHandoffWal
 }
 
 function cloneRecord(record: PendingInputWalRecord): PendingInputWalRecord {
+  const { promptAnnotationIds, ...current } = record
   return {
-    ...record,
+    ...current,
+    ...(promptAnnotationIds?.length ? { retiredAnnotationInput: true } : {}),
+    ...(record.pageContext ? { pageContext: normalizePageContext(record.pageContext)! } : {}),
+    ...(record.selectedSkills ? { selectedSkills: copySelectedSkills(record.selectedSkills) } : {}),
+    ...(record.draftIds
+      ? { draftIds: [...record.draftIds] }
+      : {}),
     attachments: record.attachments.map(attachment => ({ ...attachment })),
   }
 }
@@ -449,48 +488,75 @@ class BrowserPendingInputWal implements PendingInputWal {
   async acceptHandoff(
     ownerRequestId: string,
     acceptedSessionKey: string,
-  ): Promise<AcceptedHandoffCommit> {
+    shouldAccept: () => boolean = () => true,
+    handoffSignal?: AbortSignal,
+  ): Promise<AcceptedHandoffCommit | null> {
+    if (!shouldAccept() || handoffSignal?.aborted) return null
     const database = await this.database()
+    if (!shouldAccept() || handoffSignal?.aborted) return null
     const transaction = database.transaction(
       [STORE_NAME, HANDOFF_STORE_NAME],
       'readwrite',
     )
+    let abortedByHandoff = false
+    const abortTransaction = () => {
+      abortedByHandoff = true
+      try {
+        transaction.abort()
+      } catch {
+        // oncomplete may already have won. Its promise continuation runs
+        // before a later navigation task can invalidate this epoch.
+      }
+    }
+    if (handoffSignal?.aborted) abortTransaction()
+    else handoffSignal?.addEventListener('abort', abortTransaction, { once: true })
     const handoffStore = transaction.objectStore(HANDOFF_STORE_NAME)
     const pendingStore = transaction.objectStore(STORE_NAME)
-    const rawHandoff = await requestResult(handoffStore.get(ownerRequestId))
-    if (!isResponseHandoffWalRecord(rawHandoff)) {
-      transaction.abort()
-      throw new Error('Response handoff no longer exists')
-    }
-    if (rawHandoff.walOwnerId && rawHandoff.state !== 'accepted') {
-      transaction.abort()
-      throw new Error('Response handoff is not durably accepted')
-    }
-    const handoff = cloneHandoffRecord({
-      ...rawHandoff,
-      state: 'accepted',
-      acceptedSessionKey,
-      updatedAt: Date.now(),
-    })
-    handoffStore.put(handoff)
-    const rawPending = await requestResult(pendingStore.getAll())
-    const records = (rawPending as unknown[])
-      .filter(isPendingInputWalRecord)
-      .filter(record => record.ownerRequestId === ownerRequestId)
-      .map(record => {
-        const next = cloneRecord({
-          ...record,
-          sessionKey: acceptedSessionKey,
-          ownerRequestId: undefined,
-          state: 'saving',
-          walRevision: (record.walRevision ?? 1) + 1,
-          updatedAt: Date.now(),
-        })
-        pendingStore.put(next)
-        return next
+    try {
+      const rawHandoff = await requestResult(handoffStore.get(ownerRequestId))
+      if (!isResponseHandoffWalRecord(rawHandoff)) {
+        transaction.abort()
+        throw new Error('Response handoff no longer exists')
+      }
+      if (rawHandoff.walOwnerId && rawHandoff.state !== 'accepted') {
+        transaction.abort()
+        throw new Error('Response handoff is not durably accepted')
+      }
+      const rawPending = await requestResult(pendingStore.getAll())
+      if (!shouldAccept() || handoffSignal?.aborted) {
+        abortTransaction()
+        return null
+      }
+      const handoff = cloneHandoffRecord({
+        ...rawHandoff,
+        state: 'accepted',
+        acceptedSessionKey,
+        updatedAt: Date.now(),
       })
-    await transactionDone(transaction)
-    return { handoff, records }
+      handoffStore.put(handoff)
+      const records = (rawPending as unknown[])
+        .filter(isPendingInputWalRecord)
+        .filter(record => record.ownerRequestId === ownerRequestId)
+        .map(record => {
+          const next = cloneRecord({
+            ...record,
+            sessionKey: acceptedSessionKey,
+            ownerRequestId: undefined,
+            state: 'saving',
+            walRevision: (record.walRevision ?? 1) + 1,
+            updatedAt: Date.now(),
+          })
+          pendingStore.put(next)
+          return next
+        })
+      await transactionDone(transaction)
+      return { handoff, records }
+    } catch (error) {
+      if (abortedByHandoff || handoffSignal?.aborted || !shouldAccept()) return null
+      throw error
+    } finally {
+      handoffSignal?.removeEventListener('abort', abortTransaction)
+    }
   }
 
   async deleteHandoff(ownerRequestId: string): Promise<void> {

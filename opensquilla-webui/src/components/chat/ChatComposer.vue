@@ -4,7 +4,7 @@
     class="chat-composer"
     :class="{
       'chat-composer--new-landing': isNewLanding,
-      'chat-composer--collapsed': collapsed,
+      'chat-composer--collapsed': collapsed && promptAnnotations.length === 0 && selectedSkills.length === 0,
       'chat-composer--floating': floating,
       'chat-composer--docked': !floating,
     }"
@@ -20,13 +20,23 @@
             :data-mime="att.mime || ''"
             :title="attachmentTitle(att)"
           >
-            <span class="attachment-chip__icon" aria-hidden="true">
-              <span v-if="isAttachmentBusy(att)" class="spinner attachment-chip__spinner" />
-              <Icon v-else-if="att.kind === 'failed'" name="info" :size="15" />
-              <img v-else-if="isImageDisplayAttachment(att) && att.dataUrl" class="attachment-chip__thumb" :src="att.dataUrl" alt="" />
-              <Icon v-else :name="attachmentIcon(att)" :size="15" />
-            </span>
-            <span class="attachment-chip__name">{{ att.name }}</span>
+            <component
+              :is="attachmentCanPreview(att) ? 'button' : 'span'"
+              class="attachment-chip__primary"
+              :class="{ 'attachment-chip__preview': attachmentCanPreview(att) }"
+              :type="attachmentCanPreview(att) ? 'button' : undefined"
+              :title="attachmentCanPreview(att) ? t('chat.openTitle', { title: att.name }) : undefined"
+              :aria-label="attachmentCanPreview(att) ? t('chat.openTitle', { title: att.name }) : undefined"
+              @click.stop="previewImage(att)"
+            >
+              <span class="attachment-chip__icon" aria-hidden="true">
+                <span v-if="isAttachmentBusy(att)" class="spinner attachment-chip__spinner" />
+                <Icon v-else-if="att.kind === 'failed'" name="info" :size="15" />
+                <img v-else-if="isImageDisplayAttachment(att) && att.dataUrl" class="attachment-chip__thumb" :src="att.dataUrl" alt="" />
+                <Icon v-else :name="attachmentIcon(att)" :size="15" />
+              </span>
+              <span class="attachment-chip__name">{{ att.name }}</span>
+            </component>
             <span class="attachment-chip__meta">{{ attachmentMeta(att) }}</span>
             <button v-if="att.kind === 'failed' && att.file" class="attachment-action" :title="t('chat.retryUpload')" :aria-label="t('chat.retryUpload')" @click="emit('retryAttachment', i)">
               <Icon name="refresh" :size="12" />
@@ -36,6 +46,94 @@
             </button>
           </div>
         </div>
+      </div>
+      <div v-if="promptAnnotations.length > 0" class="chat-collapse-region">
+        <div
+          class="chat-prompt-annotations"
+          :aria-label="t('chat.promptAnnotations.draftLabel')"
+          aria-live="polite"
+          data-testid="composer-prompt-annotations"
+        >
+          <div class="chat-prompt-annotations__header" data-testid="composer-prompt-annotations-label">
+            <Icon name="chat" :size="13" aria-hidden="true" />
+            <span>{{ t('chat.promptAnnotations.label') }} · {{ promptAnnotations.length }}</span>
+          </div>
+          <div
+            v-for="annotation in promptAnnotations"
+            :key="annotation.annotationId"
+            class="chat-prompt-annotation-chip"
+            :data-annotation-id="annotation.annotationId"
+            role="group"
+          >
+            <span class="chat-prompt-annotation-chip__rail" aria-hidden="true" />
+            <form
+              v-if="editingAnnotationId === annotation.annotationId"
+              class="chat-prompt-annotation-chip__editor"
+              @submit.prevent="saveAnnotationEdit(annotation.annotationId)"
+            >
+              <input
+                ref="annotationInputEl"
+                v-model="annotationDraftBody"
+                type="text"
+                :maxlength="promptAnnotationMaxBodyLength"
+                :aria-label="t('chat.promptAnnotations.editLabel')"
+                @keydown.esc.prevent="cancelAnnotationEdit"
+              />
+              <button
+                type="submit"
+                :disabled="annotationDraftBody.trim().length === 0 || annotationDraftTooLong"
+              >
+                {{ t('common.save') }}
+              </button>
+              <button type="button" @click="cancelAnnotationEdit">
+                {{ t('common.cancel') }}
+              </button>
+            </form>
+            <template v-else>
+              <button
+                type="button"
+                class="chat-prompt-annotation-chip__main"
+                :title="annotation.body"
+                @click="emit('jumpPromptAnnotation', annotation.annotationId)"
+              >
+                <span class="chat-prompt-annotation-chip__target">
+                  {{ promptAnnotationTargetLabel(annotation, t) }}
+                </span>
+                <span class="chat-prompt-annotation-chip__text">
+                  {{ annotation.body || t('chat.promptAnnotations.emptyDraft') }}
+                </span>
+              </button>
+              <button
+                type="button"
+                class="attachment-action"
+                :aria-label="t('chat.promptAnnotations.editLabel')"
+                :title="t('chat.promptAnnotations.editLabel')"
+                @click="beginAnnotationEdit(annotation)"
+              >
+                <Icon name="edit" :size="12" />
+              </button>
+              <button
+                type="button"
+                class="attachment-action attachment-remove"
+                :aria-label="t('chat.promptAnnotations.removeLabel')"
+                :title="t('chat.promptAnnotations.removeLabel')"
+                @click="emit('discardPromptAnnotation', annotation.annotationId)"
+              >
+                <Icon name="x" :size="12" />
+              </button>
+            </template>
+          </div>
+        </div>
+      </div>
+      <div v-if="selectedSkills.length" class="chat-selected-skills" data-testid="selected-skills">
+        <span class="chat-selected-skills__label">{{ t('chat.skillPalette.thisMessage') }}</span>
+        <span v-for="skill in selectedSkills" :key="skill.instanceId" class="attachment-chip">
+          <span class="attachment-chip__name">{{ skill.name }}</span>
+          <button type="button" class="attachment-action attachment-remove" :aria-label="t('chat.skillPalette.remove', { name: skill.name })" @click="emit('removeSkill', skill.instanceId)">
+            <Icon name="x" :size="12" />
+          </button>
+        </span>
+        <span v-if="isStreaming" class="chat-selected-skills__label">{{ t('chat.skillPalette.queuedHint') }}</span>
       </div>
       <div class="chat-input-panel">
         <div v-if="replanActive" class="chat-collapse-region">
@@ -126,6 +224,7 @@
               <button
                 v-if="canCloseProject"
                 type="button"
+                :disabled="projectBindingBusy"
                 :aria-label="t('workspaces.closeProjectDraft')"
                 :title="t('workspaces.closeProjectDraft')"
                 @click="emit('closeProject')"
@@ -142,6 +241,7 @@
               "
               type="button"
               class="chat-project-choose"
+              :disabled="projectBindingBusy"
               @click="emit('chooseProject')"
             >
               <Icon name="folder" :size="15" />
@@ -161,16 +261,21 @@
               <span>{{ t('chat.codingMode.activeLabel') }}</span>
               <Icon name="x" :size="12" aria-hidden="true" />
             </button>
-            <div ref="modelRoutingAnchorEl" class="chat-settings-anchor">
+            <div
+              v-if="sessionRoutingAvailable"
+              ref="modelRoutingAnchorEl"
+              class="chat-settings-anchor"
+            >
               <button
                 class="btn btn--icon btn--ghost chat-model-routing-btn"
                 :class="[
-                  `chat-model-routing-btn--${modelRoutingMode}`,
-                  { 'is-active': modelRoutingOpen || modelRoutingMode !== 'off' },
+                  `chat-model-routing-btn--${sessionRoutingMode}`,
+                  { 'is-active': modelRoutingOpen || sessionRoutingMode !== 'off' },
                 ]"
-                :title="t('chat.composer.modelRouting')"
-                :aria-label="t('chat.composer.modelRouting')"
+                :title="t('chat.composer.sessionModelRouting')"
+                :aria-label="t('chat.composer.sessionModelRouting')"
                 :aria-expanded="modelRoutingOpen ? 'true' : 'false'"
+                :aria-disabled="sessionRoutingControlBlocked ? 'true' : 'false'"
                 @click="toggleModelRouting"
               >
                 <Icon name="router" :size="17" />
@@ -182,10 +287,10 @@
               </button>
               <ChatComposerModelRouting
                 v-if="modelRoutingOpen"
-                :model-routing-mode="modelRoutingMode"
-                :busy="modelRoutingSettingsBusy"
+                :model-routing-mode="sessionRoutingMode"
+                :busy="sessionRoutingBusy || sessionRoutingControlBlocked"
                 @close="modelRoutingOpen = false"
-                @set-model-routing-mode="emit('setModelRoutingMode', $event)"
+                @set-session-routing-mode="emit('setSessionRoutingMode', $event)"
               />
             </div>
             <div ref="runModeAnchorEl" class="chat-settings-anchor chat-run-mode-anchor">
@@ -303,9 +408,19 @@
             @set-mode="emit('setCollaborationMode', $event)"
           />
           <div class="chat-input-actions chat-input-actions--right">
+            <button
+              v-if="showSkillQueueSend"
+              type="button"
+              class="btn btn--icon btn--danger chat-send-btn"
+              :title="t('chat.stopResponseEsc')"
+              :aria-label="t('chat.stopResponse')"
+              @click="emit('stop')"
+            >
+              <Icon name="stop" :size="16" />
+            </button>
             <Transition name="composer-ctl" mode="out-in">
               <button
-                v-if="canStop"
+                v-if="canStop && !showSkillQueueSend"
                 key="stop"
                 class="btn btn--icon btn--danger chat-send-btn"
                 :title="stopTargetsPlanRun
@@ -323,18 +438,26 @@
                 key="send"
                 class="btn btn--icon btn--primary chat-send-btn"
                 :class="{ 'is-ready': hasSendContent && !sendBlockedMessage && !inputDisabled }"
-                :title="sendBlockedMessage || sendButtonTitle"
+                :title="sendBlockedMessage
+                  || (sessionRoutingBusy ? t('chat.composer.routingUpdateBlocked')
+                    : showSkillQueueSend ? t('chat.sendQueues') : sendButtonTitle)"
                 :aria-label="replanActive ? t('chat.plan.reviseSend') : t('chat.send')"
                 :aria-describedby="sendBlockedMessage ? 'chat-composer-send-status' : undefined"
-                :disabled="Boolean(sendBlockedMessage) || inputDisabled"
+                :aria-busy="sendPending || sessionRoutingBusy ? 'true' : 'false'"
+                :disabled="sendPending || Boolean(sendBlockedMessage) || sessionRoutingBusy || inputDisabled"
                 @click="emit('send')"
               >
-                <Icon name="arrowUp" :size="17" />
+                <LoadingSpinner v-if="sendPending" />
+                <Icon v-else name="arrowUp" :size="17" />
               </button>
             </Transition>
           </div>
           </div>
         </div>
+      </div>
+      <div v-if="sendPending" class="chat-composer-send-pending">
+        <LoadingSpinner aria-hidden="true" />
+        <span role="status" aria-live="polite">{{ t('chat.sendPending') }}</span>
       </div>
       <div v-if="sendBlockedMessage" class="chat-collapse-region">
         <p
@@ -360,9 +483,11 @@
 </template>
 
 <script setup lang="ts">
+import type { SelectedSkillRef } from '@/types/selectedSkills'
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import type { IconName } from '@/utils/icons'
 import ChatComposerAddMenu from '@/components/chat/ChatComposerAddMenu.vue'
 import ChatComposerGoalMode from '@/components/chat/ChatComposerGoalMode.vue'
@@ -374,6 +499,12 @@ import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { SandboxRunMode } from '@/types/sandbox'
 import type { CollaborationMode } from '@/types/plans'
 import type { PromptCacheKeepaliveStatus } from '@/types/promptCacheKeepalive'
+import type { PromptAnnotation } from '@/types/promptAnnotations'
+import { promptAnnotationTargetLabel } from '@/utils/chat/promptAnnotationPresentation'
+import {
+  PROMPT_ANNOTATION_MAX_BODY_LENGTH,
+  promptAnnotationBodyWithinLimit,
+} from '@/types/promptAnnotations'
 import { isAttachmentBusy, isImageDisplayAttachment } from '@/utils/chat/attachments'
 
 interface ChatComposerExpose {
@@ -385,9 +516,11 @@ interface ChatComposerExpose {
 }
 
 const props = withDefaults(defineProps<{
+  selectedSkills?: readonly SelectedSkillRef[]
   attachments: Attachment[]
   busySendMode: 'queue' | 'steer'
   hasSendContent: boolean
+  sendPending?: boolean
   isStreaming: boolean
   canStop: boolean
   stopTargetsPlanRun?: boolean
@@ -401,8 +534,10 @@ const props = withDefaults(defineProps<{
   safeSetupAvailable?: boolean
   runModeLocked: boolean
   runModeLockMessage: string
-  modelRoutingMode: ModelRoutingMode
-  modelRoutingSettingsBusy: boolean
+  sessionRoutingMode: ModelRoutingMode
+  sessionRoutingBusy: boolean
+  sessionRoutingControlBlocked?: boolean
+  sessionRoutingAvailable?: boolean
   codingModeEnabled?: boolean
   codingModeSettingsBusy?: boolean
   addMenuAvoidElement?: HTMLElement | null
@@ -415,7 +550,9 @@ const props = withDefaults(defineProps<{
   voiceReady: boolean
   projectWorkspace?: { id: string; name: string; path: string } | null
   projectWorkspaceStatus?: 'none' | 'resolving' | 'ready' | 'unavailable' | 'removed' | 'unknown' | 'error'
+  projectBindingBusy?: boolean
   projectStatusMessage?: string
+  promptAnnotations?: readonly PromptAnnotation[]
   canCloseProject?: boolean
   canChooseProject?: boolean
   planModeAvailable?: boolean
@@ -436,10 +573,14 @@ const props = withDefaults(defineProps<{
   canChooseProject: true,
   codingModeEnabled: false,
   codingModeSettingsBusy: false,
+  sessionRoutingAvailable: true,
+  sessionRoutingControlBlocked: false,
   goalDraftArmed: false,
   inputDisabled: false,
   safeSetupAvailable: false,
   floating: false,
+  promptAnnotations: () => [],
+  selectedSkills: () => [],
 })
 
 const emit = defineEmits<{
@@ -448,12 +589,14 @@ const emit = defineEmits<{
   fileChange: [event: Event]
   input: [event: Event]
   keydown: [event: KeyboardEvent]
+  removeSkill: [instanceId: string]
   removeAttachment: [index: number]
   retryAttachment: [index: number]
+  previewImage: [attachment: Attachment]
   send: []
   setBusySendMode: [mode: 'queue' | 'steer']
   setRunMode: [mode: SandboxRunMode]
-  setModelRoutingMode: [mode: ModelRoutingMode]
+  setSessionRoutingMode: [mode: ModelRoutingMode]
   setCodingModeEnabled: [enabled: boolean]
   setCollaborationMode: [mode: CollaborationMode]
   armGoal: []
@@ -465,6 +608,9 @@ const emit = defineEmits<{
   stop: []
   chooseProject: []
   closeProject: []
+  updatePromptAnnotation: [annotationId: string, body: string]
+  discardPromptAnnotation: [annotationId: string]
+  jumpPromptAnnotation: [annotationId: string]
   openPromptCacheKeepalive: []
   refreshPromptCacheKeepalive: []
   /** Request the parent to restore the full (expanded) composer. */
@@ -472,6 +618,13 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+
+const showSkillQueueSend = computed(() => props.canStop
+  && props.isStreaming
+  && !props.stopTargetsPlanRun
+  && !props.replanActive
+  && props.selectedSkills.length > 0
+  && props.hasSendContent)
 
 const inputText = defineModel<string>({ required: true })
 const composerEl = ref<HTMLElement | null>(null)
@@ -509,9 +662,39 @@ const fileInputEl = ref<HTMLInputElement | null>(null)
 const addMenuOpen = ref(false)
 const modelRoutingOpen = ref(false)
 const moreActionsOpen = ref(false)
+const editingAnnotationId = ref('')
+const annotationDraftBody = ref('')
+const annotationInputEl = ref<HTMLInputElement[] | null>(null)
+const promptAnnotationMaxBodyLength = PROMPT_ANNOTATION_MAX_BODY_LENGTH
+const annotationDraftTooLong = computed(() => (
+  !promptAnnotationBodyWithinLimit(annotationDraftBody.value)
+))
 const showProjectContext = computed(() =>
   Boolean(props.projectWorkspace && (props.canCloseProject || props.projectStatusMessage)),
 )
+
+function beginAnnotationEdit(annotation: PromptAnnotation) {
+  editingAnnotationId.value = annotation.annotationId
+  annotationDraftBody.value = annotation.body
+  void nextTick(() => {
+    const inputs = annotationInputEl.value
+    const input = Array.isArray(inputs) ? inputs[inputs.length - 1] : inputs
+    input?.focus()
+    input?.select()
+  })
+}
+
+function cancelAnnotationEdit() {
+  editingAnnotationId.value = ''
+  annotationDraftBody.value = ''
+}
+
+function saveAnnotationEdit(annotationId: string) {
+  const body = annotationDraftBody.value.trim()
+  if (!body || !promptAnnotationBodyWithinLimit(body)) return
+  emit('updatePromptAnnotation', annotationId, body)
+  cancelAnnotationEdit()
+}
 const promptCacheKeepaliveStatusText = computed(() => {
   const status = props.promptCacheKeepaliveStatus
   if (!status || status.state === 'off') return ''
@@ -671,6 +854,14 @@ function openPromptCacheKeepalive() {
   emit('openPromptCacheKeepalive')
 }
 
+function attachmentCanPreview(att: Attachment): boolean {
+  return isImageDisplayAttachment(att) && Boolean(att.file || att.data || att.dataUrl)
+}
+
+function previewImage(att: Attachment) {
+  if (attachmentCanPreview(att)) emit('previewImage', att)
+}
+
 function attachmentIcon(att: Attachment): IconName {
   return isImageDisplayAttachment(att) ? 'image' : 'fileText'
 }
@@ -702,7 +893,7 @@ function composerElement(): HTMLElement | null {
 
 function canCollapse(): boolean {
   const activeElement = document.activeElement
-  return !anyPopoverOpen.value
+  return props.selectedSkills.length === 0 && !anyPopoverOpen.value
     && (
       !activeElement
       || activeElement === textareaEl.value
@@ -836,6 +1027,7 @@ defineExpose<ChatComposerExpose>({
 .chat-project-chip[data-status="error"] {
   background: color-mix(in srgb, var(--warn) 7%, transparent);
 }
+
 .chat-coding-mode-chip {
   flex: 0 0 auto;
   min-height: 30px;
@@ -964,6 +1156,149 @@ defineExpose<ChatComposerExpose>({
   margin-bottom: 0.5rem;
 }
 
+.chat-prompt-annotations {
+  display: grid;
+  max-height: 8.75rem;
+  overflow-y: auto;
+  padding: 0.375rem 0.75rem 0;
+}
+
+.chat-prompt-annotations__header {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  min-height: 1.5rem;
+  margin-bottom: 0.25rem;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  line-height: 1.3;
+}
+
+.chat-prompt-annotation-chip {
+  display: grid;
+  grid-template-columns: 3px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+  min-height: 2.75rem;
+  padding: 0.375rem 0;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+}
+
+.chat-prompt-annotations__header + .chat-prompt-annotation-chip {
+  border-top: 1px solid var(--border);
+}
+
+.chat-prompt-annotation-chip__rail {
+  width: 3px;
+  align-self: stretch;
+  border-radius: var(--radius-full);
+  background: var(--accent);
+}
+
+.chat-prompt-annotation-chip__main {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  min-width: 0;
+  gap: 0.5rem;
+  padding: 0.25rem 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chat-prompt-annotation-chip__main:hover,
+.chat-prompt-annotation-chip__main:focus-visible {
+  outline: 0;
+  color: var(--accent);
+}
+
+.chat-prompt-annotation-chip__target,
+.chat-prompt-annotation-chip__text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-prompt-annotation-chip__target {
+  padding: 0.125rem 0.375rem;
+  border-radius: var(--radius-sm);
+  background: var(--bg-hover);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
+.chat-prompt-annotation-chip__text {
+  color: var(--text);
+  font-size: var(--fs-sm);
+}
+
+.chat-prompt-annotation-chip__editor {
+  display: grid;
+  grid-column: 2 / -1;
+  grid-template-columns: minmax(8rem, 1fr) auto auto;
+  gap: 0.25rem;
+}
+
+.chat-prompt-annotation-chip__editor input {
+  min-width: 0;
+  padding: 0.375rem 0.5rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--text);
+}
+
+.chat-prompt-annotation-chip__editor button {
+  padding: 0.25rem 0.5rem;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: var(--bg-hover);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.chat-prompt-annotation-chip > .attachment-action {
+  width: 2rem;
+  height: 2rem;
+  flex-basis: 2rem;
+  border-radius: var(--radius-control);
+}
+
+.chat-prompt-annotation-chip > .attachment-action:hover,
+.chat-prompt-annotation-chip > .attachment-action:focus-visible {
+  outline: 0;
+  background: var(--bg-hover);
+}
+
+@media (max-width: 600px) {
+  .chat-prompt-annotation-chip__main {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .chat-prompt-annotation-chip__target {
+    display: none;
+  }
+
+}
+
+.chat-selected-skills {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.5rem 0.75rem;
+}
+
+.chat-selected-skills__label {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
 .attachment-chip {
   display: inline-flex;
   align-items: center;
@@ -978,6 +1313,33 @@ defineExpose<ChatComposerExpose>({
 
 .attachment-chip--busy {
   opacity: 0.7;
+}
+
+.attachment-chip__primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+
+button.attachment-chip__primary {
+  cursor: pointer;
+}
+
+button.attachment-chip__primary:hover {
+  color: var(--accent);
+}
+
+button.attachment-chip__primary:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
 }
 
 .attachment-chip--failed {
@@ -1594,6 +1956,21 @@ defineExpose<ChatComposerExpose>({
   border-color: var(--bg-hover);
 }
 
+.chat-composer-send-pending {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
+.chat-composer-send-pending .loading-spinner,
+.chat-send-btn .loading-spinner {
+  width: 14px;
+  height: 14px;
+}
+
 .chat-send-btn.btn--primary:hover {
   background: var(--bg-hover);
   border-color: var(--bg-hover);
@@ -1608,6 +1985,13 @@ defineExpose<ChatComposerExpose>({
 .chat-send-btn.btn--primary.is-ready:hover {
   background: var(--accent-hover);
   border-color: var(--accent-hover);
+}
+
+/* A routing CAS is usually shorter than a visual transition. Keep the send
+   button stable while native disabled semantics prevent submission. */
+.chat-send-btn[aria-busy='true']:disabled {
+  cursor: progress;
+  opacity: 1;
 }
 
 @keyframes spin {

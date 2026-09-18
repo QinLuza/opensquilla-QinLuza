@@ -1,30 +1,27 @@
-import { computed, ref, type Ref } from 'vue'
+import { computed, getCurrentScope, onScopeDispose, ref, watch, type Ref } from 'vue'
+import type { SkillCatalog } from '@/modules/skillCatalog'
+import type { SkillCandidate } from '@/types/skills'
+import type { SelectedSkillRef } from '@/types/selectedSkills'
+import { replaceSlashQuery, shortSlashDescription, slashQueryAt, slashSearchRank, type SlashQueryRange } from '@/utils/chat/slashPalette'
 import i18n from '@/i18n'
-import type { RpcCallOptions, RpcClientError, RpcConnectionWaitOptions } from '@/lib/rpc'
+import {
+  MetaRunCenterError,
+  type MetaLaunchDraftPayload,
+  type MetaRunCenter,
+} from '@/modules/metaRunCenter'
+import type { CommandCatalog } from '@/modules/commandCatalog'
+import type {
+  UsageReporting,
+  UsageReportingRequestOptions,
+} from '@/modules/usageReporting'
+import type { SessionMaintenance } from '@/modules/sessionMaintenance'
 import type { HiddenControlDispatchResult } from '@/types/chat'
 import type { MetaSetupReadiness } from '@/types/metaSetup'
-import type { MetaLaunchDraftPayload } from '@/types/rpc'
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
-import {
-  waitForSessionRpcConnection,
-} from '@/composables/chat/sessionBootstrapAdmission'
 import {
   formatGoalDuration,
   type GoalSnapshot,
 } from '@/composables/chat/useChatGoals'
-
-type RpcClient = {
-  waitForConnection: (
-    timeoutMs?: number,
-    signal?: AbortSignal,
-    actions?: RpcConnectionWaitOptions,
-  ) => Promise<void>
-  call: <T = unknown>(
-    method: string,
-    params?: Record<string, unknown>,
-    callOptions?: RpcCallOptions,
-  ) => Promise<T>
-}
 
 export interface ArgumentChoice {
   value: string
@@ -38,10 +35,13 @@ export interface ArgumentChoice {
 }
 
 export interface ChatSlashCommand {
+  kind?: 'command' | 'skill' | 'meta'
+  skill?: SkillCandidate
   name: string
   cmd: string
   label: string
   desc: string
+  searchDescriptions?: string[]
   aliases: string[]
   execution?: {
     action?: string
@@ -72,14 +72,6 @@ interface SlashCommandPayload extends Record<string, unknown> {
   }
 }
 
-interface UsageStatusResult {
-  totals?: {
-    tokens?: number
-  }
-  totalTokens?: number
-  total_tokens?: number
-}
-
 const SUPPORTED_WEB_SLASH_ACTIONS = new Set([
   '/coding',
   '/compact',
@@ -103,8 +95,18 @@ const SUPPORTED_WEB_SLASH_ACTIONS = new Set([
 ])
 
 export interface UseChatSlashCommandsOptions {
-  rpc: RpcClient
-  catalogCallOptions?: RpcCallOptions
+  skillCatalog?: SkillCatalog
+  selectedSkills?: Ref<SelectedSkillRef[]>
+  getCaret?: () => number
+  setCaret?: (position: number) => void
+  manageSkill?: (name: string) => void
+  hasNonTextInput?: () => boolean
+  commandCatalog: CommandCatalog
+  usageReporting: UsageReporting
+  sessionMaintenance: SessionMaintenance
+  /** Domain seam for MetaSkill launch; wire method names stay in its adapter. */
+  metaRunCenter?: MetaRunCenter
+  catalogCallOptions?: UsageReportingRequestOptions
   inputText: Ref<string>
   sessionKey: Ref<string>
   autoResizeTextarea: () => void
@@ -193,6 +195,10 @@ function slashCommandKeys(command: Pick<ChatSlashCommand, 'aliases' | 'cmd' | 'n
     .filter(Boolean)
 }
 
+function isMenuCommand(command: ChatSlashCommand): boolean {
+  return !slashCommandKeys(command).some(key => key === '/reset' || key === '/usage')
+}
+
 function normalizeSlashCommand(cmd: SlashCommandPayload): ChatSlashCommand {
   const name = cmd?.name || cmd?.cmd || ''
   const rawChoices = Array.isArray((cmd as { argument_choices?: unknown })?.argument_choices)
@@ -273,6 +279,7 @@ function makeArgCandidate(parent: ChatSlashCommand, choice: ArgumentChoice): Cha
     cmd: full,
     label: full,
     desc: localizedMetaDescription(choice),
+    searchDescriptions: [choice.description],
     aliases: [],
     execution: parent.execution,
     argValue: choice.value,
@@ -285,33 +292,149 @@ function makeArgCandidate(parent: ChatSlashCommand, choice: ArgumentChoice): Cha
   }
 }
 
+const PALETTE_COPY: Record<string, { key: string; aliases: string[] }> = {
+  xlsx: { key: 'xlsx', aliases: ['Excel', 'spreadsheet', '表格'] },
+  docx: { key: 'docx', aliases: ['Word', 'document', '文档'] },
+  pptx: { key: 'pptx', aliases: ['PowerPoint', 'presentation', '幻灯片', '演示'] },
+  'pdf-toolkit': { key: 'pdf', aliases: ['PDF', '文档'] },
+  github: { key: 'github', aliases: ['GitHub', 'repository', '代码仓库'] },
+  'html-coder': { key: 'html', aliases: ['HTML', 'webpage', '网页'] },
+  AwesomeWebpageMetaSkill: { key: 'webpage', aliases: ['website', '网站'] },
+  'meta-kid-project-planner': { key: 'kidsProject', aliases: ['children', '儿童', '创意项目'] },
+  'meta-short-drama': { key: 'shortDrama', aliases: ['video', '短剧', '视频'] },
+  'meta-skill-creator': { key: 'skillCreator', aliases: ['workflow', '工作流'] },
+  'meta-paper-write': { key: 'paperWriting', aliases: ['paper', '论文'] },
+}
+const PREFERRED_META_NAMES = ['AwesomeWebpageMetaSkill', 'meta-short-drama', 'meta-paper-write']
+
+function paletteCopy(name: string, description: string): { label: string; desc: string; aliases: string[] } {
+  const copy = PALETTE_COPY[name]
+  return copy ? {
+    label: i18n.global.t(`chat.skillPalette.items.${copy.key}.name`),
+    desc: i18n.global.t(`chat.skillPalette.items.${copy.key}.description`),
+    aliases: copy.aliases,
+  } : { label: name, desc: shortSlashDescription(description), aliases: [] }
+}
+
 function localizedMetaDescription(choice: ArgumentChoice): string {
-  const keys: Record<string, string> = {
-    AwesomeWebpageMetaSkill: 'chat.metaDescriptions.webpage',
-    'meta-kid-project-planner': 'chat.metaDescriptions.kidsProject',
-    'meta-short-drama': 'chat.metaDescriptions.shortDrama',
-    'meta-skill-creator': 'chat.metaDescriptions.skillCreator',
-    'meta-paper-write': 'chat.metaDescriptions.paperWriting',
-  }
-  const key = keys[choice.value]
-  return key ? i18n.global.t(key) : choice.description
+  return paletteCopy(choice.value, choice.description).desc
 }
 
 export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
+  const commandCatalog = options.commandCatalog
+  const usageReporting = options.usageReporting
+  const maintenance = options.sessionMaintenance
   const slashOpen = ref(false)
   const slashIdx = ref(0)
   const slashCmds = ref<ChatSlashCommand[]>([])
   const filteredSlashCmds = ref<ChatSlashCommand[]>([])
   const slashCatalogLoaded = ref(false)
+  const skillCandidates = ref<SkillCandidate[]>([])
+  const skillsLoading = ref(false)
+  const skillsError = ref('')
+  const metaDraft = ref<{ name: string; label?: string; text: string; originalText: string; sessionKey: string } | null>(null)
+  let queryRange: SlashQueryRange | null = null
+  let candidatesLoaded = false
+  let candidateEpoch = 0
+  const unsubscribe = options.skillCatalog?.subscribeInvalidation?.(invalidateSkillCandidates)
+  if (unsubscribe && getCurrentScope()) onScopeDispose(unsubscribe)
+
+  watch(options.sessionKey, (sessionKey) => {
+    const draft = metaDraft.value
+    if (!draft || draft.sessionKey === sessionKey) return
+    if (draft.text.trim()) {
+      options.restoreDraft?.(`/meta ${draft.name} -- ${draft.text.trim()}`, draft.sessionKey)
+    }
+    metaDraft.value = null
+  })
+
+  function resetSkillCandidates() {
+    candidateEpoch += 1
+    candidatesLoaded = false
+    skillsLoading.value = false
+    skillCandidates.value = []
+    skillsError.value = ''
+  }
+
+  function invalidateSkillCandidates() {
+    resetSkillCandidates()
+    closeSlashMenu()
+  }
+
+  async function loadSkillCandidates() {
+    if (candidatesLoaded || skillsLoading.value || !options.skillCatalog) return
+    if (!options.skillCatalog.supportsCandidates()) {
+      skillsError.value = i18n.global.t('chat.skillPalette.upgrade')
+      return
+    }
+    const epoch = candidateEpoch
+    skillsLoading.value = true
+    skillsError.value = ''
+    try {
+      const result = await options.skillCatalog.listCandidates({ sessionKey: options.sessionKey.value })
+      if (epoch !== candidateEpoch) return
+      skillCandidates.value = [...result.candidates]
+      candidatesLoaded = true
+    } catch {
+      if (epoch === candidateEpoch) skillsError.value = i18n.global.t('chat.skillPalette.loadFailed')
+    } finally {
+      if (epoch === candidateEpoch) {
+        skillsLoading.value = false
+        if (slashOpen.value) updatePalette()
+      }
+    }
+  }
+
+  function updatePalette() {
+    if (!queryRange) return
+    const query = queryRange.query
+    const commands = slashCmds.value.filter(isMenuCommand).map(command => ({
+      ...withLiveDescription(command), searchDescriptions: [command.desc], kind: 'command' as const,
+    }))
+    const meta = slashCmds.value.flatMap(parent => (parent.argumentChoices || []).map(choice => ({
+      ...makeArgCandidate(parent, choice), kind: 'meta' as const,
+      ...paletteCopy(choice.value, choice.description),
+    })))
+    const skills: ChatSlashCommand[] = skillCandidates.value.map(skill => {
+      const copy = paletteCopy(skill.name, String(i18n.global.locale.value).startsWith('zh')
+        ? skill.descriptionZh || skill.description : skill.description)
+      return {
+        ...copy, name: skill.name, cmd: '/' + skill.name,
+        aliases: [...skill.aliases, ...copy.aliases], kind: 'skill', skill,
+      }
+    })
+    filteredSlashCmds.value = [...commands, ...skills, ...meta]
+      .map((command, index) => ({ command, index, rank: slashSearchRank(query,
+        [command.label, command.name, command.cmd, ...command.aliases],
+        [command.desc, ...(command.searchDescriptions || []), command.skill?.description || '', command.skill?.descriptionZh || '']) }))
+      .filter(item => item.rank >= 0)
+      .sort((a, b) => a.rank - b.rank || a.index - b.index)
+      .map(item => item.command)
+    slashIdx.value = Math.max(0, Math.min(slashIdx.value, filteredSlashCmds.value.length - 1))
+    slashOpen.value = true
+  }
+
+  async function launchMetaDraft() {
+    const draft = metaDraft.value
+    if (!draft?.text.trim() || draft.sessionKey !== options.sessionKey.value) return
+    if (options.hasNonTextInput?.() || options.selectedSkills?.value.length) {
+      options.notify(i18n.global.t('chat.skillPalette.metaTextOnly'))
+      return
+    }
+    const launchText = `/meta ${draft.name} -- ${draft.text.trim()}`
+    metaDraft.value = null
+    const outcome = await runMetaInvocation({ skillName: draft.name, launchText,
+      originatingSessionKey: draft.sessionKey, clientRequestId: createClientRequestId() })
+    if (outcome !== 'failed' && outcome !== 'discarded'
+      && options.sessionKey.value === draft.sessionKey && options.inputText.value === draft.originalText) {
+      options.inputText.value = ''
+      options.autoResizeTextarea()
+    }
+  }
   const metaSkillChoices = computed(() => {
     const command = slashCmds.value.find(c => slashCommandKey(c.name) === '/meta')
     const choices = command?.argumentChoices || []
-    const preferred = [
-      'AwesomeWebpageMetaSkill',
-      'meta-short-drama',
-      'meta-paper-write',
-    ]
-    return preferred
+    return PREFERRED_META_NAMES
       .map(name => choices.find(choice => choice.value === name))
       .filter((choice): choice is ArgumentChoice => Boolean(choice))
   })
@@ -356,13 +479,8 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       options.notify(i18n.global.t('chat.metaRuns.couldNotRunSkillError', { error }))
     }
     try {
-      const result = await options.rpc.call<{
-        ok?: boolean
-        error?: string
-        drafted?: boolean
-        setup_required?: boolean
-        readiness?: MetaSetupReadiness
-      }>('meta.run', {
+      if (!options.metaRunCenter) throw new Error('MetaRunCenter is unavailable')
+      const result = await options.metaRunCenter.launch({
         name: skillName,
         sessionKey: originatingSessionKey,
         clientRequestId,
@@ -389,7 +507,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
         }
         return dispatchResult?.status === 'queued' ? 'queued' : 'accepted'
       }
-      if (result?.setup_required) {
+      if (result?.setupRequired) {
         const readiness = result.readiness || {}
         if (options.requestMetaSetup) {
           const disposition = await options.requestMetaSetup(
@@ -431,12 +549,11 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       )
       return 'failed'
     } catch (err: unknown) {
-      const rpcError = err as RpcClientError | undefined
-      if (rpcError?.code === 'META_DRAFT_DISCARDED') {
+      if (err instanceof MetaRunCenterError && err.code === 'draft-discarded') {
         // Another tab already committed the user's cancellation. This identity
         // is terminal: never recreate a setup card or a sendable composer copy.
         options.notify(i18n.global.t('chat.metaRuns.couldNotRunSkillError', {
-          error: rpcError.message,
+          error: err.message,
         }))
         return 'discarded'
       }
@@ -480,18 +597,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
 
   async function loadSlashCommands() {
     try {
-      await waitForSessionRpcConnection(options.rpc, options.catalogCallOptions)
-      const params = { surface: 'web_chat' }
-      const res = options.catalogCallOptions
-        ? await options.rpc.call<{ commands?: ChatSlashCommand[] }>(
-            'commands.list_for_surface',
-            params,
-            options.catalogCallOptions,
-          )
-        : await options.rpc.call<{ commands?: ChatSlashCommand[] }>(
-            'commands.list_for_surface',
-            params,
-          )
+      const res = await commandCatalog.list('web_chat', options.catalogCallOptions)
       if (
         !Array.isArray(res?.commands)
         || !res.commands.every(isValidSlashCommandPayload)
@@ -533,19 +639,39 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
 
   function withLiveDescription(command: ChatSlashCommand): ChatSlashCommand {
     const action = command?.execution?.action || command.cmd || command.name
-    if (action !== 'coding.mode' && action !== '/coding') return command
-    return {
-      ...command,
-      desc: i18n.global.t(
+    if (action === 'coding.mode' || action === '/coding') return {
+      ...command, desc: i18n.global.t(
         options.codingModeEnabled.value
           ? 'chat.codingMode.commandDisable'
           : 'chat.codingMode.commandEnable',
       ),
     }
+    const names: Record<string, string> = {
+      new_chat: 'new', '/new': 'new',
+      compact_context: 'compact', 'sessions.contextCompact': 'compact', '/compact': 'compact',
+      'goal.set': 'goal', '/goal': 'goal', 'meta.menu': 'meta',
+      'plans.setMode': 'plan', 'plans.toggleMode': 'plan', '/plan': 'plan',
+      reset_session: 'reset', 'sessions.reset': 'reset', '/reset': 'reset',
+      usage_status: 'usage', 'usage.status': 'usage', '/usage': 'usage',
+    }
+    return { ...command, desc: names[action]
+      ? i18n.global.t(`chat.skillPalette.commandDescriptions.${names[action]}`)
+      : shortSlashDescription(command.desc) }
   }
 
   function handleSlashInput() {
     const val = options.inputText.value
+    queryRange = slashQueryAt(val, options.getCaret?.() ?? val.length)
+    if (queryRange) {
+      // Directory edits and mutations in another client have no push event.
+      // Revalidate at the next palette opening, never on each search keystroke
+      // or during client startup. The epoch also fences an earlier open's RPC.
+      if (!slashOpen.value) resetSkillCandidates()
+      slashIdx.value = 0
+      updatePalette()
+      void loadSkillCandidates()
+      return
+    }
     if (val.startsWith('//') || !val.startsWith('/')) {
       closeSlashMenu()
       return
@@ -555,6 +681,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       // Command-name completion: "/me" -> matching commands.
       const query = val.slice(1).toLowerCase()
       const matches = slashCmds.value
+        .filter(isMenuCommand)
         .filter(command =>
           slashCommandKeys(command).some(key => key.slice(1).startsWith(query)),
         )
@@ -571,7 +698,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     const partial = val.slice(firstSpace + 1).trimStart().toLowerCase()
     const parent = slashCmds.value.find(c => slashCommandKey(c.name) === slashCommandKey(head))
     const choices = parent?.argumentChoices || []
-    if (parent && choices.length > 0) {
+    if (parent && isMenuCommand(parent) && choices.length > 0) {
       openWith(
         choices
           .filter(ch => ch.value.toLowerCase().startsWith(partial))
@@ -588,10 +715,49 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   }
 
   function completeSlashCmd(cmd: ChatSlashCommand) {
+    if (cmd.kind === 'skill' && cmd.skill && queryRange) {
+      const skill = cmd.skill
+      if (skill.disabled || !skill.ready) {
+        options.manageSkill?.(skill.name)
+        closeSlashMenu()
+        return
+      }
+      const selected = options.selectedSkills
+      if (!selected) return
+      if (!selected.value.some(item => item.instanceId === skill.instanceId)) {
+        if (selected.value.length >= 16) {
+          options.notify(i18n.global.t('chat.skillPalette.limit'))
+          return
+        }
+        selected.value = [...selected.value, { name: skill.name, instanceId: skill.instanceId, digest: skill.digest }]
+      }
+      const caret = queryRange.start
+      options.inputText.value = replaceSlashQuery(options.inputText.value, queryRange)
+      closeSlashMenu()
+      options.autoResizeTextarea()
+      options.setCaret?.(caret)
+      return
+    }
+    if (cmd.kind === 'meta') {
+      if (options.hasNonTextInput?.() || options.selectedSkills?.value.length) {
+        options.notify(i18n.global.t('chat.skillPalette.metaTextOnly'))
+        return
+      }
+      const originalText = options.inputText.value
+      metaDraft.value = { name: cmd.argValue!, label: cmd.label, originalText,
+        text: queryRange ? replaceSlashQuery(originalText, queryRange).trim() : '',
+        sessionKey: options.sessionKey.value }
+      closeSlashMenu()
+      return
+    }
+    if (queryRange && queryRange.start > 0) {
+      options.notify(i18n.global.t('chat.skillPalette.commandAtStart'))
+      return
+    }
     closeSlashMenu()
     const needsArgument = !cmd.argValue && (cmd.argumentChoices?.length ?? 0) > 0
     const action = cmd?.execution?.action || cmd.cmd || cmd.name
-    if (action === 'goal.set' && !cmd.argValue) {
+    if (action === 'goal.set' && !cmd.argValue && !options.selectedSkills?.value.length) {
       // Selecting /goal arms the goal composer: the Goal chip appears next to
       // the access-mode controls and the user types the goal normally.
       const originalInput = options.inputText.value
@@ -608,6 +774,10 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   }
 
   function activateSlashCmd(cmd: ChatSlashCommand) {
+    if (cmd.kind === 'skill' || cmd.kind === 'meta') {
+      completeSlashCmd(cmd)
+      return
+    }
     if (cmd.argValue) {
       completeSlashCmd(cmd)
       return
@@ -641,6 +811,11 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       options.inputText.value = cmd.cmd + ' '
       options.autoResizeTextarea()
       handleSlashInput()
+      return
+    }
+
+    if (options.selectedSkills?.value.length) {
+      options.notify(i18n.global.t('chat.skillPalette.commandWithSkills'))
       return
     }
 
@@ -738,7 +913,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       case 'reset_session':
       case 'sessions.reset':
       case '/reset':
-        options.rpc.call('sessions.reset', { key: options.sessionKey.value })
+        maintenance.reset({ key: options.sessionKey.value })
           .then(() => {
             options.resetCurrentSession()
           })
@@ -753,13 +928,10 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
           tone: 'info',
           source: 'manual',
         })
-        options.rpc.call<Record<string, unknown>>('sessions.contextCompact', {
-          key: compactKey,
-          wait: false,
-        })
+        maintenance.compact({ key: compactKey, wait: false })
           .then((result) => {
             if (compactKey !== options.sessionKey.value) return
-            options.showCompactionToast({ key: compactKey, source: 'manual', ...result })
+            options.showCompactionToast({ ...result, key: compactKey, source: 'manual' })
           })
           .catch((err: unknown) => {
             if (compactKey !== options.sessionKey.value) return
@@ -775,13 +947,11 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       case 'usage_status':
       case 'usage.status':
       case '/usage':
-        options.rpc.call<UsageStatusResult>('usage.status')
-          .then((result: UsageStatusResult) => {
-            const totals = result?.totals || {}
-            const tokens = Number(result?.totalTokens ?? result?.total_tokens ?? totals.tokens ?? 0)
-            console.info(`Usage: ${tokens.toLocaleString()} tokens`)
+        usageReporting.status()
+          .then((result) => {
+            options.notify(i18n.global.t('chat.skillPalette.usage', { tokens: result.totalTokens.toLocaleString() }))
           })
-          .catch((err: unknown) => console.warn('Usage failed:', err instanceof Error ? err.message : String(err)))
+          .catch(() => options.notify(i18n.global.t('chat.skillPalette.usageFailed')))
         break
       case 'meta.menu': {
         // Bare "/meta" is handled by the argument-completion branch above
@@ -935,6 +1105,12 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
 
   return {
     slashOpen,
+    skillsLoading,
+    skillsError,
+    loadSkillCandidates,
+    invalidateSkillCandidates,
+    metaDraft,
+    launchMetaDraft,
     slashIdx,
     metaSkillChoices,
     filteredSlashCmds,

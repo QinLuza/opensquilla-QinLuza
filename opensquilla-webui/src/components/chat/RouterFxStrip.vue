@@ -42,6 +42,14 @@
           aria-hidden="true"
         ></span>
       </div>
+      <div
+        v-if="executionDiffersFromRoute"
+        class="router-fx-execution"
+        data-testid="router-execution-model"
+        :title="executionModel"
+      >
+        {{ executionModelAnnouncement }}
+      </div>
       <span
         class="router-fx-sr-only"
         role="status"
@@ -104,7 +112,9 @@
               }"
               :data-status="model.status || undefined"
             >
-              <span class="router-fx-inspector__role">{{ model.role }}</span>
+              <span class="router-fx-inspector__role">
+                {{ ensembleMemberRoleLabel(model.role) }} <span aria-hidden="true">·</span>
+              </span>
               <span class="router-fx-inspector__model" :title="model.model">{{ model.modelShort }}</span>
               <span class="router-fx-inspector__usage" :title="ensembleModelTitle(model)">
                 <span
@@ -140,6 +150,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useMediaQuery } from '@/composables/chat/useMediaQuery'
 import type { ChatEnsembleMetaModel, ChatRenderedMessage } from '@/types/chat'
+import { ensembleMemberRoleLabel } from '@/utils/ensembleRoles'
 
 const ROUTER_FX_SCAN_STEP_MS = 190
 const ROUTER_FX_SCAN_WINDOW_MS = 600
@@ -177,12 +188,34 @@ const ensembleStageReady = computed(() =>
 )
 const prefersReducedMotion = useMediaQuery('(prefers-reduced-motion: reduce)')
 const realCandidateIndices = computed(() => gridCells.value.flatMap((cell, index) => cell.kind === 'real' ? [index] : []))
-const winnerIndex = computed(() => {
+const routeWinnerIndex = computed(() => {
   const index = Number(props.message.winnerIdx ?? -1)
   if (!Number.isInteger(index) || index < 0 || index >= gridCells.value.length) return -1
   return gridCells.value[index]?.kind === 'real' ? index : -1
 })
+const routeSelectedModel = computed(() => String(props.message.routerSelectedModel || '').trim())
+const executionModel = computed(() => String(props.message.routerExecutionModel || '').trim())
+const executionDiffersFromRoute = computed(() => Boolean(
+  executionModel.value
+  && routeSelectedModel.value
+  && executionModel.value !== routeSelectedModel.value,
+))
+const executionCellIndex = computed(() => {
+  if (!executionDiffersFromRoute.value) return -1
+  return gridCells.value.findIndex(cell => (
+    cell.kind === 'real' && String(cell.model || '').trim() === executionModel.value
+  ))
+})
+const winnerIndex = computed(() => (
+  executionDiffersFromRoute.value ? executionCellIndex.value : routeWinnerIndex.value
+))
 const winnerName = computed(() => winnerIndex.value >= 0 ? visualGridCells.value[winnerIndex.value]?.visualName || '' : '')
+const executionModelAnnouncement = computed(() => t(
+  props.message.routerSettled || props.message.routerStatic
+    ? 'chat.routerFx.executionModelCompleted'
+    : 'chat.routerFx.executionModel',
+  { model: executionModel.value },
+))
 const visibleWinnerIndex = computed(() => {
   return motionPhase.value === 'locked' || motionPhase.value === 'static' ? winnerIndex.value : -1
 })
@@ -192,6 +225,7 @@ const routerDataSettled = computed(() => {
 })
 const routerAriaLabel = computed(() => {
   if (!showsRouterStage.value) return undefined
+  if (executionDiffersFromRoute.value) return executionModelAnnouncement.value
   if (visibleWinnerIndex.value >= 0 && winnerName.value) {
     return t('chat.routerFx.selectedModel', { model: winnerName.value })
   }
@@ -292,6 +326,7 @@ function clearMotionTimers() {
 }
 
 function selectedAnnouncement(): string {
+  if (executionDiffersFromRoute.value) return executionModelAnnouncement.value
   return winnerName.value
     ? t('chat.routerFx.selectedModel', { model: winnerName.value })
     : ''
@@ -382,7 +417,7 @@ function initializeMotion() {
     startScanning()
     return
   }
-  const shouldAnnounce = winnerIndex.value >= 0
+  const shouldAnnounce = (winnerIndex.value >= 0 || executionDiffersFromRoute.value)
     && props.message.routerStatic !== true
     && props.message.routerObserve !== true
   settleStatic(shouldAnnounce)
@@ -392,8 +427,16 @@ watch(animationIdentity, () => {
   if (mounted) initializeMotion()
 })
 
-watch(winnerIndex, (next, previous) => {
-  if (!mounted || next < 0 || next === previous) return
+watch([winnerIndex, executionModel], ([next, nextExecutionModel], [previous, previousExecutionModel]) => {
+  if (
+    !mounted
+    || (next === previous && nextExecutionModel === previousExecutionModel)
+  ) return
+  if (executionDiffersFromRoute.value || nextExecutionModel !== previousExecutionModel) {
+    settleStatic(props.message.routerStatic !== true && props.message.routerObserve !== true)
+    return
+  }
+  if (next < 0) return
   if (motionPhase.value === 'idle') {
     initializeMotion()
     return
@@ -410,7 +453,7 @@ watch(
   ],
   ([routerStatic, routerObserve, routerSettled, reduceMotion]) => {
     if (!mounted || (!routerStatic && !routerObserve && !routerSettled && !reduceMotion)) return
-    const shouldAnnounce = winnerIndex.value >= 0 && !routerStatic && !routerObserve
+    const shouldAnnounce = (winnerIndex.value >= 0 || executionDiffersFromRoute.value) && !routerStatic && !routerObserve
     settleStatic(shouldAnnounce)
   },
 )
@@ -794,7 +837,6 @@ function ensembleModelElapsed(model: ChatEnsembleMetaModel): string {
   overflow: hidden;
   text-overflow: ellipsis;
   color: var(--router-muted);
-  text-transform: uppercase;
   white-space: nowrap;
 }
 
@@ -865,6 +907,21 @@ function ensembleModelElapsed(model: ChatEnsembleMetaModel): string {
   display: grid;
   max-width: 100%;
   min-width: 0;
+}
+
+.router-fx-execution {
+  align-self: center;
+  max-width: 100%;
+  padding: 3px 8px;
+  border: 1px solid color-mix(in srgb, var(--router-accent) 34%, var(--router-hairline));
+  border-radius: 999px;
+  color: var(--router-text);
+  background: color-mix(in srgb, var(--router-accent) 7%, var(--router-bg));
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .router-fx-sr-only {

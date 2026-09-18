@@ -30,12 +30,14 @@ import asyncio
 import concurrent.futures
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from opensquilla.provider.request_proof import estimate_provider_media_tokens
-from opensquilla.token_estimation import estimate_material_text_tokens
+from opensquilla.telemetry.file_parse_facts import FileParseReliabilityFacts
+from opensquilla.token_estimation import estimate_attachment_text_tokens
 
 if TYPE_CHECKING:
     from opensquilla.engine.turn_runner.outcome import StageOutcome
@@ -103,33 +105,59 @@ def _materialization_stats(
     parse_failure_count = 0
     provider_visible_text_chars = 0
     image_count = 0
+    attachment_blocks: list[Any] = []
     for message in extra_messages:
         content = getattr(message, "content", None)
         if not isinstance(content, list):
             continue
         # The first block is the ordinary prompt. Routing already counts it.
-        for attachment, block in zip(attachments, content[1:], strict=False):
-            block_tokens = 0
-            if isinstance(block, ContentBlockText):
-                provider_visible_text_chars += len(block.text)
-                block_tokens = estimate_material_text_tokens(block.text)
-                parse_failure_count += block.text.count(_UNAVAILABLE_MARKER)
-            elif isinstance(block, ContentBlockImage):
-                image_count += 1
-                block_tokens = estimate_provider_media_tokens(
-                    "image",
-                    _base64_decoded_size(block.data),
-                )
-            estimated_tokens += block_tokens
-            if (
-                generated_normalization_attachment_count > 0
-                and attachment.get("_generated_by")
-                == _GENERATED_TEXT_ATTACHMENT_SOURCE
-                and attachment.get("source") == _GENERATED_TEXT_ATTACHMENT_SOURCE
-                and attachment.get("_provider_inline_policy") == "preview_only"
-            ):
-                generated_normalization_estimated_tokens += block_tokens
-                generated_normalization_attachment_count -= 1
+        attachment_blocks.extend(content[1:])
+
+    block_tokens_by_index: list[int] = []
+    for block in attachment_blocks:
+        block_tokens = 0
+        if isinstance(block, ContentBlockText):
+            provider_visible_text_chars += len(block.text)
+            block_tokens = estimate_attachment_text_tokens(block.text)
+            parse_failure_count += block.text.count(_UNAVAILABLE_MARKER)
+        elif isinstance(block, ContentBlockImage):
+            image_count += 1
+            block_tokens = estimate_provider_media_tokens(
+                "image",
+                _base64_decoded_size(block.data),
+                encoded_data=block.data,
+            )
+        estimated_tokens += block_tokens
+        block_tokens_by_index.append(block_tokens)
+
+    # Most attachments render one block. A materialized image renders its
+    # image block plus a standalone workspace marker; advance across both so a
+    # following generated text attachment is attributed to its own block.
+    block_index = 0
+    for attachment in attachments:
+        if block_index >= len(attachment_blocks):
+            break
+        block = attachment_blocks[block_index]
+        block_tokens = block_tokens_by_index[block_index]
+        if (
+            generated_normalization_attachment_count > 0
+            and attachment.get("_generated_by")
+            == _GENERATED_TEXT_ATTACHMENT_SOURCE
+            and attachment.get("source") == _GENERATED_TEXT_ATTACHMENT_SOURCE
+            and attachment.get("_provider_inline_policy") == "preview_only"
+        ):
+            generated_normalization_estimated_tokens += block_tokens
+            generated_normalization_attachment_count -= 1
+        block_index += 1
+        if (
+            isinstance(block, ContentBlockImage)
+            and block_index < len(attachment_blocks)
+            and isinstance(attachment_blocks[block_index], ContentBlockText)
+            and attachment_blocks[block_index].text.startswith(
+                ("[attachment available:", "[attachment unavailable:")
+            )
+        ):
+            block_index += 1
     return AttachmentMaterializationStats(
         attachment_count=len(attachments),
         estimated_tokens=estimated_tokens,
@@ -207,6 +235,9 @@ class AttachmentStageInput:
     session_id: str | None = None
     generated_normalization_attachment_count: int = 0
     timeout_seconds: float | None = None
+    persist_image_material: bool | None = None
+    image_workspace_dir: str | Path | None = None
+    failure_cleanup: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -225,6 +256,7 @@ class AttachmentStageOutput:
     extra_messages: list[Any] | None
     turn_input: str
     stats: AttachmentMaterializationStats
+    file_parse_facts: tuple[FileParseReliabilityFacts, ...] = ()
 
 
 class AttachmentStage:
@@ -292,22 +324,47 @@ class AttachmentStage:
             deadline_at_monotonic=deadline_at_monotonic
         )
 
-        def _prepare() -> tuple[list[Any] | None, AttachmentMaterializationStats]:
+        def _prepare() -> tuple[
+            list[Any] | None,
+            AttachmentMaterializationStats,
+            tuple[FileParseReliabilityFacts, ...],
+        ]:
+            file_parse_facts: list[FileParseReliabilityFacts] = []
+            image_kwargs = (
+                {
+                    "persist_image_material": inp.persist_image_material,
+                    "image_workspace_dir": inp.image_workspace_dir,
+                }
+                if inp.persist_image_material is not None else {}
+            )
             build_cancellable = getattr(self._builder, "build_cancellable", None)
             if callable(build_cancellable):
-                extra = build_cancellable(
-                    inp.effective_runtime_message,
-                    attachments,
-                    workspace_dir=inp.workspace_dir,
-                    session_id=inp.session_id,
-                    cancel_check=control.check,
-                )
+                if getattr(self._builder, "supports_file_parse_facts", False) is True:
+                    extra = build_cancellable(
+                        inp.effective_runtime_message,
+                        attachments,
+                        workspace_dir=inp.workspace_dir,
+                        session_id=inp.session_id,
+                        cancel_check=control.check,
+                        **image_kwargs,
+                        file_parse_fact_sink=file_parse_facts.append,
+                    )
+                else:
+                    extra = build_cancellable(
+                        inp.effective_runtime_message,
+                        attachments,
+                        workspace_dir=inp.workspace_dir,
+                        session_id=inp.session_id,
+                        cancel_check=control.check,
+                        **image_kwargs,
+                    )
             else:
                 extra = self._builder.build(
                     inp.effective_runtime_message,
                     attachments,
                     workspace_dir=inp.workspace_dir,
                     session_id=inp.session_id,
+                    **image_kwargs,
                 )
             control.check()
             stats = _materialization_stats(
@@ -317,7 +374,7 @@ class AttachmentStage:
                     0, inp.generated_normalization_attachment_count
                 ),
             )
-            return extra, stats
+            return extra, stats, tuple(file_parse_facts)
 
         try:
             await asyncio.wait_for(
@@ -326,14 +383,22 @@ class AttachmentStage:
             )
         except TimeoutError as exc:
             control.cancel()
+            if inp.failure_cleanup is not None:
+                inp.failure_cleanup()
             raise TimeoutError(
                 f"attachment preparation timed out after {timeout_seconds:g}s"
             ) from exc
+        except BaseException:
+            if inp.failure_cleanup is not None:
+                inp.failure_cleanup()
+            raise
 
         remaining_seconds = deadline_at_monotonic - time.monotonic()
         if remaining_seconds <= 0:
             self._admission.release()
             control.cancel()
+            if inp.failure_cleanup is not None:
+                inp.failure_cleanup()
             raise TimeoutError(
                 f"attachment preparation timed out after {timeout_seconds:g}s"
             )
@@ -343,6 +408,8 @@ class AttachmentStage:
             future = loop.run_in_executor(self._executor, _prepare)
         except BaseException:
             self._admission.release()
+            if inp.failure_cleanup is not None:
+                inp.failure_cleanup()
             raise
         def _release_admission(done: asyncio.Future[Any]) -> None:
             self._admission.release()
@@ -350,19 +417,31 @@ class AttachmentStage:
                 done.exception()
 
         future.add_done_callback(_release_admission)
+        def _cleanup_failed_worker(_done: asyncio.Future[Any]) -> None:
+            if inp.failure_cleanup is not None:
+                inp.failure_cleanup()
+
         try:
-            extra_messages, stats = await asyncio.wait_for(
+            extra_messages, stats, file_parse_facts = await asyncio.wait_for(
                 asyncio.shield(future),
                 timeout=remaining_seconds,
             )
         except asyncio.CancelledError:
             control.cancel()
+            if inp.failure_cleanup is not None:
+                future.add_done_callback(_cleanup_failed_worker)
             raise
         except TimeoutError as exc:
             control.cancel()
+            if inp.failure_cleanup is not None:
+                future.add_done_callback(_cleanup_failed_worker)
             raise TimeoutError(
                 f"attachment preparation timed out after {timeout_seconds:g}s"
             ) from exc
+        except BaseException:
+            if inp.failure_cleanup is not None:
+                inp.failure_cleanup()
+            raise
         turn_input = (
             inp.effective_runtime_message if extra_messages is None else ""
         )
@@ -371,5 +450,6 @@ class AttachmentStage:
                 extra_messages=extra_messages,
                 turn_input=turn_input,
                 stats=stats,
+                file_parse_facts=file_parse_facts,
             )
         )

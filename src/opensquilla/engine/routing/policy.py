@@ -650,6 +650,7 @@ def budget_gate(
     *,
     valid_tiers: list[str],
     budget: BudgetGateInput | None,
+    minimum_tier: str | None = None,
 ) -> BudgetGateResult:
     """Warn or cap when accumulated session spend crosses the configured limit.
 
@@ -698,6 +699,14 @@ def budget_gate(
         return BudgetGateResult(tier, "under_limit", action=budget.action, **common)  # type: ignore[arg-type]
     if budget.action == "cap":
         target = normalize_text_tier(budget.cap_tier) if budget.cap_tier else None
+        minimum = normalize_text_tier(minimum_tier) if minimum_tier else None
+        if (
+            target is not None
+            and minimum is not None
+            and minimum in valid_tiers
+            and _tier_index(target, valid_tiers) < _tier_index(minimum, valid_tiers)
+        ):
+            target = minimum
         if (
             target is not None
             and target in valid_tiers

@@ -1,13 +1,65 @@
-import { watch, type Ref } from 'vue'
+import { nextTick, watch, type Ref } from 'vue'
+import { copySelectedSkills, isSelectedSkills, sameSelectedSkills, type SelectedSkillRef } from '@/types/selectedSkills'
 
 const DRAFT_KEY_PREFIX = 'opensquilla.chat.draft:'
+export const RECENT_DRAFT_SESSION_KEY = 'opensquilla.chat.recent-draft-session'
 // Cap what we persist so a giant paste cannot bloat localStorage; the composer
 // itself is unbounded, only the saved copy is capped.
 const MAX_DRAFT_CHARS = 100_000
 
+function draftKey(key: string): string {
+  return DRAFT_KEY_PREFIX + key
+}
+
+function validDraftSessionKey(key: string): boolean {
+  if (!key || key.length > 512 || key !== key.trim()) return false
+  if (/[/\u0000-\u001f\u007f\s]/.test(key)) return false
+  const marker = ':webchat:'
+  const markerIndex = key.indexOf(marker)
+  return key.startsWith('agent:')
+    && markerIndex > 'agent:'.length
+    && markerIndex + marker.length < key.length
+}
+
+function clearRecentDraftPointer(key?: string): void {
+  try {
+    const current = localStorage.getItem(RECENT_DRAFT_SESSION_KEY)
+    if (!key || current === key) localStorage.removeItem(RECENT_DRAFT_SESSION_KEY)
+  } catch {
+    // Storage can be unavailable in private or restricted contexts.
+  }
+}
+
+/** Return the single recoverable draft session, retiring stale/corrupt pointers. */
+export function recentDraftSessionKey(): string {
+  try {
+    const key = localStorage.getItem(RECENT_DRAFT_SESSION_KEY)
+    if (key === null) return ''
+    if (!validDraftSessionKey(key) || !localStorage.getItem(draftKey(key))) {
+      localStorage.removeItem(RECENT_DRAFT_SESSION_KEY)
+      return ''
+    }
+    return key
+  } catch {
+    return ''
+  }
+}
+
+/** Return a specific recoverable draft without changing the recent pointer. */
+export function recoverableDraftSessionKey(key: string): string {
+  try {
+    return validDraftSessionKey(key) && Boolean(localStorage.getItem(draftKey(key)))
+      ? key
+      : ''
+  } catch {
+    return ''
+  }
+}
+
 export interface UseChatDraftPersistenceOptions {
   sessionKey: Ref<string>
   inputText: Ref<string>
+  selectedSkills?: Ref<SelectedSkillRef[]>
 }
 
 /**
@@ -17,22 +69,32 @@ export interface UseChatDraftPersistenceOptions {
  * when a session becomes active, and cleared once the composer is emptied
  * (i.e. after the message is sent).
  *
- * Deliberately minimal: it does NOT touch attachments or the pending queue —
- * only the composer text, which is the recurring "my instruction vanished"
- * complaint. Storage failures (private mode, quota) are swallowed.
+ * Text and explicit skill references travel together. Attachments and the
+ * pending queue retain their own persistence. Storage failures are swallowed.
  */
 export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions) {
-  function draftKey(key: string): string {
-    return DRAFT_KEY_PREFIX + key
+  let pendingRebind: { from: string; to: string } | null = null
+
+  /** Move one proven fresh draft without loading another session's composer. */
+  function rebindCurrentDraft(key: string): void {
+    const previous = options.sessionKey.value
+    if (!previous || !key || previous === key) return
+    const from = pendingRebind?.to === previous ? pendingRebind.from : previous
+    pendingRebind = { from, to: key }
+    options.sessionKey.value = key
   }
 
-  function saveDraft(key: string, text: string): void {
+  function saveDraft(key: string, text: string, selectedSkills: SelectedSkillRef[] = []): void {
     if (!key) return
     try {
-      if (text) {
-        localStorage.setItem(draftKey(key), text.slice(0, MAX_DRAFT_CHARS))
+      if (text || selectedSkills.length) {
+        const trimmed = text.slice(0, MAX_DRAFT_CHARS)
+        localStorage.setItem(draftKey(key), selectedSkills.length
+          ? JSON.stringify({ version: 1, text: trimmed, selectedSkills }) : trimmed)
+        localStorage.setItem(RECENT_DRAFT_SESSION_KEY, key)
       } else {
         localStorage.removeItem(draftKey(key))
+        clearRecentDraftPointer(key)
       }
     } catch {
       // Ignore storage failures in private or restricted contexts.
@@ -40,20 +102,62 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
   }
 
   function loadDraft(key: string): string {
-    if (!key) return ''
+    return loadDraftPayload(key).text
+  }
+
+  function loadDraftPayload(key: string): { text: string; selectedSkills: SelectedSkillRef[] } {
+    const empty = { text: '', selectedSkills: [] as SelectedSkillRef[] }
+    if (!key) return empty
     try {
-      return localStorage.getItem(draftKey(key)) || ''
+      const raw = localStorage.getItem(draftKey(key)) || ''
+      try {
+        const value = JSON.parse(raw)
+        if (value?.version === 1 && typeof value.text === 'string' && isSelectedSkills(value.selectedSkills)) {
+          return { text: value.text, selectedSkills: copySelectedSkills(value.selectedSkills) }
+        }
+      } catch { /* Legacy plain-text draft. */ }
+      return { ...empty, text: raw }
     } catch {
-      return ''
+      return empty
     }
+  }
+
+  function restoreDraft(key: string): void {
+    const saved = loadDraftPayload(key)
+    options.inputText.value = saved.text
+    if (options.selectedSkills) options.selectedSkills.value = saved.selectedSkills
+  }
+
+  async function consumeAcceptedDraft(
+    key: string,
+    accepted: { text: string; selectedSkills: readonly SelectedSkillRef[] },
+  ): Promise<void> {
+    // Session switching writes the outgoing composer in a Vue watcher. Wait
+    // for that write before consuming an offscreen request's saved snapshot.
+    await nextTick()
+    if (options.sessionKey.value === key) return
+    const saved = loadDraftPayload(key)
+    if (saved.text === accepted.text.slice(0, MAX_DRAFT_CHARS)
+      && sameSelectedSkills(saved.selectedSkills, accepted.selectedSkills)) clearDraft(key)
   }
 
   function clearDraft(key: string): void {
     if (!key) return
     try {
       localStorage.removeItem(draftKey(key))
+      clearRecentDraftPointer(key)
     } catch {
       // Ignore.
+    }
+  }
+
+  function discardRecentDraft(): void {
+    try {
+      const key = localStorage.getItem(RECENT_DRAFT_SESSION_KEY) || ''
+      if (validDraftSessionKey(key)) localStorage.removeItem(draftKey(key))
+      localStorage.removeItem(RECENT_DRAFT_SESSION_KEY)
+    } catch {
+      // Ignore storage failures in private or restricted contexts.
     }
   }
 
@@ -64,15 +168,23 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
   watch(
     options.sessionKey,
     (key, previousKey) => {
+      const rebind = pendingRebind
+      pendingRebind = null
+      if (rebind && rebind.from === previousKey && rebind.to === key) {
+        // Read text at watcher execution, not at Hello: typing may continue
+        // before Vue flushes. In-memory preservation also works without storage.
+        clearDraft(previousKey)
+        saveDraft(key, options.inputText.value, options.selectedSkills?.value)
+        return
+      }
       if (previousKey && previousKey !== key) {
-        saveDraft(previousKey, options.inputText.value)
-        options.inputText.value = loadDraft(key)
+        saveDraft(previousKey, options.inputText.value, options.selectedSkills?.value)
+        restoreDraft(key)
         return
       }
       if (!key) return
-      if (options.inputText.value) return
-      const saved = loadDraft(key)
-      if (saved) options.inputText.value = saved
+      if (options.inputText.value || options.selectedSkills?.value.length) return
+      restoreDraft(key)
     },
     { immediate: true },
   )
@@ -80,9 +192,9 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
   // Persist on every composer change for the CURRENT session. Empty text clears
   // the saved draft (the send path empties inputText, so this doubles as the
   // "sent → forget the draft" hook).
-  watch(options.inputText, (text) => {
-    saveDraft(options.sessionKey.value, text)
-  })
+  watch([options.inputText, () => options.selectedSkills?.value], ([text]) => {
+    saveDraft(options.sessionKey.value, text, options.selectedSkills?.value)
+  }, { deep: true })
 
-  return { saveDraft, loadDraft, clearDraft }
+  return { saveDraft, loadDraft, clearDraft, discardRecentDraft, rebindCurrentDraft, consumeAcceptedDraft }
 }

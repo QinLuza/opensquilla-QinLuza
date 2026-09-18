@@ -20,9 +20,13 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
   const setStatusFilter = vi.fn()
   const loadData = vi.fn(async () => loadDataResult)
   const scrollIntoView = vi.fn()
-  const rpcCall = vi.fn(async () => reloadResult)
-  const waitForConnection = vi.fn(async () => {})
+  const rpcCall = vi.fn(async (_method: string) => reloadResult)
+  const ready = vi.fn(async () => {})
   const pushToast = vi.fn()
+  const routeState = ref<{ query: { skill?: string } }>({ query: {} })
+  const allSkills = ref<Array<{ name: string; active?: boolean }>>([])
+  const detail = vi.fn(async (skill: { name: string }) => ({ ...skill, content: 'Synthetic content' }))
+  vi.doMock('vue-router', () => ({ useRoute: () => routeState.value }))
 
   const iconStub = defineComponent({
     name: 'IconStub',
@@ -111,7 +115,7 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
     }),
   }))
   vi.doMock('@/stores/rpc', () => ({
-    useRpcStore: () => ({ call: rpcCall, waitForConnection }),
+    useRpcStore: () => ({ call: rpcCall, ready }),
   }))
   vi.doMock('@/composables/useToasts', () => ({
     useToasts: () => ({ pushToast }),
@@ -167,9 +171,12 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
     },
   }))
   vi.doMock('@/composables/skills/useSkillsCatalog', () => ({
+    normalizeSkill: (skill: unknown) => skill,
+    skillCatalogKey: (skill: { name: string }) => skill.name,
     skillLayerHelp: (key: string) => `help:${key}`,
     skillLayerLabel: (key: string) => `label:${key}`,
     useSkillsCatalog: () => ({
+      allSkills,
       filterText: ref(''),
       statusFilter: ref('all'),
       metaSkills: ref([]),
@@ -205,6 +212,11 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
   const app = createApp(Root)
   app.use(pinia)
   app.use(i18n)
+  const { SKILL_CATALOG_KEY } = await import('@/modules/skillCatalog')
+  app.provide(SKILL_CATALOG_KEY, {
+    reload: () => rpcCall('skills.reload'),
+    detail,
+  } as never)
   app.mount(el)
   await nextTick()
 
@@ -216,9 +228,12 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
     scrollIntoView,
     loadData,
     rpcCall,
-    waitForConnection,
+    ready,
     pushToast,
     viewActive,
+    routeState,
+    allSkills,
+    detail,
   }
 }
 
@@ -228,6 +243,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.doUnmock('vue-router')
   vi.doUnmock('@/components/Icon.vue')
   vi.doUnmock('@/components/ControlSwitch.vue')
   vi.doUnmock('@/components/skills/AutoEnabledSkills.vue')
@@ -244,6 +260,16 @@ afterEach(() => {
 })
 
 describe('SkillsView stats navigation', () => {
+  it('opens the requested skill when a slash-menu management link updates the route', async () => {
+    const { app, routeState, allSkills, detail, nextTick } = await mountSkillsView()
+    allSkills.value = [{ name: 'synthetic-target', active: true }]
+    routeState.value.query.skill = 'synthetic-target'
+    await nextTick()
+    await nextTick()
+    expect(detail).toHaveBeenCalledWith(expect.objectContaining({ name: 'synthetic-target' }))
+    app.unmount()
+  })
+
   it('keeps the catalog visible when a status tile is selected', async () => {
     const { app, el, nextTick, setStatusFilter } = await mountSkillsView()
     const catalog = el.querySelector<HTMLElement>('[data-testid="skills-catalog"]')

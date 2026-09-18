@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -164,6 +165,8 @@ async def test_static_b5_wrap_skipped_without_openrouter_credential(
     assert "ensemble_enabled" not in turn.metadata
 
 
+
+
 async def test_static_b5_wraps_when_openrouter_env_key_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -184,6 +187,8 @@ async def test_static_b5_wraps_when_openrouter_env_key_present(
     assert isinstance(provider, EnsembleProvider)
     assert turn.metadata["ensemble_enabled"] is True
     assert "ensemble_wrap_skipped_reason" not in turn.metadata
+
+
 
 
 async def test_static_b5_wraps_when_active_provider_is_keyed_openrouter(
@@ -265,9 +270,9 @@ async def test_static_tokenrhythm_b5_wraps_when_active_provider_is_keyed(
 @pytest.mark.parametrize(
     ("routed_tier", "expected_model", "expect_ensemble"),
     [
-        ("c0", "qwen3.7-flash", False),
-        ("c1", "deepseek-v4-flash-0731", False),
-        ("c2", "glm-5.2", False),
+        ("c0", "deepseek-v4-flash-0731", False),
+        ("c1", "deepseek-v4-pro-0813", False),
+        ("c2", "kimi-k2.7-code", False),
         # Shared C3 triggers the global plan without replacing the configured
         # direct/fallback selector head.
         ("c3", "deepseek-v4-flash-0731", True),
@@ -383,6 +388,78 @@ async def test_global_ensemble_keeps_fixed_fallback_when_router_is_also_enabled(
     assert turn.metadata["routed_model"] == routed_model
     assert turn.metadata["routed_model_before_ensemble"] == routed_model
     assert turn.metadata["ensemble_activation_source"] == "global"
+
+
+@pytest.mark.parametrize("global_ensemble", [False, True])
+async def test_attachment_capacity_bypass_keeps_routed_model_without_building_ensemble(
+    monkeypatch: pytest.MonkeyPatch,
+    global_ensemble: bool,
+) -> None:
+    fixed_model = "deepseek-v4-flash-0731"
+    routed_model = "glm-5.2"
+    cfg = GatewayConfig(
+        llm={
+            "provider": "tokenrhythm",
+            "model": fixed_model,
+            "api_key": "sk-tr-synthetic",
+        },
+        llm_ensemble={
+            "enabled": global_ensemble,
+            "selection_mode": "static_tokenrhythm_b5",
+        },
+    )
+
+    async def route_to_capable_model(turn):
+        turn.model = routed_model
+        turn.metadata.update({
+            "routed_tier": "c2" if global_ensemble else "c3",
+            "routed_model": routed_model,
+            "routing_applied": True,
+            "large_context_capacity_required": True,
+            "large_context_request_input_tokens": 200_000,
+            "thinking_requested": True,
+            "thinking_source": "squilla_router_tier",
+        })
+        return turn
+
+    monkeypatch.setattr("opensquilla.engine.steps.apply_squilla_router", route_to_capable_model)
+    capacity_check = Mock(side_effect=lambda deployment, metadata, **kwargs: (
+        deployment.model == routed_model
+    ))
+    monkeypatch.setattr(
+        "opensquilla.engine.selector_override.provider_config_has_request_capacity",
+        capacity_check,
+    )
+    build_ensemble = Mock(
+        side_effect=AssertionError("capacity bypass must keep single-model routing"),
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble.build_ensemble_provider_from_config",
+        build_ensemble,
+    )
+    selector = _FakeSelector(
+        provider="tokenrhythm", model=fixed_model, api_key="sk-tr-synthetic",
+    )
+    runner = TurnRunner(provider_selector=None, config=cfg)
+
+    turn, provider = await runner._run_pipeline(
+        "analyze the attached material", "agent:main:capacity-bypass", _Provider(),
+        selector, [], "system prompt", [],
+    )
+
+    assert [call.args[0].model for call in capacity_check.call_args_list] == [
+        fixed_model, routed_model,
+    ]
+    build_ensemble.assert_not_called()
+    assert not isinstance(provider, EnsembleProvider)
+    assert selector.current_config.model == routed_model
+    assert turn.model == routed_model
+    assert turn.metadata["executed_model"] == routed_model
+    assert turn.metadata["thinking_requested"] is True
+    assert turn.metadata["ensemble_wrap_skipped_reason"] == "fixed_fallback_request_capacity"
+    assert turn.metadata["ensemble_capacity_bypassed"] is True
+    assert "ensemble_enabled" not in turn.metadata
+    assert "ensemble_fallback_model" not in turn.metadata
 
 
 async def test_shared_c3_rejects_an_empty_fixed_fallback_model(
@@ -2048,7 +2125,7 @@ async def test_custom_b5_wraps_when_every_member_resolves_a_key(
 
     assert isinstance(provider, EnsembleProvider)
     assert provider.profile_name == "custom_b5"
-    assert [member.label for member in provider.proposers] == ["primary", "contrast"]
+    assert [member.label for member in provider.proposers] == ["proposer_1", "proposer_2"]
     assert provider.aggregator.provider_config.model == "fuser"
     assert turn.metadata["ensemble_enabled"] is True
     assert "ensemble_wrap_skipped_reason" not in turn.metadata

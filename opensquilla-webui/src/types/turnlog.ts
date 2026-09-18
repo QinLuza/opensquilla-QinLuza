@@ -1,4 +1,5 @@
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
+import type { ToolPresentation } from '@/types/chat'
 import type {
   InterruptApprovalData,
   InterruptClarifyData,
@@ -14,16 +15,37 @@ import type {
  * by `appendFrame` as a monotonic append index (seq-less frames are ordered
  * by arrival), used only for ordering/dedup — never for gating.
  */
-export type Frame =
+type FrameBody =
   | {
       kind: 'text'
       seq: number
       text: string
       presentation?: 'intermediate' | 'answer'
     }
-  | { kind: 'tool-start'; seq: number; toolId: string; name: string; input: string; at: number }
+  | {
+      kind: 'tool-start'
+      seq: number
+      toolId: string
+      name: string
+      input: string
+      at: number
+      authoritativeInput?: boolean
+      presentation?: ToolPresentation
+    }
   | { kind: 'tool-delta'; seq: number; toolId: string; fragment: string }
-  | { kind: 'tool-result'; seq: number; toolId: string; name: string; result: string; isError: boolean; input: string; at: number }
+  | {
+      kind: 'tool-result'
+      seq: number
+      toolId: string
+      name: string
+      result: string
+      executionLogHandle?: string
+      isError: boolean
+      input: string
+      at: number
+      authoritativeInput?: boolean
+      presentation?: ToolPresentation
+    }
   | { kind: 'artifact'; seq: number; artifact: ArtifactPayload }
   | {
       kind: 'thinking-start'
@@ -87,6 +109,11 @@ export type Frame =
       reason?: string
     }
 
+export type Frame = FrameBody & {
+  /** Authoritative Gateway stream position for cross-refresh chronology. */
+  activityOrder?: number
+}
+
 /** A frame as emitted by a mutator; `appendFrame` stamps the `seq` index. */
 export type FrameInput =
   | Omit<Extract<Frame, { kind: 'text' }>, 'seq'>
@@ -112,4 +139,6 @@ export interface ReasoningBlock {
   startedAt: number
   endedAt?: number
   contentKind: 'summary' | 'reasoning'
+  /** First accepted event position for interleaving with phases and tools. */
+  activityOrder?: number
 }

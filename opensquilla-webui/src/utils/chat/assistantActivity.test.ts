@@ -76,6 +76,55 @@ function toolGroup(
 }
 
 describe('projectAssistantActivity', () => {
+  it('hides persisted mutation protocol echoes while keeping structured activity', () => {
+    const leaked = (
+      'TheUserInstructions {"documentMutationOutcome":{"status":"applied"}} '
+      + 'User(internal control text)'
+    )
+    const projection = projectAssistantActivity(
+      message({
+        text: `${leaked}\n\nPage updated.`,
+        timelineItems: [
+          toolGroup([call('apply', { name: 'document_apply' })], 'apply'),
+          { type: 'text', key: 'leaked-answer', html: leaked, rawText: leaked },
+        ],
+        turnOutcome: {
+          turnId: 'turn-contained-output',
+          status: 'succeeded',
+          documentMutationOutcome: {
+            version: 1,
+            status: 'applied',
+          },
+        },
+      }),
+      text => `<p>${text}</p>`,
+    )
+
+    expect(projection.answerPart).toBeNull()
+    expect(projection.activityItems.map(item => item.type)).toEqual(['tool-group'])
+    expect(JSON.stringify(projection)).not.toContain('TheUserInstructions')
+    expect(JSON.stringify(projection)).not.toContain('documentMutationOutcome')
+  })
+
+  it('keeps an ordinary localized mutation result visible', () => {
+    const projection = projectAssistantActivity(
+      message({
+        text: 'Page updated.',
+        turnOutcome: {
+          turnId: 'turn-safe-output',
+          status: 'succeeded',
+          documentMutationOutcome: {
+            version: 1,
+            status: 'applied',
+          },
+        },
+      }),
+      text => `<p>${text}</p>`,
+    )
+
+    expect(projection.answerPart?.rawText).toBe('Page updated.')
+  })
+
   it('fails open when an ordinary tool group did not settle successfully', () => {
     const failed = call('failed', {
       status: 'error',
@@ -218,6 +267,41 @@ describe('projectAssistantActivity', () => {
       'opening',
       'middle',
       'verify',
+    ])
+  })
+
+  it('keeps an explicit intermediate span out of the adjacent final answer', () => {
+    const projection = projectAssistantActivity(
+      message({
+        text: 'Inspecting.Working note.Final answer.',
+        timelineItems: [
+          { type: 'text', key: 'opening', html: 'Inspecting.', rawText: 'Inspecting.' },
+          toolGroup([call('inspect', { name: 'read_file' })], 'inspect'),
+          {
+            type: 'text',
+            key: 'work',
+            html: 'Working note.',
+            rawText: 'Working note.',
+            presentation: 'intermediate',
+          },
+          {
+            type: 'text',
+            key: 'answer',
+            html: 'Final answer.',
+            rawText: 'Final answer.',
+            presentation: 'answer',
+          },
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('terminal-timeline-boundary')
+    expect(projection.answerPart?.rawText).toBe('Final answer.')
+    expect(projection.activityItems.map(item => item.key)).toEqual([
+      'opening',
+      'inspect',
+      'work',
     ])
   })
 
@@ -543,6 +627,61 @@ describe('projectAssistantActivity', () => {
 
     expect(projection.answerSource).toBe('canonical')
     expect(projection.answerPart?.rawText).toBe(canonical)
+  })
+
+  it('uses explicit intermediate presentation across a preceding transparent control', () => {
+    const canonical = 'Narration.\n\nFinal answer.'
+    const projection = projectAssistantActivity(
+      message({
+        text: canonical,
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'narration',
+            html: 'Narration.',
+            rawText: 'Narration.',
+            presentation: 'intermediate',
+          },
+          toolGroup([call('checkpoint', { name: 'plan_run_checkpoint' })], 'checkpoint'),
+          {
+            type: 'text',
+            key: 'answer',
+            html: 'Final answer.',
+            rawText: 'Final answer.',
+            presentation: 'answer',
+          },
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('terminal-control-boundary')
+    expect(projection.answerPart?.rawText).toBe('Final answer.')
+    expect(projection.activityItems.map(item => item.key)).toEqual(['narration'])
+  })
+
+  it('keeps a terminal-tool turn with only explicit intermediate text out of the answer', () => {
+    const canonical = 'Work narration.'
+    const projection = projectAssistantActivity(
+      message({
+        text: canonical,
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'narration',
+            html: 'Work narration.',
+            rawText: 'Work narration.',
+            presentation: 'intermediate',
+          },
+          toolGroup([call('finish', { name: 'read_file' })], 'finish'),
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('explicit-no-answer')
+    expect(projection.answerPart).toBeNull()
+    expect(projection.activityItems.map(item => item.key)).toEqual(['narration', 'finish'])
   })
 
   it.each([
@@ -1015,6 +1154,23 @@ describe('projectAssistantActivityTimeline', () => {
     expect(JSON.stringify(projection.statusSteps)).not.toContain('raw reasoning body')
   })
 
+  it.each(['working', 'settled'] as const)('localizes retries without a fixed limit when %s', (lifecycle) => {
+    const projection = projectAssistantActivityTimeline([], {
+      lifecycle,
+      statusHistory: [
+        { action: 'provider:retrying:7:0', label: 'Retrying 7/0', at: 1_000 },
+      ],
+    })
+
+    expect(projection.statusSteps[0]?.label).toEqual({
+      code: 'chat.activity.provider.retryingWithoutLimit', params: { attempt: 7 },
+    })
+    for (const locale of [en, zhHans, ja, de, fr, es]) {
+      expect(locale.chat.activity.provider.retryingWithoutLimit).toContain('{attempt}')
+      expect(locale.chat.activity.provider.retryingWithoutLimit).not.toContain('{limit}')
+    }
+  })
+
   it('derives each phase duration from the next transition and terminal boundary', () => {
     const projection = projectAssistantActivityTimeline([], {
       lifecycle: 'settled',
@@ -1027,6 +1183,31 @@ describe('projectAssistantActivityTimeline', () => {
     })
 
     expect(projection.statusSteps.map(step => step.durationSeconds)).toEqual([3, 5, 3])
+  })
+
+  it('uses authoritative v2 phase endings without sorting by timestamps', () => {
+    const projection = projectAssistantActivityTimeline([], {
+      lifecycle: 'settled',
+      endedAt: 99_000,
+      statusHistory: [
+        {
+          action: 'provider:requesting',
+          label: 'Waiting',
+          at: 9_000,
+          endedAt: 9_000,
+          activityOrder: 1,
+        },
+        {
+          action: 'provider:fallback',
+          label: 'Fallback',
+          at: 1_000,
+          endedAt: 12_000,
+          activityOrder: 2,
+        },
+      ],
+    })
+    expect(projection.statusSteps.map(step => step.activityOrder)).toEqual([1, 2])
+    expect(projection.statusSteps.map(step => step.durationSeconds)).toEqual([0, 11])
   })
 
   it('counts down provider retry waits locally without changing other phases', () => {
@@ -1123,7 +1304,7 @@ describe('projectAssistantActivityTimeline', () => {
     expect(projection.statusSteps[0]?.label.code).toBe('chat.compact.skipped')
   })
 
-  it('merges adjacent automatic completions and keeps durable metadata', () => {
+  it('keeps request-scoped reductions distinct from adjacent saved summaries', () => {
     const projection = projectAssistantActivityTimeline([], {
       lifecycle: 'settled',
       statusHistory: [
@@ -1150,13 +1331,20 @@ describe('projectAssistantActivityTimeline', () => {
       ],
     })
 
-    expect(projection.statusSteps).toHaveLength(1)
+    expect(projection.statusSteps).toHaveLength(2)
     expect(projection.statusSteps[0]).toMatchObject({
+      id: 'cmp-request-scoped',
+      state: 'completed',
+      isCurrent: false,
+      durability: 'request_scoped',
+      label: { code: 'chat.compact.temporarilyReduced' },
+    })
+    expect(projection.statusSteps[1]).toMatchObject({
       id: 'cmp-durable',
       state: 'completed',
       source: 'automatic',
       durability: 'durable',
-      label: { code: 'chat.compact.compacted' },
+      label: { code: 'chat.compact.summarySaved' },
     })
   })
 

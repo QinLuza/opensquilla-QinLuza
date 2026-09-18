@@ -50,7 +50,15 @@
           :show-turn-outcome="isTurnTip(entry.index)"
           :is-streaming="isStreaming"
           :is-goal-source="isGoalSource(messages[entry.index])"
+          :can-reuse-prompt-annotations="canReusePromptAnnotations === true"
+          :workbench-resource-preview-enabled="workbenchResourcePreviewEnabled === true"
+          :workbench-resource-edit-enabled="workbenchResourceEditEnabled === true"
+          :workbench-attachment-resources="workbenchAttachmentResources"
           @edit="$emit('editMessage', $event)"
+          @edit-attachment="$emit('editAttachment', $event)"
+          @preview-attachment="$emit('previewAttachment', $event)"
+          @preview-image="$emit('previewImage', $event, messages[entry.index].attachments || [])"
+          @reuse-prompt-annotation="$emit('reusePromptAnnotation', $event)"
           @toggle-share="$emit('toggleShareMessage', $event)"
         />
         <CompactionEvent
@@ -73,7 +81,6 @@
           :tool-status-text="toolStatusText"
           :tool-secondary-text="toolSecondaryText"
           :session-key="sessionKey"
-          :auth-token="authToken"
           :workbench-enabled="workbenchEnabled"
           :artifact-navigation-items="artifactNavigationItems"
           :copy-message="copyMessage"
@@ -82,9 +89,16 @@
           :fork-busy="forkBusy"
           :plan-action-pending="planActionPending"
           :plan-actions-disabled="planActionsDisabled"
+          :plan-presentations="planPresentations"
+          :plan-presentation-available="planPresentationAvailable && !shareMode"
+          :plan-presentation-pending="planPresentationPending"
           :show-turn-outcome="isTurnTip(entry.index)"
           :goal-outcome="goalOutcomeFor(messages[entry.index], entry.index)"
           :goal-elapsed="goalElapsed"
+          :goal-removable="goalRemovable && !shareMode"
+          :goal-busy="goalBusy"
+          :resolve-session-availability="resolveSessionAvailability"
+          :resolve-workspace-preview-resource="resolveWorkspacePreviewResource"
           @fork="$emit('forkConversation', forkThroughTurnId(entry.index))"
           @regenerate="$emit('regenerateMessage', $event)"
           @toggle-share="$emit('toggleShareMessage', $event)"
@@ -101,6 +115,8 @@
           @plan-implement-current="$emit('planImplementCurrent', $event)"
           @plan-implement-new="$emit('planImplementNew', $event)"
           @plan-replan="$emit('planReplan', $event)"
+          @plan-presentation-change="$emit('planPresentationChange', $event)"
+          @goal-clear="$emit('goalClear', $event)"
         />
         <SystemMessage
           v-else
@@ -108,8 +124,14 @@
           :subagent-summary="subagentSummary"
           :subagent-body="subagentBody"
           :retry-available="usageBarrierRetryAvailable(entry.index)"
+          :has-partial-answer="Boolean(messages[entry.index].turnId && visibleAnswerTurns.has(messages[entry.index].turnId!))"
           @resume="$emit('resumeSandbox')"
           @retry="forwardSystemRetry"
+        />
+        <SkillLoadStatus
+          v-if="messages[entry.index].displayRole !== 'assistant'"
+          standalone
+          :receipts="messages[entry.index]?.skillLoads || []"
         />
       </div>
     </template>
@@ -124,6 +146,7 @@
 </template>
 
 <script setup lang="ts">
+import SkillLoadStatus from './SkillLoadStatus.vue'
 import {
   computed,
   nextTick,
@@ -144,13 +167,16 @@ import type {
   ChatToolCallRenderItem,
   ToolResultContext,
 } from '@/types/chat'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import {
   goalHasSettledTerminalOutcome,
   type GoalSnapshot,
 } from '@/composables/chat/useChatGoals'
-import type { PlanCardAction, PlanCardActionTarget } from '@/types/plans'
+import type { PlanCardAction, PlanCardActionTarget, PlanPresentationSnapshot, PlanPresentationRequest } from '@/types/plans'
+import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
+import type { WorkbenchResource } from '@/types/workbenchResources'
 import { chatMessageKey } from '@/utils/chat/messageIdentity'
+import { applyProgrammaticScroll } from '@/utils/chat/scrollMutation'
 import {
   isUsageAccountingBarrierMessage,
   strictUsageBarrierRetryUserMessageIndex,
@@ -181,16 +207,28 @@ const props = defineProps<{
   downloadAttachment: (attachment: import('@/types/chat').DisplayAttachment) => Promise<boolean>
   artifactNavigationItems?: ArtifactPayload[]
   sessionKey?: string
-  authToken?: string
   workbenchEnabled?: boolean
+  workbenchResourcePreviewEnabled?: boolean
+  workbenchResourceEditEnabled?: boolean
+  workbenchAttachmentResources?: ReadonlyMap<string, WorkbenchResource>
+  canReusePromptAnnotations?: boolean
   forkBusy?: boolean
   planActionPending?: PlanCardAction | null
   planActionsDisabled?: boolean
+  planPresentations?: Record<string, PlanPresentationSnapshot>
+  planPresentationAvailable?: boolean
+  planPresentationPending?: string | null
   isStreaming?: boolean
   goal?: GoalSnapshot | null
   goalElapsed?: string
+  goalRemovable?: boolean
+  goalBusy?: boolean
+  resolveSessionAvailability?: (sessionKey: string) => Promise<boolean>
+  resolveWorkspacePreviewResource?: (sessionKey: string, documentId: string) => Promise<WorkbenchResource | null>
   /** Required for long-history virtualization; omitted by legacy embedders. */
   scrollContainer?: HTMLElement | null
+  /** Session/render epoch used to invalidate deferred scroll corrections. */
+  scrollEpoch?: number
   /** Preview/export paths can force a complete, canonical DOM. */
   virtualizationDisabled?: boolean
   /** Current search match or another externally owned focus target. */
@@ -201,6 +239,10 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   editMessage: [message: ChatRenderedMessage]
+  editAttachment: [attachment: import('@/types/chat').DisplayAttachment]
+  previewAttachment: [attachment: import('@/types/chat').DisplayAttachment]
+  previewImage: [attachment: import('@/types/chat').DisplayAttachment, attachments: import('@/types/chat').DisplayAttachment[]]
+  reusePromptAnnotation: [annotation: PromptAnnotationSnapshot]
   regenerateMessage: [
     message: ChatRenderedMessage,
     settle?: (accepted: boolean) => void,
@@ -221,6 +263,8 @@ const emit = defineEmits<{
   planImplementCurrent: [target: PlanCardActionTarget]
   planImplementNew: [target: PlanCardActionTarget]
   planReplan: [target: PlanCardActionTarget]
+  planPresentationChange: [request: PlanPresentationRequest]
+  goalClear: [goal: GoalSnapshot]
 }>()
 
 const VIRTUALIZATION_STORAGE_KEY = 'opensquilla.chat.virtualizeHistory'
@@ -232,6 +276,10 @@ function forwardSystemRetry(
 ) {
   emit('regenerateMessage', message, settle)
 }
+
+const visibleAnswerTurns = computed(() => new Set(props.messages
+  .filter(message => message.displayRole === 'assistant' && message.text.trim() && message.turnId)
+  .map(message => message.turnId!)))
 
 function usageBarrierRetryAvailable(index: number): boolean {
   const message = props.messages[index]
@@ -265,6 +313,18 @@ let viewportFrame = 0
 let pendingAnchorAdjustment = 0
 let anchorAdjustmentScheduled = false
 let liveEdgePinScheduled = false
+let deferredScrollGeneration = 0
+
+function currentScrollEpoch(): number {
+  return props.scrollEpoch ?? 0
+}
+
+function resetDeferredScrollWork() {
+  deferredScrollGeneration += 1
+  pendingAnchorAdjustment = 0
+  anchorAdjustmentScheduled = false
+  liveEdgePinScheduled = false
+}
 
 function readVirtualizationPreference(): boolean {
   if (typeof window === 'undefined') return true
@@ -396,15 +456,22 @@ function scheduleViewportMeasure() {
 function queueAnchorAdjustment(delta: number) {
   const container = props.scrollContainer
   if (!container || Math.abs(delta) < 0.5) return
+  const epoch = currentScrollEpoch()
+  const sessionKey = props.sessionKey
+  const generation = deferredScrollGeneration
   pendingAnchorAdjustment += delta
   if (anchorAdjustmentScheduled) return
   anchorAdjustmentScheduled = true
   void nextTick(() => {
+    if (deferredScrollGeneration !== generation) return
     anchorAdjustmentScheduled = false
     const adjustment = pendingAnchorAdjustment
     pendingAnchorAdjustment = 0
     if (!props.scrollContainer || props.scrollContainer !== container) return
-    container.scrollTop += adjustment
+    if (props.sessionKey !== sessionKey || currentScrollEpoch() !== epoch) return
+    applyProgrammaticScroll(container, () => {
+      container.scrollTop += adjustment
+    })
     scheduleViewportMeasure()
   })
 }
@@ -412,11 +479,18 @@ function queueAnchorAdjustment(delta: number) {
 function queueLiveEdgePin() {
   const container = props.scrollContainer
   if (!container || liveEdgePinScheduled) return
+  const epoch = currentScrollEpoch()
+  const sessionKey = props.sessionKey
+  const generation = deferredScrollGeneration
   liveEdgePinScheduled = true
   void nextTick(() => {
+    if (deferredScrollGeneration !== generation) return
     liveEdgePinScheduled = false
     if (!props.followLiveEdge || props.scrollContainer !== container) return
-    container.scrollTop = container.scrollHeight
+    if (props.sessionKey !== sessionKey || currentScrollEpoch() !== epoch) return
+    applyProgrammaticScroll(container, () => {
+      container.scrollTop = container.scrollHeight
+    })
     scheduleViewportMeasure()
   })
 }
@@ -526,7 +600,15 @@ function attachContainer(container: HTMLElement | null | undefined) {
   container.addEventListener('focusin', onContainerFocusIn)
   container.addEventListener('focusout', onContainerFocusOut)
   if (typeof ResizeObserver !== 'undefined') {
-    viewportResizeObserver = new ResizeObserver(scheduleViewportMeasure)
+    viewportResizeObserver = new ResizeObserver(entries => {
+      scheduleViewportMeasure()
+      // A container-height change has no new stream event to trigger the
+      // ordinary bottom pin. Keep a reader already following the live edge at
+      // the true bottom; historical readers retain their existing anchor.
+      if (props.followLiveEdge && entries.some(entry => entry.target === container)) {
+        queueLiveEdgePin()
+      }
+    })
     viewportResizeObserver.observe(container)
     if (listRootRef.value) viewportResizeObserver.observe(listRootRef.value)
   }
@@ -609,13 +691,18 @@ watch(virtualizationEnabled, () => {
     scheduleViewportMeasure()
   })
 })
-watch(() => props.sessionKey, () => {
-  measuredSizes.clear()
-  ensuredMessageKeys.value = new Set()
-  focusedMessageKey.value = null
-  measurementVersion.value += 1
-  void nextTick(scheduleViewportMeasure)
-})
+watch(
+  [() => props.sessionKey, () => props.scrollEpoch],
+  () => {
+    resetDeferredScrollWork()
+    measuredSizes.clear()
+    ensuredMessageKeys.value = new Set()
+    focusedMessageKey.value = null
+    measurementVersion.value += 1
+    void nextTick(scheduleViewportMeasure)
+  },
+  { flush: 'sync' },
+)
 watch(() => windowRows.value.map(row => row.key), nextKeys => {
   const retained = new Set(nextKeys)
   for (const key of measuredSizes.keys()) {

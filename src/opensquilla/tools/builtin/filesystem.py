@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
 import csv
 import difflib
@@ -13,14 +14,16 @@ import os
 import posixpath
 import re
 import sys
+import time
 import zipfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
 
-from opensquilla.sandbox.backend.unavailable import UnavailableBackend
+import structlog
+
 from opensquilla.sandbox.backup_vault import BackupReceiptSummary, summarize_backup_receipts
 from opensquilla.sandbox.destructive_backup import DestructiveBackupGate
 from opensquilla.sandbox.directory_listing import format_directory_entry
@@ -92,6 +95,20 @@ from opensquilla.tools.write_tracking import (
     workspace_write_progress_note,
 )
 
+log = structlog.get_logger(__name__)
+
+
+def _settlement_duration_bucket(duration_ms: int) -> str:
+    if duration_ms <= 10:
+        return "le_10ms"
+    if duration_ms <= 50:
+        return "le_50ms"
+    if duration_ms <= 250:
+        return "le_250ms"
+    if duration_ms <= 1000:
+        return "le_1s"
+    return "gt_1s"
+
 _SPREADSHEET_EXTENSIONS = {".csv", ".tsv", ".xlsx"}
 _OFFICE_BINARY_EXTENSIONS = {".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}
 _BINARY_EXTENSIONS = {
@@ -115,10 +132,7 @@ _BOOTSTRAP_SOURCE_FILENAMES_FALLBACK = frozenset(
         "AGENTS.md",
         "SOUL.md",
         "IDENTITY.md",
-        "TOOLS.md",
         "USER.md",
-        "BOOTSTRAP.md",
-        "HEARTBEAT.md",
     }
 )
 _GREP_DEFAULT_MAX_RESULTS = 100
@@ -156,6 +170,61 @@ _SOURCE_SYMBOL_EXTENSIONS = frozenset(
         ".tsx",
     }
 )
+
+
+async def _run_executor_mutation[ExecutorResult](
+    worker: Callable[[], ExecutorResult],
+    *,
+    settle: Callable[[BaseException | None], None],
+) -> ExecutorResult:
+    """Run an unkillable thread mutation and reconcile it before cancellation.
+
+    Cancelling an asyncio future cannot stop a callable that is already running
+    in a thread. Shield the future, absorb repeated cancellation until it ends,
+    then run the caller's disk/receipt reconciliation before propagating the
+    first cancellation.
+    """
+    # Keep the historical event-loop injection seam used by race tests and
+    # embedders while normal async callers still receive the running loop.
+    loop = asyncio.get_event_loop()
+    started_at = time.monotonic()
+    future = asyncio.ensure_future(loop.run_in_executor(None, worker))
+    pending_cancel: asyncio.CancelledError | None = None
+    worker_error: BaseException | None = None
+    result: ExecutorResult | None = None
+
+    while not future.done():
+        try:
+            result = await asyncio.shield(future)
+        except asyncio.CancelledError as exc:
+            if pending_cancel is None:
+                pending_cancel = exc
+        except BaseException as exc:  # noqa: BLE001 - reconciled below
+            worker_error = exc
+            break
+
+    if future.done() and worker_error is None and result is None:
+        try:
+            result = future.result()
+        except BaseException as exc:  # noqa: BLE001 - reconciled below
+            worker_error = exc
+
+    settle(worker_error)
+    duration_ms = int((time.monotonic() - started_at) * 1000)
+    log.info(
+        "filesystem.executor_mutation_settled",
+        duration_ms=duration_ms,
+        duration_bucket=_settlement_duration_bucket(duration_ms),
+        cancellation_delayed=pending_cancel is not None,
+        worker_outcome="failed" if worker_error is not None else "completed",
+    )
+    if pending_cancel is not None:
+        raise pending_cancel
+    if worker_error is not None:
+        raise worker_error
+    return result  # type: ignore[return-value]
+
+
 _SOURCE_SYMBOL_REGEXES: tuple[tuple[frozenset[str], str, re.Pattern[str]], ...] = (
     (
         frozenset({".py", ".pyi"}),
@@ -465,6 +534,41 @@ def _looks_binary(raw: bytes, p: Path) -> str | None:
 def _read_binary_sample(p: Path, size: int = 8192) -> bytes:
     with p.open("rb") as fh:
         return fh.read(size)
+
+
+def _read_image_file_result(p: Path, sample: bytes) -> dict[str, object] | None:
+    """Build an image result inside the same read boundary as ordinary files."""
+    from opensquilla.contracts.attachment_sniff import sniff_mime_from_bytes
+    from opensquilla.contracts.attachments import IMAGE_ATTACHMENT_BYTES, IMAGE_ATTACHMENT_MIMES
+    from opensquilla.contracts.image_validation import validate_image_bytes
+
+    mime = sniff_mime_from_bytes(sample)
+    if mime not in IMAGE_ATTACHMENT_MIMES:
+        mime = {
+            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".gif": "image/gif", ".webp": "image/webp",
+        }.get(p.suffix.lower())
+    if mime is None:
+        return None
+    with p.open("rb") as stream:
+        payload = stream.read(IMAGE_ATTACHMENT_BYTES + 1)
+    if len(payload) > IMAGE_ATTACHMENT_BYTES:
+        raise SafeToolError("Image exceeds the supported attachment byte limit.")
+    try:
+        validate_image_bytes(payload, mime)
+    except ValueError:
+        raise SafeToolError("Image is corrupt, unreadable, or has an unsupported format.") from None
+    return {
+        "message": f"Loaded image ({mime}) for model input; it has not yet been analyzed.",
+        "image": {"mime": mime, "data": base64.b64encode(payload).decode("ascii")},
+    }
+
+
+def _publish_read_image(image: object, *, tool_use_id: str) -> None:
+    context = current_tool_context.get()
+    if context is None or not tool_use_id or not isinstance(image, dict):
+        raise SafeToolError("Image loading requires a model tool call to receive the image.")
+    context.tool_result_media[tool_use_id] = [image]
 
 
 def _is_search_excluded_path(path: Path) -> bool:
@@ -814,15 +918,6 @@ async def _run_sandbox_operation_if_required(
                 filesystem=filesystem_permissions,
             ),
         )
-    if (
-        trusted_sandbox_active()
-        and ctx is not None
-        and ctx.is_owner
-        and runtime is not None
-        and isinstance(runtime.backend, UnavailableBackend)
-        and operation.kind not in {"create_source", "edit_source"}
-    ):
-        return None
     return await SandboxOperationRuntime(
         runtime,
         host_execution_active=full_host_access_active() or host_execution_active,
@@ -1590,7 +1685,9 @@ def _backup_receipt_note(
 @tool(
     name="read_file",
     description=(
-        "Read UTF-8 text file contents with line numbers. Supports offset and limit. "
+        "Read UTF-8 text with line numbers, or load PNG/JPEG/GIF/WebP images from a file path. "
+        "Images are supplied directly to the model, without a separate analysis call. "
+        "Supports offset and limit for text. "
         "Before modifying an existing workspace file with edit_file or write_file, "
         "read it once without offset or limit to establish fresh edit context. "
         "Use offset/limit for inspection windows only. For CSV/TSV/Excel workbook "
@@ -1606,6 +1703,7 @@ def _backup_receipt_note(
     },
     required=["path"],
     plan_access=PlanAccess.READ_ONLY,
+    runtime_only_arguments={"_tool_use_id"},
     sandbox=SandboxToolDescriptor.filesystem(
         kind="read_file",
         argv_factory=lambda a: ("read_file", str(a.get("path", ""))),
@@ -1614,7 +1712,12 @@ def _backup_receipt_note(
         record_payload=False,
     ),
 )
-async def read_file(path: str, offset: int | None = None, limit: int | None = None) -> str:
+async def read_file(
+    path: str,
+    offset: int | None = None,
+    limit: int | None = None,
+    _tool_use_id: str = "",
+) -> str:
     p = _resolve_path(path)
     blocked = _sensitive_access_block("read_file", p, path)
     if blocked is not None:
@@ -1642,6 +1745,9 @@ async def read_file(path: str, offset: int | None = None, limit: int | None = No
             )
         )
         if sandbox_result is not None:
+            metadata = getattr(sandbox_result, "metadata", {})
+            if isinstance(metadata, dict) and "image" in metadata:
+                _publish_read_image(metadata.pop("image"), tool_use_id=_tool_use_id)
             record_workspace_file_read(
                 p,
                 operation="read_file",
@@ -1653,6 +1759,11 @@ async def read_file(path: str, offset: int | None = None, limit: int | None = No
 
     loop = asyncio.get_event_loop()
     sample: bytes = await loop.run_in_executor(None, _read_binary_sample, p)
+    image_result = await loop.run_in_executor(None, _read_image_file_result, p, sample)
+    if image_result is not None:
+        _publish_read_image(image_result["image"], tool_use_id=_tool_use_id)
+        record_workspace_file_read(p, operation="read_file", complete=True)
+        return str(image_result["message"])
     if not sample:
         record_workspace_file_read(
             p,
@@ -1706,7 +1817,7 @@ async def read_file(path: str, offset: int | None = None, limit: int | None = No
         },
     },
     required=["path"],
-    exposed_by_default=False,
+    default_access="deny",
     plan_access=PlanAccess.READ_ONLY,
 )
 async def read_source(path: str, start_line: int = 1, end_line: int | None = None) -> str:
@@ -2040,17 +2151,22 @@ async def write_file(
 ) -> str:
     p = _resolve_path(path)
     if full_host_access_active():
-        loop = asyncio.get_event_loop()
         created = not p.exists()
 
         def _write_full_host() -> None:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(content, encoding="utf-8")
 
-        await loop.run_in_executor(None, _write_full_host)
-        record_workspace_file_write(p, operation="write_file", created=created)
-        _notify_memory_source_write(p)
-        _notify_bootstrap_source_write(p)
+        def _settle_full_host(error: BaseException | None) -> None:
+            if error is None:
+                record_workspace_file_write(p, operation="write_file", created=created)
+                _notify_memory_source_write(p)
+                _notify_bootstrap_source_write(p)
+
+        await _run_executor_mutation(
+            _write_full_host,
+            settle=_settle_full_host,
+        )
         return f"Written {len(content)} bytes to {p}"
 
     approval, elevated, backup_summaries = await _gate_out_of_workspace_write(
@@ -2066,7 +2182,6 @@ async def write_file(
     if approval is not None:
         return json.dumps(approval)
 
-    loop = asyncio.get_event_loop()
     created = not p.exists()
     if not created:
         require_fresh_workspace_file_read(p, tool_name="write_file", original_path=path)
@@ -2110,22 +2225,26 @@ async def write_file(
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
 
-    await loop.run_in_executor(None, _write)
-    after_fingerprint = fingerprint_path(p)
-    record_semantic_mutation_receipt(
-        tool_name="write_file",
-        path=p,
-        operation="write_file",
-        before=before_fingerprint,
-        after=after_fingerprint,
-        partial=False,
-        metadata={"created": created},
-    )
-    record_workspace_file_write(p, operation="write_file", created=created)
-    refresh_workspace_file_read_state(p, operation="write_file")
-    record_scratch_file_write(p)
-    _notify_memory_source_write(p)
-    _notify_bootstrap_source_write(p)
+    def _settle_write(error: BaseException | None) -> None:
+        after_fingerprint = fingerprint_path(p)
+        changed = before_fingerprint != after_fingerprint
+        record_semantic_mutation_receipt(
+            tool_name="write_file",
+            path=p,
+            operation="write_file",
+            before=before_fingerprint,
+            after=after_fingerprint,
+            partial=error is not None,
+            metadata={"created": created},
+        )
+        if error is None or changed:
+            record_workspace_file_write(p, operation="write_file", created=created)
+            refresh_workspace_file_read_state(p, operation="write_file")
+            record_scratch_file_write(p)
+            _notify_memory_source_write(p)
+            _notify_bootstrap_source_write(p)
+
+    await _run_executor_mutation(_write, settle=_settle_write)
     return (
         f"Written {len(content)} bytes to {p}{_write_scope_suffix(p)}"
         f"{_backup_receipt_note(backup_summaries)}"
@@ -2191,7 +2310,7 @@ def _resolve_scratch_write_path(path: str) -> tuple[Path, str]:
         },
     },
     required=["path", "content"],
-    exposed_by_default=False,
+    default_access="deny",
     sandbox=SandboxToolDescriptor.filesystem(
         kind="fs.write",
         argv_factory=lambda a: ("fs.write_scratch", str(a.get("path", ""))),
@@ -2205,16 +2324,21 @@ async def write_scratch(path: str, content: str) -> str:
     if blocked is not None:
         return json.dumps(blocked)
 
-    loop = asyncio.get_event_loop()
     before_fingerprint = fingerprint_path(p)
+    settled_after: dict[str, Any] = {}
 
     def _write() -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
 
-    await loop.run_in_executor(None, _write)
-    after_fingerprint = fingerprint_path(p)
-    record_scratch_file_write(p)
+    def _settle_write(error: BaseException | None) -> None:
+        after_fingerprint = fingerprint_path(p)
+        settled_after.update(after_fingerprint)
+        if error is None or before_fingerprint != after_fingerprint:
+            record_scratch_file_write(p)
+
+    await _run_executor_mutation(_write, settle=_settle_write)
+    after_fingerprint = settled_after
     result = {
         "status": "written",
         "path": relative_path,
@@ -2252,7 +2376,7 @@ async def write_scratch(path: str, content: str) -> str:
     },
     required=["path", "content"],
     runtime_only_arguments=("approval_id",),
-    exposed_by_default=False,
+    default_access="deny",
     sandbox=SandboxToolDescriptor.filesystem(
         kind="fs.write",
         argv_factory=lambda a: ("fs.create_source", str(a.get("path", ""))),
@@ -2353,36 +2477,63 @@ async def create_source(path: str, content: str, approval_id: str | None = None)
             f"create_source refused because the file already exists: {path}. "
             "Use read_source/edit_source for existing files."
         )
-    loop = asyncio.get_event_loop()
     before_fingerprint = fingerprint_path(p)
+    settled_create: dict[str, Any] = {}
 
     def _write() -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("x", encoding="utf-8") as handle:
             handle.write(content)
 
-    await loop.run_in_executor(None, _write)
-    after_fingerprint = fingerprint_path(p)
-    after_revision = source_revision_for_path(p)
     display_path = _workspace_display_path(p, path)
-    receipt = record_semantic_mutation_receipt(
-        tool_name="create_source",
-        path=p,
-        operation="create_source",
-        before=before_fingerprint,
-        after=after_fingerprint,
-        partial=False,
-        metadata={
-            "after_revision": after_revision,
+
+    def _settle_create(error: BaseException | None) -> None:
+        if isinstance(error, FileExistsError):
+            # Exclusive open proves this worker did not create or write the
+            # file. A racing external writer must not be attributed to the
+            # tool through a synthetic mutation receipt.
+            return
+        after_fingerprint = fingerprint_path(p)
+        after_revision = (
+            source_revision_for_path(p)
+            if after_fingerprint.get("exists") and p.is_file()
+            else None
+        )
+        metadata: dict[str, Any] = {
             "created": True,
             "contract": "source_create_v1",
-        },
-    )
-    workspace_epoch = receipt["workspace_epoch"] if receipt is not None else None
-    record_workspace_file_write(p, operation="create_source", created=True)
-    refresh_workspace_file_read_state(p, operation="create_source")
-    _notify_memory_source_write(p)
-    _notify_bootstrap_source_write(p)
+        }
+        if after_revision is not None:
+            metadata["after_revision"] = after_revision
+        receipt = record_semantic_mutation_receipt(
+            tool_name="create_source",
+            path=p,
+            operation="create_source",
+            before=before_fingerprint,
+            after=after_fingerprint,
+            partial=error is not None,
+            metadata=metadata,
+        )
+        settled_create.update(
+            {
+                "after_fingerprint": after_fingerprint,
+                "after_revision": after_revision,
+                "workspace_epoch": (
+                    receipt["workspace_epoch"] if receipt is not None else None
+                ),
+            }
+        )
+        if error is None or before_fingerprint != after_fingerprint:
+            record_workspace_file_write(p, operation="create_source", created=True)
+            refresh_workspace_file_read_state(p, operation="create_source")
+            _notify_memory_source_write(p)
+            _notify_bootstrap_source_write(p)
+
+    await _run_executor_mutation(_write, settle=_settle_create)
+    after_revision = settled_create.get("after_revision")
+    if not isinstance(after_revision, str):
+        raise ToolError("create_source write settled without a valid revision.")
+    workspace_epoch = settled_create.get("workspace_epoch")
     result = {
         "status": "created",
         "path": display_path,
@@ -2579,9 +2730,22 @@ async def edit_file(
         loop = asyncio.get_event_loop()
         original = await loop.run_in_executor(None, p.read_text, "utf-8")
         updated = _apply_edit_replacements(original, replacements, path=path)
-        await loop.run_in_executor(None, p.write_text, updated, "utf-8")
-        _notify_memory_source_write(p)
-        _notify_bootstrap_source_write(p)
+        before_fingerprint = fingerprint_path(p)
+
+        def _write_full_host() -> int:
+            return p.write_text(updated, encoding="utf-8")
+
+        def _settle_full_host(error: BaseException | None) -> None:
+            after_fingerprint = fingerprint_path(p)
+            if error is None or before_fingerprint != after_fingerprint:
+                record_workspace_file_write(p, operation="edit_file", created=False)
+                _notify_memory_source_write(p)
+                _notify_bootstrap_source_write(p)
+
+        await _run_executor_mutation(
+            _write_full_host,
+            settle=_settle_full_host,
+        )
         if len(replacements) == 1:
             replacement = replacements[0]
             return (
@@ -2665,22 +2829,26 @@ async def edit_file(
     def _write() -> None:
         p.write_text(updated, encoding="utf-8")
 
-    await loop.run_in_executor(None, _write)
-    after_fingerprint = fingerprint_path(p)
-    record_semantic_mutation_receipt(
-        tool_name="edit_file",
-        path=p,
-        operation="edit_file",
-        before=before_fingerprint,
-        after=after_fingerprint,
-        partial=False,
-        metadata={"replacement_count": len(replacements)},
-    )
-    record_workspace_file_write(p, operation="edit_file", created=False)
-    refresh_workspace_file_read_state(p, operation="edit_file")
-    record_scratch_file_write(p)
-    _notify_memory_source_write(p)
-    _notify_bootstrap_source_write(p)
+    def _settle_edit(error: BaseException | None) -> None:
+        after_fingerprint = fingerprint_path(p)
+        changed = before_fingerprint != after_fingerprint
+        record_semantic_mutation_receipt(
+            tool_name="edit_file",
+            path=p,
+            operation="edit_file",
+            before=before_fingerprint,
+            after=after_fingerprint,
+            partial=error is not None,
+            metadata={"replacement_count": len(replacements)},
+        )
+        if error is None or changed:
+            record_workspace_file_write(p, operation="edit_file", created=False)
+            refresh_workspace_file_read_state(p, operation="edit_file")
+            record_scratch_file_write(p)
+            _notify_memory_source_write(p)
+            _notify_bootstrap_source_write(p)
+
+    await _run_executor_mutation(_write, settle=_settle_edit)
     if len(replacements) == 1:
         replacement = replacements[0]
         return (
@@ -2758,7 +2926,7 @@ async def edit_file(
     },
     required=["path", "expected_revision", "edits"],
     runtime_only_arguments=("approval_id",),
-    exposed_by_default=False,
+    default_access="deny",
     sandbox=SandboxToolDescriptor.filesystem(
         kind="fs.edit",
         argv_factory=lambda a: ("fs.edit", str(a.get("path", ""))),
@@ -2908,36 +3076,63 @@ async def edit_source(
 
     before_fingerprint = fingerprint_path(p)
     if updated != original:
+        settled_edit: dict[str, Any] = {}
 
         def _write() -> None:
             p.write_text(updated, encoding="utf-8")
 
-        await loop.run_in_executor(None, _write)
+        def _settle_edit(error: BaseException | None) -> None:
+            after_fingerprint = fingerprint_path(p)
+            after_revision = source_revision_for_path(p)
+            receipt = record_semantic_mutation_receipt(
+                tool_name="edit_source",
+                path=p,
+                operation="edit_source",
+                before=before_fingerprint,
+                after=after_fingerprint,
+                partial=error is not None,
+                metadata={
+                    "before_revision": before_revision,
+                    "after_revision": after_revision,
+                    "edit_count": len(edits),
+                    "contract": "source_revision_line_edit_v1",
+                },
+            )
+            settled_edit.update(
+                {
+                    "after_fingerprint": after_fingerprint,
+                    "after_revision": after_revision,
+                    "receipt": receipt,
+                }
+            )
+            if error is None or before_fingerprint != after_fingerprint:
+                record_workspace_file_write(p, operation="edit_source", created=False)
+                refresh_workspace_file_read_state(p, operation="edit_source")
+                record_scratch_file_write(p)
+                _notify_memory_source_write(p)
+                _notify_bootstrap_source_write(p)
 
-    after_fingerprint = fingerprint_path(p)
-    after_revision = source_revision_for_path(p)
-    receipt = record_semantic_mutation_receipt(
-        tool_name="edit_source",
-        path=p,
-        operation="edit_source",
-        before=before_fingerprint,
-        after=after_fingerprint,
-        partial=False,
-        metadata={
-            "before_revision": before_revision,
-            "after_revision": after_revision,
-            "edit_count": len(edits),
-            "contract": "source_revision_line_edit_v1",
-        },
-    )
+        await _run_executor_mutation(_write, settle=_settle_edit)
+        after_revision = settled_edit["after_revision"]
+        receipt = settled_edit["receipt"]
+    else:
+        after_fingerprint = fingerprint_path(p)
+        after_revision = source_revision_for_path(p)
+        receipt = record_semantic_mutation_receipt(
+            tool_name="edit_source",
+            path=p,
+            operation="edit_source",
+            before=before_fingerprint,
+            after=after_fingerprint,
+            partial=False,
+            metadata={
+                "before_revision": before_revision,
+                "after_revision": after_revision,
+                "edit_count": len(edits),
+                "contract": "source_revision_line_edit_v1",
+            },
+        )
     workspace_epoch = receipt["workspace_epoch"] if receipt is not None else None
-
-    if updated != original:
-        record_workspace_file_write(p, operation="edit_source", created=False)
-        refresh_workspace_file_read_state(p, operation="edit_source")
-        record_scratch_file_write(p)
-        _notify_memory_source_write(p)
-        _notify_bootstrap_source_write(p)
 
     result = {
         "status": "applied",
@@ -3762,7 +3957,7 @@ def _source_symbol_query_matches(
         },
     },
     required=[],
-    exposed_by_default=False,
+    default_access="deny",
     plan_access=PlanAccess.READ_ONLY,
 )
 async def source_symbols(

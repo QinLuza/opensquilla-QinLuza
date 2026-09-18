@@ -17,8 +17,8 @@
       class="chat-share-picker"
       :class="{ 'is-selected': shareSelected }"
       :aria-pressed="shareSelected"
-      :title="shareSelected ? 'Remove from share image' : 'Add to share image'"
-      :aria-label="shareSelected ? 'Remove from share image' : 'Add to share image'"
+      :title="shareSelected ? t('chat.removeFromShare') : t('chat.addToShare')"
+      :aria-label="shareSelected ? t('chat.removeFromShare') : t('chat.addToShare')"
       @click.stop="emit('toggleShare', shareMessageId)"
     >
       <Icon v-if="shareSelected" name="check" :size="13" />
@@ -40,7 +40,7 @@
           v-if="showActivityDisclosure"
           :lifecycle="activityLifecycle"
           :step-count="activityStepCount"
-          :failure-count="0"
+          :failure-count="toolFailureCount"
           :duration-seconds="activityDurationSeconds"
           :summary-label="displayActivitySummaryLabel"
           :detail-label="displayActivityDetailLabel"
@@ -50,6 +50,36 @@
           :state-key="activityStateKey"
           :continuity-key="activityContinuityKey"
         >
+          <UnifiedAssistantActivityTimeline
+            v-if="hasUnifiedActivityOrder"
+            :projection="visibleActivityProjection"
+            :timeline-items="visibleActivityItems"
+            :reasoning-blocks="reasoningBlocks"
+            :reasoning-pace-bursts="reasoningRevealPending"
+            :state-scope="toolStateScope"
+            :is-tool-group-open="isToolGroupOpen"
+            :is-tool-item-open="isToolItemOpen"
+            :tool-group-status-text="toolGroupStatusText"
+            :tool-status-text="toolStatusText"
+            :tool-secondary-text="toolSecondaryText"
+            @reveal-complete="completeTerminalReasoningReveal"
+            @toggle-group="$emit('toggleToolGroup', $event)"
+            @toggle-item="$emit('toggleToolItem', $event)"
+            @show-result="(content, title, context) => $emit('showToolResult', content, title, context)"
+          >
+            <template #interrupt="{ part }">
+              <InterruptPart
+                v-if="part.resolution"
+                :part="part"
+                timeline
+                @resolve="(id, decision) => $emit('resolveInterrupt', id, decision)"
+                @extend="id => $emit('extendInterrupt', id)"
+                @clarify-submit="(fields, request) => $emit('clarifySubmit', fields, request)"
+                @clarify-dismiss="$emit('clarifyDismiss')"
+              />
+            </template>
+          </UnifiedAssistantActivityTimeline>
+          <template v-else>
           <AssistantActivityTimeline
             v-if="hasBeforeReasoningActivity"
             :projection="visibleActivityProjection"
@@ -109,6 +139,14 @@
               />
             </template>
           </AssistantActivityTimeline>
+          </template>
+          <p
+            v-if="message.activitySnapshotIncomplete"
+            class="assistant-activity-incomplete"
+            role="status"
+          >
+            {{ t('chat.activity.recordIncomplete') }}
+          </p>
         </ActivityDisclosure>
         <div
           v-if="activityProjection.answerPart && !hasPlan"
@@ -118,7 +156,11 @@
           <TextPart
             :part="activityProjection.answerPart"
             :sources="message.sources ?? []"
+            :workspace-previews="workspacePreviews"
+            :session-key="sessionKey"
+            @open-resource="emit('openArtifact', $event)"
             @citation="onCitation"
+            @workspace-preview="openWorkspacePreview"
           />
         </div>
       </template>
@@ -173,7 +215,20 @@
         class="plan-message-intro"
         :part="activityProjection.answerPart"
         :sources="message.sources ?? []"
+        :workspace-previews="workspacePreviews"
+        :session-key="sessionKey"
+        @open-resource="emit('openArtifact', $event)"
         @citation="onCitation"
+        @workspace-preview="openWorkspacePreview"
+      />
+
+      <TextPart
+        v-if="workspacePreviews.length && (!activityProjection.canSeparateActivity || !activityProjection.answerPart)"
+        :part="{ type: 'text', key: 'workspace-preview-fallback', rawText: '', html: '' }"
+        :workspace-previews="workspacePreviews"
+        :session-key="sessionKey"
+        @open-resource="emit('openArtifact', $event)"
+        @workspace-preview="openWorkspacePreview"
       />
 
       <PlanCard
@@ -183,15 +238,21 @@
         :plan="part.plan"
         :disabled="planActionsDisabled"
         :pending-action="planActionPending"
+        :dismissed="planPresentations?.[part.plan.revisionId]?.dismissed"
+        :presentation-available="planPresentationAvailable"
+        :presentation-busy="Boolean(planPresentationPending)"
         @implement-current="$emit('planImplementCurrent', $event)"
         @implement-new="$emit('planImplementNew', $event)"
         @replan="$emit('planReplan', $event)"
+        @presentation-change="$emit('planPresentationChange', $event)"
       />
 
       <SessionCreatedCard
         v-for="createdSession in createdSessions"
         :key="createdSession.callId"
         :session-key="createdSession.sessionKey"
+        :title="createdSession.title"
+        :resolve-session-availability="resolveSessionAvailability"
         @open="$emit('openSession', $event)"
       />
 
@@ -205,7 +266,6 @@
           :artifacts="message.artifacts"
           :navigation-artifacts="artifactNavigationItems"
           :session-key="sessionKey"
-          :auth-token="authToken"
           :prefer-workbench="workbenchEnabled"
           @download="$emit('downloadArtifact', $event)"
           @open="$emit('openArtifact', $event)"
@@ -214,13 +274,25 @@
         <SourcesRow v-if="message.toolCalls?.length" ref="sourcesRowRef" :calls="message.toolCalls" :sources="message.sources ?? []" />
       </div>
 
-      <div v-if="showFooter" class="msg-ai-footer">
+      <SkillLoadStatus
+        class="msg-ai-skill-loads"
+        :receipts="message.skillLoads || []"
+      />
+
+      <div
+        v-if="showFooter"
+        class="msg-ai-footer"
+        :class="{ 'msg-ai-footer--goal': goalOutcome }"
+      >
         <GoalOutcomeNotice
           v-if="goalOutcome"
           class="msg-goal-outcome"
           :goal="goalOutcome"
           :elapsed="goalElapsed || '0s'"
+          :removable="goalRemovable && !shareMode"
+          :busy="goalBusy"
           inline
+          @clear="$emit('goalClear', $event)"
         />
         <span
           v-if="isCronMessage"
@@ -284,10 +356,7 @@
                   <span class="msg-meta-popover__label">{{ t('chat.msgMeta.ensemble') }}</span>
                   <span class="msg-meta-popover__value">{{ ensembleSummary }}</span>
                 </div>
-                <div
-                  v-if="message.meta.ensemble.costUsd || message.meta.costUsd || !usageIncomplete"
-                  class="msg-meta-popover__row"
-                >
+                <div class="msg-meta-popover__row">
                   <span class="msg-meta-popover__label">{{ t('chat.msgMeta.cost') }}</span>
                   <span class="msg-meta-popover__value">{{ fmtUsd(message.meta.ensemble.costUsd || message.meta.costUsd) }}</span>
                 </div>
@@ -298,13 +367,15 @@
                 <div class="msg-meta-popover__models" :aria-label="t('chat.msgMeta.ensembleModelsAria')">
                   <div
                     v-for="member in message.meta.ensemble.models"
-                    :key="`${member.role}:${member.provider}:${member.model}`"
+                    :key="`${member.role}:${member.provider}:${member.model}:${member.sampleIndex || 0}`"
                     class="msg-meta-popover__model"
                   >
-                    <span class="msg-meta-popover__model-role">{{ ensembleRole(member.role, member.label) }}</span>
+                    <span class="msg-meta-popover__model-role">
+                      {{ ensembleMemberRoleLabel(member.role) }} <span aria-hidden="true">·</span>
+                    </span>
                     <span class="msg-meta-popover__model-name" :title="member.model">{{ member.modelShort }}</span>
                     <span class="msg-meta-popover__model-cost">
-                      {{ member.costUsd || !usageIncomplete ? fmtUsd(member.costUsd) : '—' }}
+                      {{ fmtUsd(member.costUsd) }}
                     </span>
                   </div>
                 </div>
@@ -402,9 +473,11 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
 import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
+import UnifiedAssistantActivityTimeline from '@/components/chat/UnifiedAssistantActivityTimeline.vue'
 import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
 import GoalOutcomeNotice from '@/components/chat/GoalOutcomeNotice.vue'
 import SourcesRow from '@/components/chat/SourcesRow.vue'
+import SkillLoadStatus from '@/components/chat/SkillLoadStatus.vue'
 import ToolCallTimeline from '@/components/chat/ToolCallTimeline.vue'
 import InterruptPart from '@/components/chat/parts/InterruptPart.vue'
 import PlanCard from '@/components/chat/PlanCard.vue'
@@ -419,6 +492,12 @@ import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { useRelativeNow } from '@/composables/useRelativeNow'
 import { createdSessionsFromMessage } from '@/utils/chat/createdSessions'
 import {
+  workspacePreviewOpenAction, workspacePreviewPages, workspacePreviewsFromMessage, type WorkspacePreviewLink,
+} from '@/utils/chat/workspacePreviews'
+import type { WorkbenchResource } from '@/types/workbenchResources'
+import {
+} from '@/utils/chat/toolDisplay'
+import {
   hasIncompleteUsageCoverage,
   usageCoverageText,
 } from '@/utils/chat/usageCoverage'
@@ -432,10 +511,12 @@ import type {
 } from '@/types/chat'
 import type { GoalSnapshot } from '@/composables/chat/useChatGoals'
 import type { ChatPart } from '@/types/parts'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type {
   PlanCardAction,
   PlanCardActionTarget,
+  PlanPresentationSnapshot,
+  PlanPresentationRequest,
 } from '@/types/plans'
 import {
   isBeforeReasoningActivityStatusStep,
@@ -449,6 +530,7 @@ import {
   writeAssistantActivityDuration,
 } from '@/utils/chat/activityDisclosureState'
 import { absoluteTime, fullTime, isoTime, relativeTime } from '@/utils/messageTime'
+import { ensembleMemberRoleLabel } from '@/utils/ensembleRoles'
 import {
   isProcessRestartOutcome,
   turnOutcomeDurationSeconds,
@@ -473,16 +555,22 @@ const props = defineProps<{
   regenerateAvailable?: boolean
   artifactNavigationItems?: ArtifactPayload[]
   sessionKey?: string
-  authToken?: string
   workbenchEnabled?: boolean
   /** True for a durable completed turn tip, or the legacy current-tip fallback. */
   isTip?: boolean
   forkBusy?: boolean
   planActionPending?: PlanCardAction | null
   planActionsDisabled?: boolean
+  planPresentations?: Record<string, PlanPresentationSnapshot>
+  planPresentationAvailable?: boolean
+  planPresentationPending?: string | null
   showTurnOutcome?: boolean
   goalOutcome?: GoalSnapshot | null
   goalElapsed?: string
+  goalRemovable?: boolean
+  goalBusy?: boolean
+  resolveSessionAvailability?: (sessionKey: string) => Promise<boolean>
+  resolveWorkspacePreviewResource?: (sessionKey: string, documentId: string) => Promise<WorkbenchResource | null>
 }>()
 
 const emit = defineEmits<{
@@ -501,7 +589,9 @@ const emit = defineEmits<{
   planImplementCurrent: [target: PlanCardActionTarget]
   planImplementNew: [target: PlanCardActionTarget]
   planReplan: [target: PlanCardActionTarget]
+  planPresentationChange: [request: PlanPresentationRequest]
   openSession: [sessionKey: string]
+  goalClear: [goal: GoalSnapshot]
 }>()
 
 // Absolute label is static; only the relative label subscribes to the shared
@@ -614,7 +704,13 @@ const standaloneInterruptParts = computed(() =>
     )
   )),
 )
-const outcomePresentation = computed(() => turnOutcomePresentation(props.message.turnOutcome))
+const outcomePresentation = computed(() => {
+  const outcome = turnOutcomePresentation(props.message.turnOutcome)
+  if (outcome !== 'completed') return outcome
+  if (props.message.interrupted) return 'interrupted'
+  if (props.message.terminalFailure) return 'failed'
+  return outcome
+})
 const processRestart = computed(() => isProcessRestartOutcome(props.message.turnOutcome))
 
 function epochMilliseconds(value: string | number | null | undefined): number {
@@ -697,11 +793,8 @@ const hasMetaDetails = computed(() => {
   )
 })
 
-const usageIncomplete = computed(() => (
-  props.message.meta ? hasIncompleteUsageCoverage(props.message.meta) : false
-))
 const usageCoverageDetail = computed(() => (
-  props.message.meta
+  props.message.meta && !props.message.meta.ensemble
     ? usageCoverageText(
         props.message.meta,
         (key, named) => String(named ? t(key, named) : t(key)),
@@ -777,6 +870,33 @@ const legacyTimelineItems = computed<ChatStreamTimelineItem[]>(() => {
 })
 
 const semanticCreatedSessions = computed(() => createdSessionsFromMessage(props.message))
+const registeredWorkspacePreviews = computed(() => workspacePreviewsFromMessage(props.message))
+const previewResources = ref<Record<string, WorkbenchResource>>({})
+const workspacePreviews = computed(() => registeredWorkspacePreviews.value.flatMap(
+  preview => workspacePreviewPages(preview, previewResources.value[preview.documentId]),
+))
+watch(
+  [() => props.sessionKey, () => props.resolveWorkspacePreviewResource,
+    () => JSON.stringify(registeredWorkspacePreviews.value)],
+  async ([key, resolve], _previous, onCleanup) => {
+    let active = true
+    onCleanup(() => { active = false })
+    previewResources.value = {}
+    if (!key || !resolve) return
+    const entries = await Promise.all(registeredWorkspacePreviews.value.filter(preview => preview.bundleRoot)
+      .map(async preview => {
+        try {
+          const resource = await resolve(key, preview.documentId)
+          return resource ? [preview.documentId, resource] as const : null
+        } catch { return null }
+      }))
+    if (active) previewResources.value = Object.fromEntries(entries.filter(entry => entry !== null))
+  },
+  { immediate: true, flush: 'sync' },
+)
+function openWorkspacePreview(preview: WorkspacePreviewLink) {
+  emit('openArtifact', workspacePreviewOpenAction(preview, props.sessionKey))
+}
 const createdSessions = computed(() => (
   props.message.createdSessionLinks ?? semanticCreatedSessions.value
 ))
@@ -789,71 +909,34 @@ const activityLifecycle = computed<AssistantActivityLifecycle>(() => {
   if (outcomePresentation.value === 'interrupted') return 'interrupted'
   if (outcomePresentation.value === 'timeout') return 'failed'
   if (outcomePresentation.value === 'failed') return 'failed'
-  if (props.message.interrupted) return 'interrupted'
-  if (props.message.terminalFailure) return 'failed'
-  const hasTerminalFailure = !props.message.text.trim()
-    && (
-      (props.message.toolCalls || []).some(call => call.isError || call.status === 'error')
-      || (props.message.timelineItems || []).some(item =>
-        item.type === 'tool-group'
-        && item.group.calls.some(call => call.isError || call.status === 'error'),
-      )
-  )
-  if (hasTerminalFailure) return 'failed'
   return props.message.isStreaming ? 'working' : 'settled'
 })
 
 const activityProjection = computed(() =>
   projectAssistantActivity(
-    props.message,
+    { ...props.message, timelineItems: withoutFailedActivity(props.message.timelineItems || []) },
     props.renderMarkdown,
-    legacyTimelineItems.value,
+    withoutFailedActivity(legacyTimelineItems.value),
     {
       lifecycle: activityLifecycle.value,
       statusHistory: statusHistory.value,
-      endedAt: epochMilliseconds(props.message.ts),
+      endedAt: epochMilliseconds(
+        props.message.turnOutcome?.finishedAt ?? props.message.ts,
+      ),
     },
   ),
 )
 
-function withoutFailedActivity(
-  items: ChatStreamTimelineItem[],
-): ChatStreamTimelineItem[] {
+function withoutFailedActivity(items: ChatStreamTimelineItem[]): ChatStreamTimelineItem[] {
   return items.flatMap((item): ChatStreamTimelineItem[] => {
     if (item.type !== 'tool-group') return [item]
-    const failedCalls = item.group.calls.filter(
-      call => call.isError || call.status === 'error',
-    )
-    // Some restored histories only carry the failure marker on the group.
-    // Treat that group-level state as authoritative when no call-level marker
-    // survived serialization.
-    if (
-      (item.group.isError || item.group.status === 'error')
-      && failedCalls.length === 0
-    ) {
-      return []
-    }
-    const calls = item.group.calls.filter(
-      call => !call.isError
-        && call.status !== 'error'
-        && !createdSessionCallIds.value.has(call.toolId),
-    )
-    if (calls.length === 0) return []
-    const isRunning = calls.some(call => call.isRunning)
-    return [{
-      ...item,
-      group: {
-        ...item.group,
-        calls,
-        isRunning,
-        isError: false,
-        status: isRunning
-          ? ''
-          : calls.every(call => call.status === 'success')
-            ? 'success'
-            : '',
-      },
-    }]
+    const groupFailure = (item.group.isError || item.group.status === 'error')
+      && !item.group.calls.some(call => call.isError || call.status === 'error')
+    const calls = item.group.calls
+      .filter(call => !createdSessionCallIds.value.has(call.toolId))
+      .map(call => groupFailure ? { ...call, isError: true, status: 'error' as const } : call)
+    if (!calls.length) return []
+    return [{ ...item, group: { ...item.group, calls } }]
   })
 }
 
@@ -872,8 +955,7 @@ const visibleActivityCallKeys = computed(() => new Set(
 ))
 const visibleActivityClusters = computed(() =>
   activityProjection.value.activityClusters.filter(cluster =>
-    !cluster.isFailure
-    && cluster.calls.some(call => visibleActivityCallKeys.value.has(call.renderKey)),
+    cluster.calls.some(call => visibleActivityCallKeys.value.has(call.renderKey)),
   ),
 )
 const visibleActivityStatusSteps = computed(() =>
@@ -884,6 +966,20 @@ const visibleActivityProjection = computed(() => ({
   activityClusters: visibleActivityClusters.value,
   statusSteps: visibleActivityStatusSteps.value,
 }))
+function validActivityOrder(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+}
+const hasUnifiedActivityOrder = computed(() => {
+  const orders = [
+    ...visibleActivityStatusSteps.value.map(step => step.activityOrder),
+    ...reasoningBlocks.value.map(block => block.activityOrder),
+    ...visibleActivityItems.value.map(item => (
+      item.activityOrder
+      ?? (item.type === 'tool-group' ? item.group.activityOrder : undefined)
+    )),
+  ]
+  return orders.length > 0 && orders.every(validActivityOrder)
+})
 const hasBeforeReasoningActivity = computed(() =>
   visibleActivityStatusSteps.value.some(isBeforeReasoningActivityStatusStep),
 )
@@ -898,8 +994,21 @@ const hasActivity = computed(() =>
   || visibleActivityStatusSteps.value.length > 0,
 )
 const showActivityDisclosure = computed(() =>
-  activityProjection.value.canSeparateActivity
-  && hasActivity.value,
+  (activityProjection.value.canSeparateActivity && hasActivity.value)
+  || props.message.activitySnapshotIncomplete === true,
+)
+
+const toolFailureCount = computed(() =>
+  visibleActivityItems.value.reduce((count, item) => {
+    if (item.type !== 'tool-group') return count
+    return count + item.group.calls.filter(call =>
+      call.isError || call.status === 'error',
+    ).length
+  }, 0),
+)
+
+const documentMutationOutcome = computed(() =>
+  props.message.turnOutcome?.documentMutationOutcome,
 )
 
 const activityStepCount = computed(() => Math.max(
@@ -1039,22 +1148,33 @@ const activityDetailLabel = computed(() => {
   return parts.join(' · ')
 })
 
-const completedMaintenanceCount = computed(() =>
-  activityProjection.value.statusSteps.filter(step =>
-    step.category === 'maintenance' && step.state === 'completed',
-  ).length,
-)
-
 function withMaintenanceSummary(label: string): string {
-  const count = completedMaintenanceCount.value
-  if (!count) return label
-  const maintenance = count > 1
-    ? `${String(t('chat.compact.compacted'))} ×${count}`
-    : String(t('chat.compact.compacted'))
-  return [label, maintenance].filter(Boolean).join(' · ')
+  const counts = new Map<string, number>()
+  for (const step of activityProjection.value.statusSteps) {
+    if (step.category !== 'maintenance' || step.state !== 'completed') continue
+    counts.set(step.label.code, (counts.get(step.label.code) ?? 0) + 1)
+  }
+  const maintenance = [...counts].map(([code, count]) =>
+    count > 1 ? `${String(t(code))} ×${count}` : String(t(code)),
+  )
+  return [label, ...maintenance].filter(Boolean).join(' · ')
 }
 
 const activitySummaryLabel = computed(() => {
+  const mutationStatus = documentMutationOutcome.value?.status
+  const mutationSummaryKey = mutationStatus === 'applied'
+    ? 'applied'
+    : mutationStatus === 'ambiguous'
+      ? 'ambiguous'
+      : mutationStatus
+        ? 'not_applied'
+        : ''
+  if (mutationSummaryKey) {
+    return withMaintenanceSummary([
+      String(t(`chat.promptAnnotations.status.${mutationSummaryKey}`)),
+      activityCompactElapsedLabel.value,
+    ].filter(Boolean).join(' · '))
+  }
   if (outcomePresentation.value !== 'completed') {
     const label = String(t({
       stopped: 'sessions.status.cancelled',
@@ -1066,6 +1186,12 @@ const activitySummaryLabel = computed(() => {
     return withMaintenanceSummary(
       [label, activityCompactElapsedLabel.value].filter(Boolean).join(' · '),
     )
+  }
+  if (activityLifecycle.value === 'failed') {
+    return withMaintenanceSummary([
+      String(t('sessions.status.failed')),
+      activityCompactElapsedLabel.value,
+    ].filter(Boolean).join(' · '))
   }
   if (activityCompletionConfirmed.value) {
     return withMaintenanceSummary([
@@ -1100,16 +1226,15 @@ function fmtUsd(value: number): string {
   return `$${n.toFixed(6).replace(/\.?0+$/, '')}`
 }
 
-function ensembleRole(role: string, label: string): string {
-  const normalized = String(role || '').replace(/_/g, ' ')
-  if (normalized === 'proposer') return 'proposer'
-  if (normalized === 'aggregator') return 'aggregator'
-  if (normalized === 'fallback single') return 'fallback'
-  return label || normalized || 'member'
-}
 </script>
 
 <style scoped>
+.assistant-activity-incomplete {
+  margin: 0.375rem 0 0;
+  color: color-mix(in srgb, var(--text) 52%, transparent);
+  font-size: 0.75rem;
+}
+
 .msg-ai-main > :deep(.approval-card),
 .msg-ai-main > :deep(.clarify-card) {
   width: 100%;
@@ -1246,6 +1371,14 @@ function ensembleRole(role: string, label: string): string {
   align-items: center;
   gap: 0.625rem;
   margin-top: 0.25rem;
+}
+
+.msg-ai-skill-loads {
+  margin-top: 0.375rem;
+}
+
+.msg-ai-footer--goal {
+  flex-wrap: wrap;
 }
 
 .msg-provenance-chip {

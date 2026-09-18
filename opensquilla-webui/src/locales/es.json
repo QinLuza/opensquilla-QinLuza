@@ -1,4 +1,13 @@
 {
+  "resourceActions": {
+    "more": "Acciones de archivo", "preview": "Vista previa en la aplicación", "openSource": "Abrir con la aplicación predeterminada",
+    "reveal": "Mostrar en el gestor de archivos", "revealFinder": "Mostrar en Finder", "revealExplorer": "Mostrar en el Explorador de archivos",
+    "openCopy": "Abrir una copia local", "saveAs": "Guardar como…", "copyPath": "Copiar ruta",
+    "copyGatewayPath": "Copiar ruta del servidor", "copyContents": "Copiar contenido", "saved": "Archivo guardado",
+    "singleFile": "Guardar solo este HTML, sin estilos, imágenes ni páginas vinculadas.",
+    "textOnly": "Solo se puede copiar texto UTF-8 de hasta 1 MiB. Guarda el archivo.",
+    "unavailable": "El archivo fuente no está disponible. Las vistas previas y descargas existentes no cambian.", "failed": "La operación de archivo falló."
+  },
   "workspaces": {
     "projects": "Proyectos",
     "createProject": "Crear proyecto",
@@ -67,6 +76,13 @@
     "viewRelease": "Ver versión",
     "dismiss": "Descartar",
     "desktop": {
+      "installErrorTitle": "No se pudo iniciar la instalación",
+      "quitAndInstall": "Salir e instalar",
+      "signedDownloadedDesc": "OpenSquilla {version} está verificado y listo. «Salir e instalar» cierra los servicios en segundo plano y abre el instalador.",
+      "manualApplyingStatus": "Cerrando servicios en segundo plano",
+      "manualApplyingDesc": "OpenSquilla está cerrando sus servicios en segundo plano. El instalador se abrirá cuando se hayan detenido.",
+      "errorSignatureInvalid": "La firma del instalador no es válida o su editor no coincide con OpenSquilla. Se bloqueó la instalación. Descarga la actualización de nuevo.",
+      "errorSignatureUnavailable": "OpenSquilla no pudo verificar la firma del instalador. Se bloqueó la instalación. Inténtalo más tarde.",
       "indicatorAvailable": "Actualizar {version}",
       "indicatorDownloaded": "Actualización lista",
       "indicatorInstallerReady": "Instalador verificado",
@@ -77,7 +93,7 @@
       "availableDesc": "Descárgala cuando estés listo. OpenSquilla la instalará solo después de reiniciar.",
       "manualAvailableDesc": "Descarga el instalador de Windows correspondiente a esta versión. Windows te guiará para completar la instalación.",
       "manualDownloadedTitle": "Instalador verificado listo",
-      "manualDownloadedDesc": "OpenSquilla {version} se verificó con la suma de comprobación oficial de GitHub y se mostró en su carpeta. Ejecuta el instalador cuando estés listo.",
+      "manualDownloadedDesc": "El instalador de OpenSquilla {version} se ha verificado. Selecciona Mostrar instalador para localizar el archivo y ejecútalo manualmente cuando estés listo.",
       "downloadedTitle": "Lista para instalar",
       "downloadedDesc": "Reinicia OpenSquilla para terminar la actualización a {version}.",
       "downloadingTitle": "Descargando actualización",
@@ -88,8 +104,8 @@
       "errorFallback": "Vuelve a intentarlo desde Ajustes.",
       "errorSourceUnreachable": "Las fuentes de actualización no están disponibles temporalmente. Inténtalo de nuevo más tarde.",
       "errorManifestInvalid": "Los datos del canal de versiones no son válidos, por lo que OpenSquilla no puede confirmar la actualización de forma segura.",
-      "errorChecksumUnavailable": "No se puede verificar el instalador porque la suma de comprobación oficial de GitHub no está disponible. No se abrió ningún instalador.",
-      "errorIntegrityFailed": "El instalador descargado no superó la verificación de integridad y se eliminó.",
+      "errorChecksumUnavailable": "No se puede verificar el instalador porque la suma de comprobación oficial de la actualización no está disponible. No se abrió ningún instalador.",
+      "errorIntegrityFailed": "El instalador no superó la verificación de integridad. Descarga la actualización de nuevo.",
       "errorDownloadFailed": "OpenSquilla no pudo descargar la actualización. Comprueba la conexión e inténtalo de nuevo.",
       "errorInstallFailed": "OpenSquilla no pudo preparar o abrir el instalador. Inténtalo de nuevo o usa la página de la versión.",
       "idleDesc": "Busca una nueva versión de escritorio.",
@@ -145,6 +161,14 @@
     "pixels": "píxeles",
     "empty": "No hay una vista previa disponible para este elemento.",
     "itemLimitReached": "Ya hay ocho vistas previas aisladas abiertas. Cierra una antes de abrir otra.",
+    "resources": {
+      "title": "Archivos", "count": "Archivos ({count})", "empty": "Aún no hay archivos ni enlaces.",
+      "groups": { "files": "Archivos", "links": "Enlaces", "attachments": "Archivos", "documents": "Archivos", "deliverables": "Archivos", "urls": "Enlaces" },
+      "open": "Abrir {name}", "preparing": "Preparando el editor…", "retry": "Reintentar", "preview": "Vista previa de {name}", "download": "Descargar {name}", "edit": "Editar una copia de {name}", "publish": "Publicar {name}",
+      "imported": "Ya puedes editar {name}.", "published": "Ya puedes compartir {name}.",
+      "publishUnavailable": "Este documento no tiene una revisión actual publicable.", "actionFailed": "La acción del área de trabajo falló.",
+      "unavailableReasons": { "htmlEncodingUnsupported": "Este HTML no es UTF-8 válido y no se puede previsualizar ni editar de forma segura.", "htmlValidationFailed": "No se pudo validar este HTML para una vista previa o edición seguras.", "htmlEditTooLarge": "Este HTML es demasiado grande para editarlo en la aplicación. Aún puedes descargarlo.", "htmlPreviewTooLarge": "Este HTML es demasiado grande para previsualizarlo de forma segura. Aún puedes descargarlo.", "officeAdapterNotAvailable": "La edición de Office aún no está disponible.", "unsupported": "Esta acción no está disponible para este recurso." }
+    },
     "browser": {
       "back": "Atrás",
       "forward": "Adelante",
@@ -157,6 +181,35 @@
       "failed": "El navegador lateral se detuvo",
       "failedDetail": "Vuelve a cargar el navegador aislado para continuar."
     },
+    "artifactAnnotation": {
+      "start": "Anotar vista previa",
+      "stop": "Dejar de anotar",
+      "selectElement": "Selecciona un elemento de la página para anotar",
+      "selectElementShort": "Selecciona elemento",
+      "unavailable": "La anotación de vista previa no está disponible.",
+      "desktopEditingOnly": "Selecciona y edita elementos de la página con IA en la aplicación de escritorio.",
+      "createFailed": "No se pudo adjuntar el elemento seleccionado.",
+      "elementChanged": "El elemento seleccionado cambió antes de adjuntarse. Vuelva a seleccionarlo en la vista previa actual.",
+      "rearmFailed": "El modo de anotación se detuvo porque no se pudo reiniciar el selector. Vuelva a activarlo para intentarlo de nuevo.",
+      "updateFailed": "No se pudo guardar el borrador de anotación.",
+      "discardFailed": "No se pudo descartar la anotación. Seguirá abierta para volver a intentarlo.",
+      "closeFailed": "No se pudo cerrar el editor de anotaciones. Inténtelo de nuevo.",
+      "replacementCleanupFailed": "Se conservó la anotación nueva, pero no se pudo eliminar el borrador anterior.",
+      "overlayFallback": "Continúa la anotación a continuación.",
+      "fallbackTitle": "Continuar anotación",
+      "fallbackDetail": "La vista previa está oculta temporalmente. Tu anotación sigue aquí.",
+      "frozenPreview": "Vista previa de la zona seleccionada",
+      "placeholder": "Describe el cambio para esta zona…",
+      "newlineHint": "{shortcut} para una línea nueva",
+      "keepDraft": "Conservar anotación",
+      "submit": "Añadir anotación",
+      "contextLabel": "Selección actual",
+      "bodyLabel": "Anotación de página",
+      "emptyBody": "Describe el cambio solicitado.",
+      "reselectHint": "Selecciona la zona correspondiente de la página.",
+      "reuseHint": "Se copió la solicitud de cambio. Selecciona la zona correspondiente de la página.",
+      "screenshotUploadFailed": "No se pudo adjuntar la captura. La anotación se conserva; puedes añadir una imagen manualmente."
+    },
     "artifactPreview": {
       "refresh": "Actualizar vista previa",
       "openExternal": "Abrir externamente",
@@ -165,26 +218,25 @@
       "readyWithWarnings": "La vista previa se está ejecutando con advertencias.",
       "warningsShort": "Advertencias",
       "suspended": "Vista previa en pausa",
-      "nativePreview": "Vista previa HTML nativa",
+      "nativePreview": "Vista previa interactiva",
       "allowRemoteResources": "Permitir imágenes, estilos y contenido multimedia en línea",
       "blockRemoteResources": "Bloquear imágenes, estilos y contenido multimedia en línea",
       "remoteResourcesConfirmTitle": "¿Cargar recursos en línea?",
       "remoteResourcesConfirmBody": "Este HTML puede contactar con sitios externos para cargar imágenes, estilos, fuentes o contenido multimedia. Esos sitios pueden conocer tu dirección IP y recibir URL codificadas por el artefacto. Los scripts remotos y las solicitudes de datos seguirán bloqueados.",
       "remoteResourcesConfirmAction": "Permitir una vez",
-      "fullMode": "Vista previa con red completa",
-      "offlineMode": "Vista previa sin conexión",
-      "fullShort": "Completa",
-      "offlineShort": "Sin conexión",
+      "fullMode": "Vista previa interactiva",
+      "offlineMode": "Vista previa restringida",
+      "fullShort": "Interactiva",
+      "offlineShort": "Restringida",
       "modeControl": "Modo de vista previa: {mode}",
       "modeDefaultOption": "{mode} (predeterminado)",
       "modeDefaults": "Configuración predeterminada",
-      "switchFull": "Cambiar a vista previa con red completa",
-      "switchOffline": "Cambiar a vista previa sin conexión",
+      "switchFull": "Cambiar a vista previa interactiva",
+      "switchOffline": "Cambiar a vista previa restringida",
       "setDefaultMode": "Usar este modo de forma predeterminada",
       "restoreDefaultMode": "Restaurar el modo de vista previa predeterminado",
       "defaultModeSaved": "Modo de vista previa predeterminado guardado.",
-      "fullModeNotice": "La vista previa completa puede acceder a la red como un navegador, pero no comparte la identidad de OpenSquilla, archivos locales ni sesiones del navegador.",
-      "offlineWebLimits": "La vista previa web sin conexión ejecuta los scripts y carga los recursos del paquete en un entorno aislado de origen opaco. No se garantiza la disponibilidad de workers, service workers, almacenamiento persistente ni rutas absolutas desde la raíz; el acceso a redes externas está bloqueado.",
+      "offlineWebLimits": "Es posible que algunos contenidos externos y funciones web avanzadas no estén disponibles en la vista previa restringida.",
       "compatibilityFallback": "Esta versión de Desktop solo admite la vista previa antigua de un solo archivo.",
       "upgradeDesktopShort": "Actualizar Desktop",
       "permissionTitle": "¿Permitir el acceso de la página?",
@@ -203,6 +255,72 @@
       "integrityErrorDetail": "El artefacto guardado está dañado o ya no coincide con su suma de comprobación. Vuelve a publicarlo o descárgalo para verificarlo.",
       "invalidContent": "El contenido descargado no coincide con el tipo de artefacto.",
       "failedDetail": "Reintenta la vista previa o descarga el archivo."
+    },
+    "artifactErrors": {
+      "documentChanged": "La página cambió. Actualízala antes de volver a intentarlo.",
+      "writeBusy": "La página se está actualizando. Espera un momento y vuelve a intentarlo.",
+      "mutationNotApplied": "La página no se actualizó. Puedes volver a intentarlo.",
+      "mutationOutcomePending": "No se puede confirmar el resultado de la actualización. Abre la página para comprobarlo.",
+      "documentUnavailable": "Esta página no está disponible temporalmente. Vuelve a intentarlo.",
+      "resourceUnsupported": "Este archivo no se puede editar aquí.",
+      "permissionDenied": "No tienes permiso para actualizar esta página.",
+      "previewCapabilityExpired": "Es necesario volver a abrir la vista previa.",
+      "previewRendererFailed": "No se pudo mostrar la vista previa. Intenta volver a abrirla.",
+      "previewPageUnsupported": "Este cliente o Gateway no permite abrir esta subpágina directamente. Actualiza el software y vuelve a intentarlo.",
+      "annotationUnavailable": "Esta anotación no está disponible temporalmente.",
+      "annotationBusy": "Las anotaciones se están actualizando. Espera un momento y vuelve a intentarlo.",
+      "invalidRequest": "No se pudo completar la solicitud. Revisa la entrada y vuelve a intentarlo.",
+      "internalError": "No se pudo completar la operación. Vuelve a intentarlo.",
+      "documentEditingRetired": "Actualiza el cliente y vuelve a abrir la página para enviar anotaciones como mensajes."
+    },
+    "artifactDocument": {
+      "sections": "Secciones del documento del artefacto",
+      "preview": "Vista previa",
+      "source": "Código fuente",
+      "versions": "Versiones",
+      "changes": "Cambios",
+      "comments": "Comentarios",
+      "syncing": "Sincronizando…",
+      "publishHead": "Publicar versión actual",
+      "publishing": "Publicando…",
+      "publishFailed": "No se pudo publicar la versión actual.",
+      "downloadLatest": "Descargar la última versión",
+      "officeDownloadOnlyTitle": "La vista previa y edición de Office no están habilitadas",
+      "officeDownloadOnlyDetail": "Este cliente conserva intacto el archivo de Office original y permite descargar la última versión.",
+      "downloadOnlyTitle": "Este artefacto solo se puede descargar",
+      "downloadOnlyDetail": "La vista previa y la edición en la aplicación no están disponibles para este tipo de archivo.",
+      "noEditingClaim": "Ningún cambio aparecerá como aplicado hasta que se habilite un editor compatible.",
+      "noVersions": "Todavía no hay historial de versiones.",
+      "noChanges": "Todavía no hay cambios propuestos.",
+      "noComments": "Todavía no hay comentarios.",
+      "commentsUnavailable": "Los comentarios no están habilitados para este artefacto.",
+      "versionNumber": "Versión {generation}",
+      "versionOriginal": "Versión original",
+      "versionByYou": "Editada por ti",
+      "versionByOpenSquilla": "Actualizada por OpenSquilla",
+      "versionRestored": "Restaurada",
+      "versionUndone": "Deshecha",
+      "changeApplied": "Página actualizada",
+      "changeEdited": "Página editada",
+      "current": "Actual",
+      "operationCount": "{count} operaciones",
+      "actor": "{kind}",
+      "downloadVersion": "Descargar esta versión",
+      "restoreVersion": "Restaurar esta versión",
+      "restoring": "Restaurando…",
+      "revertChange": "Revertir este cambio",
+      "reverting": "Revirtiendo…",
+      "addComment": "Añadir un comentario",
+      "commentPlaceholder": "Escribe un comentario de revisión…",
+      "addCommentAction": "Añadir comentario",
+      "addingComment": "Añadiendo…",
+      "resolveComment": "Resolver",
+      "resolving": "Resolviendo…",
+      "restoreFailed": "No se pudo restaurar esta versión. Revisa la versión más reciente y vuelve a intentarlo.",
+      "revertFailed": "No se pudo revertir este cambio. Revisa la versión más reciente y vuelve a intentarlo.",
+      "commentCreateFailed": "No se pudo añadir el comentario. Revisa el estado actual del documento y vuelve a intentarlo.",
+      "commentResolveFailed": "No se pudo resolver el comentario. Revisa su estado actual y vuelve a intentarlo.",
+      "sourceUnavailable": "El código HTML no está disponible."
     }
   },
   "nav": {
@@ -283,8 +401,8 @@
   },
   "settings": {
     "appearance": {
-      "title": "Apariencia",
-      "desc": "Tema, idioma y preferencias de interfaz locales de este navegador. Los preajustes se aplican al instante; usa Aplicar para un ancho personalizado.",
+      "title": "Interfaz",
+      "desc": "Tema y preferencias de interfaz locales de este navegador. Los preajustes se aplican al instante; usa Aplicar para un ancho personalizado.",
       "themeLabel": "Tema",
       "themeDesc": "Sigue tu sistema o fuerza el modo claro u oscuro. El conmutador de la barra lateral es un atajo a este mismo ajuste.",
       "languageLabel": "Idioma",
@@ -469,7 +587,7 @@
       "builtin": "Integrado",
       "actions": { "add": "Añadir", "remove": "Quitar", "retry": "Reintentar", "copy": "Copiar", "saving": "Guardando…", "redetect": "Volver a detectar" },
       "mode": {
-        "title": "Modo de acceso predeterminado", "description": "Elige el modo inicial de las tareas nuevas. Seguro no se puede seleccionar si falla la comprobación.",
+        "title": "Modo de acceso predeterminado", "description": "Configura el modo de acceso global. Al elegir Seguro por primera vez se abre la configuración del entorno aislado; no se puede seleccionar si falla la inicialización o no es compatible.",
         "default": "Modo predeterminado", "safe": "Seguro", "full": "Acceso completo", "resetWarning": "Volver a mostrar el aviso al iniciar"
       },
       "setup": {
@@ -493,7 +611,18 @@
         "title": "Seguridad de red", "description": "La red pública se permite por defecto y se mantienen las protecciones SSRF y de metadatos.",
         "blockAll": "Bloquear toda la red", "blockAllDescription": "Los dominios permitidos siguen siendo excepciones.", "allowDomains": "Dominios permitidos", "denyDomains": "Dominios rechazados"
       },
-      "runtimes": { "title": "Runtimes incluidos", "description": "Seguro prioriza las herramientas incluidas; Acceso completo prioriza las del host.", "target": "Destino del paquete" },
+      "runtimes": {
+        "title": "Paquetes de ejecución", "description": "Las descargas se activan automáticamente. Seguro prioriza los paquetes instalados; Acceso completo mantiene primero las herramientas del sistema.", "target": "Destino de ejecución",
+        "allowRuntime": "Permitir {runtime}", "progress": "Descarga de {runtime}: {progress}%",
+        "states": {
+          "unknown": "Estado no disponible", "notInstalled": "No instalado", "disabled": "No activado", "installed": "Instalado", "installedVersion": "Instalado · {version}", "updatePaused": "Actualización en pausa",
+          "unsupported": "No disponible para este sistema", "corrupt": "Requiere reparación", "queued": "Esperando la descarga", "downloading": "Descargando", "downloadingProgress": "Descargando · {progress}%",
+          "verifying": "Verificando la descarga", "extracting": "Instalando", "probing": "Comprobando el entorno", "activating": "Finalizando la instalación", "cancelling": "Cancelando", "queuedRemoval": "Esperando para eliminar", "removing": "Eliminando",
+          "cancelled": "Descarga cancelada", "failed": "Error de descarga", "removeFailed": "Error al eliminar", "removeInterrupted": "Eliminación interrumpida", "interrupted": "Descarga pausada"
+        },
+        "actions": { "enable": "Activar", "download": "Descargar", "cancel": "Cancelar", "discardDownload": "Descartar descarga", "resume": "Continuar", "retry": "Reintentar", "repair": "Reparar", "remove": "Eliminar", "retryRemove": "Reintentar eliminación" },
+        "sources": { "oss": "OSS de Pekín", "github": "Versiones de GitHub" }
+      },
       "lan": {
         "listen": "Escuchar en la red local", "listenDescription": "Se enlaza a todas las interfaces locales tras reiniciar; los pares públicos siguen bloqueados.",
         "allowedCidrs": "CIDR de clientes permitidos", "cidrDescription": "Opcional. Vacío permite loopback, RFC1918 e IPv6 ULA; solo se puede restringir ese rango.",
@@ -529,30 +658,49 @@
       "moreOptionsIn": "Hay más opciones en",
       "copyConfigPath": "Copiar ruta de configuración",
       "applyLiveNote": "La mayoría de los cambios se aplican en vivo; algunos requieren reiniciar la puerta de enlace",
-      "discardTitle": "¿Descartar los cambios sin guardar?",
-      "discardBody": "Tienes ediciones sin guardar. Si cierras ahora se perderán.",
+      "discardTitle": "Cambios sin guardar",
+      "discardBody": "Guarda las ediciones antes de cerrar o descártalas.",
+      "saveAndClose": "Guardar y cerrar",
       "discardConfirmPrimary": "Descartar cambios"
     },
+    "gateway": {
+      "title": "Puerta de enlace",
+      "desc": "Conecta con la puerta de enlace y, en escritorio, gestiona el entorno local."
+    },
+    "general": {
+      "title": "General",
+      "desc": "Configura el idioma, las sesiones y las ventanas para toda la aplicación."
+    },
+    "securityPrivacy": {
+      "title": "Seguridad y privacidad",
+      "desc": "Gestiona las preferencias de diagnóstico, las vistas previas y el aislamiento de herramientas."
+    },
+    "memoryOverview": {
+      "title": "Memoria",
+      "desc": "Elige qué recuerda OpenSquilla y gestiona las funciones opcionales de aprendizaje.",
+      "autoCaptureLabel": "Captura de conversaciones",
+      "autoCaptureDesc": "Guarda localmente conversaciones y turnos sin procesar para auditoría y recuperación. No se añaden a la memoria a largo plazo ni se indexan para su consulta.",
+      "learningSummary": "Memoria y autoaprendizaje (avanzado)",
+      "learningDesc": "Las funciones de aprendizaje opcionales pueden usar tokens adicionales y requerir un reinicio.",
+      "profileImportLabel": "Importación del perfil",
+      "profileImportDesc": "Revisa e importa datos compatibles de identidad y memoria.",
+      "profileImportAction": "Abrir"
+    },
     "rail": {
-      "connection": "Conexión",
-      "runtime": "Tiempo de ejecución",
+      "gateway": "Puerta de enlace",
       "provider": "Servicio de modelos",
       "modelStrategy": "Enrutamiento de modelos",
-      "behavior": "Comportamiento",
-      "privacy": "Privacidad",
-      "sandbox": "Sandbox",
-      "memory": "Memoria y perfil",
-      "router": "Enrutador",
-      "ensemble": "Conjunto",
       "capabilities": "Capacidades",
-      "appearance": "Apariencia",
-      "keyboard": "Teclado",
+      "general": "General",
+      "interface": "Interfaz",
+      "shortcuts": "Atajos",
+      "securityPrivacy": "Seguridad y privacidad",
+      "memory": "Memoria y exportación",
       "advanced": "Avanzado",
       "groups": {
-        "gateway": "Puerta de enlace",
         "ai": "Configuración de IA",
         "preferences": "Preferencias",
-        "capabilities": "Capacidades"
+        "safetyData": "Seguridad y datos"
       }
     }
   },
@@ -581,11 +729,52 @@
     }
   },
   "setup": {
+    "capacity": {
+      "customOpenAI": "Personalizado · compatible con OpenAI",
+      "customAnthropic": "Personalizado · compatible con Anthropic",
+      "partialSaved": "Guardado: {saved}. Sin guardar: {pending}. Se conservan los valores pendientes.",
+      "providerPartialSaved": "Se guardó el proveedor. Los límites del modelo no se guardaron; se conservan los datos introducidos.",
+      "backToRouting": "Volver al enrutamiento inteligente",
+      "editSharedEnsemble": "Editar conjunto compartido",
+      "sharedEnsemble": "C3 y la fusión de modelos comparten este conjunto.",
+      "title": "Ajustes del modelo",
+      "forModel": "Ajustes del modelo — {model}",
+      "unknown": "Límites sin confirmar",
+      "contextWindow": "Ventana de contexto",
+      "maxOutputTokens": "Longitud máxima de salida",
+      "scope": "Se aplica donde se utilice este modelo con este proveedor.",
+      "current": "Actual: {value} tokens · {source}",
+      "source": {
+        "catalog": "Catálogo de modelos",
+        "default": "Valor predeterminado del sistema",
+        "config": "Configuración global",
+        "override": "Valor manual"
+      },
+      "autoValue": "Automático ({value})",
+      "autoHint": "Deja vacío para usar el valor automático; introduce un entero positivo para cambiarlo.",
+      "requestHint": "Límite de salida del modelo; las respuestas pueden ser más cortas.",
+      "localHint": "Este valor debe coincidir con el contexto configurado en tu servidor de modelos local.",
+      "serverControlled": "El servidor controla la longitud de salida.",
+      "restore": "Restaurar valores automáticos",
+      "positiveInteger": "Introduce un entero positivo o deja el campo vacío para usar el valor automático.",
+      "upgrade": "Actualiza el Gateway para ver y editar los límites. La configuración existente sigue disponible.",
+      "loadFailed": "No se pudo cargar los límites del modelo. Se conservan tus cambios.",
+      "retry": "Reintentar",
+      "draftHint": "Después de Listo, selecciona Guardar cambios en la página de ajustes.",
+      "done": "Listo",
+      "invalid": "Revisa los límites del modelo antes de guardar.",
+      "saved": "Límites del modelo guardados.",
+      "saveFailed": "No se pudo guardar los límites del modelo. Se conservan los valores pendientes.",
+      "unknownHint": "Uno o ambos límites del modelo están sin confirmar. Se usan los valores predeterminados; puedes configurar los límites aquí.",
+      "automaticSource": "Automático · {source}",
+      "unsaved": "Sin guardar",
+      "effective": "Límite efectivo: {value} tokens"
+    },
     "cli": {
       "advancedTitle": "Avanzado · CLI integrada",
       "hintBundled": "Estos comandos usan la CLI integrada en la aplicación; pégalos en una terminal para ejecutarlos.",
       "hintDev": "Modo dev: los comandos se ejecutan desde el checkout del código fuente vía uv.",
-      "restartHint": "Usa Ajustes → Runtime → Reiniciar de la aplicación para aplicar."
+      "restartHint": "Usa Ajustes → Puerta de enlace → Reiniciar para aplicar."
     },
     "common": {
       "apiKey": "Clave de API",
@@ -638,6 +827,11 @@
       "memoryOptions": "Opciones de memoria"
     },
     "provider": {
+      "moreActions": "Más acciones de {provider}",
+      "routerOutcomeSynchronized": "Las recomendaciones del Router siguen al proveedor principal guardado.",
+      "routerOutcomePreserved": "Se conservaron los niveles guardados del Router.",
+      "routerOutcomeDisabled": "El enrutamiento de modelos está desactivado; se conservaron los niveles guardados.",
+      "primarySavedAdditionalFailed": "El proveedor se guardó, pero otros ajustes no pudieron guardarse. Revísalos antes de reintentar.",
       "title": "Proveedor",
       "pageTitle": "Servicio de modelos",
       "pageDesc": "Conecta proveedores y gestiona sus credenciales y modelos.",
@@ -646,6 +840,7 @@
       "configuredSummary": "{ready} de {count} listos. La prueba envía una pequeña solicitud.",
       "configuredDesc": "Los proveedores guardados siguen disponibles para el enrutamiento hasta que los elimines. La verificación de la configuración envía una solicitud breve al modelo con los ajustes guardados; el proveedor puede aplicar cargos.",
       "activeBadge": "Activo",
+      "currentPrimary": "Proveedor principal actual",
       "editingBadge": "Editando",
       "profileReady": "Credenciales listas",
       "profileNeedsCredentials": "Necesita credenciales",
@@ -809,7 +1004,7 @@
       "runtimeDefaultsDesc": "Comportamiento global de la puerta de enlace para solicitudes normales.",
       "timeoutLabel": "Tiempo de espera de la solicitud (segundos)",
       "timeoutDesc": "Cuánto esperar la respuesta de un modelo antes de agotar el tiempo de espera; aumenta este valor para modelos locales lentos (Ollama, vLLM, LM Studio).",
-      "timeoutGlobalDesc": "Tiempo de espera global para solicitudes normales de todos los proveedores. La verificación de configuración usa 30 segundos aparte.",
+      "timeoutGlobalDesc": "Tiempo de espera global para solicitudes normales de todos los proveedores. Las comprobaciones de conexión y las pruebas del modelo usan límites fijos independientes.",
       "contextWindowLabel": "Anulación de la ventana de contexto (tokens)",
       "contextWindowDesc": "Limita el presupuesto de ensamblado del prompt para este modelo. Déjalo en blanco para usar la ventana detectada automáticamente.",
       "contextWindowIdentityLabel": "Ventana de contexto · {provider} / {model}",
@@ -860,7 +1055,14 @@
       "credentialSourceOptions": "Fuente de credenciales",
       "credentialRevealUnavailable": "Couldn't reveal the saved API key.",
       "connectionLabel": "Configuración actual",
-      "connectionDesc": "Envía una solicitud breve al modelo con la clave, el endpoint y el modelo de verificación actuales y confirma que el flujo finaliza. El proveedor puede cobrarla.",
+      "connectionDesc": "Comprueba rápidamente el acceso al endpoint y, cuando sea necesario, prueba una llamada real al modelo por streaming. El proveedor puede cobrar las pruebas del modelo.",
+      "checkConnection": "Comprobar conexión",
+      "checkingConnection": "Comprobando conexión…",
+      "cancelConnectionCheck": "Cancelar comprobación",
+      "testModel": "Probar modelo",
+      "testingModel": "Probando modelo…",
+      "cancelTest": "Cancelar prueba",
+      "testSavedModel": "Probar modelo guardado",
       "testConnection": "Verificar configuración",
       "testCurrentSettings": "Verificar configuración actual",
       "testing": "Verificando configuración…",
@@ -870,6 +1072,11 @@
       "lastVerifyFailedAgo": "Última verificación fallida · {ago}",
       "currentSettingsNotTested": "Configuración actual sin verificar",
       "endpointVerified": "Configuración verificada",
+      "reachableNotModelTested": "Endpoint accesible · modelo sin probar",
+      "endpointResponded": "El endpoint respondió — {reason}",
+      "modelVerified": "Llamada al modelo correcta",
+      "modelTimedOut": "La respuesta del modelo agotó el tiempo · verificación incompleta",
+      "reachabilityTimedOut": "La comprobación agotó el tiempo · accesibilidad sin confirmar",
       "probeMissingRequired": "Completa los campos obligatorios antes de verificar: {fields}.",
       "requiredFieldJoiner": ", ",
       "connected": "✓ Configuración verificada",
@@ -888,6 +1095,7 @@
       "failureModelNotFound": "El proveedor no reconoce este id de modelo.",
       "failureUnreachable": "No se pudo alcanzar el endpoint.",
       "failureBadRequest": "El proveedor rechazó la solicitud.",
+      "failureProbeTimeout": "Se agotó el plazo de verificación.",
       "failureGeneric": "La verificación de configuración falló.",
       "modelListLabel": "Modelos descubiertos",
       "modelOptionsToggle": "Catálogo de modelos · {count}",
@@ -919,26 +1127,50 @@
       "modelNoMatches": "No hay modelos coincidentes — puedes usar lo que escribiste.",
       "modelListTruncated": "Mostrando {shown} de {total} modelos — sigue escribiendo para acotar.",
       "modelProvenance": "Lista del proveedor en vivo · fuente de capacidades: {sources}",
-      "modelMetadataProvenance": "Lista del proveedor en vivo · valores oficiales si están disponibles; si no, valores del catálogo"
+      "modelMetadataProvenance": "Lista del proveedor en vivo · valores oficiales si están disponibles; si no, valores del catálogo",
+      "modelMultimodal": "Multimodal",
+      "modelMultimodalTitle": "Admite entradas de imagen",
+      "saveAndStart": "Guardar y empezar",
+      "saveAndMakeActive": "Guardar y establecer como principal",
+      "saveActivateUpgradeHint": "Actualiza el Gateway para guardar y activar el proveedor en una sola operación.",
+      "primaryRoleHint": "El proveedor principal gestiona las solicitudes directas predeterminadas y el respaldo. Las estrategias personalizadas conservan su configuración.",
+      "activationCredentialRequired": "Añade credenciales válidas antes de establecer este proveedor como principal.",
+      "routerConflictTitle": "Elige cómo gestionar las rutas existentes",
+      "routerConflictBody": "El Router guardado usa {conflicts}, en conflicto con {provider}. Las recomendaciones de {provider} reemplazan los niveles guardados y sin guardar. Si se ofrece, puedes desactivar el enrutamiento conservando los niveles. Cancelar mantiene el modo y los borradores.",
+      "routerUseRecommended": "Usar las rutas recomendadas del proveedor de destino",
+      "routerDisablePreserve": "Conservar las rutas y desactivar Router",
+      "alreadyActive": "El proveedor de destino ya es el principal. Este cambio de credenciales no se guardó.",
+      "primarySaveUncertain": "No se pudo confirmar el guardado. Se conservó el borrador. Comprueba la configuración antes de reintentar; un proveedor activo no confirma que se hayan guardado las credenciales."
     },
     "preset": {
-      "summary": "Plantilla de enrutamiento: {label}",
-      "desc": "Aplícala una vez para llenar Enrutamiento de modelos; edita allí los niveles activos.",
-      "customizedSummary": "Enrutamiento de modelos ya usa {label}.",
-      "customizedDesc": "Los niveles activos se editan en Enrutamiento de modelos.",
-      "synthesizedLabel": "Plantilla de enrutamiento generada",
-      "synthesizedBadge": "Plantilla generada",
-      "customize": "Ver detalles de la plantilla →",
-      "hide": "Ocultar detalles de la plantilla",
-      "apply": "Aplicar a Enrutamiento de modelos",
-      "viewInRouter": "Abrir Enrutamiento de modelos →",
-      "modeRecommended": "plantilla de enrutamiento",
-      "modeCustom": "personalizado",
-      "modeDisabled": "desactivado"
+      "modeCustom": "personalizado"
     },
     "modelStrategy": {
+      "summaryPrimary": "Proveedor principal guardado",
+      "summaryRouter": "Enrutamiento de modelos",
+      "summaryOn": "Activado",
+      "summaryOff": "Desactivado",
+      "bindingFollowPrimary": "Recomendado · sigue al principal",
+      "bindingCustom": "Niveles personalizados",
+      "bindingLegacy": "Niveles existentes · seguimiento no definido",
+      "resetRecommended": "Usar niveles recomendados de {provider}",
+      "resettingRecommended": "Actualizando niveles recomendados…",
+      "resetKeepsOff": "Actualiza los niveles; el enrutamiento sigue desactivado.",
+      "resetKeepsMode": "Reemplaza los niveles y mantiene el modo actual.",
+      "retainedDrafts": "Cambios de enrutamiento sin guardar",
+      "crossProviderDisabledMismatch": "Los niveles guardados usan otros proveedores; la ejecución entre proveedores está desactivada.",
+      "resetUpgradeHint": "Actualiza el Gateway para aplicar los niveles recomendados en una sola operación.",
+      "operationPending": "Hay otra operación de proveedor o enrutamiento en curso.",
+      "activationUpgradeHint": "Este Gateway no puede confirmar una activación segura del Router. Actualízalo para revisar y resolver los conflictos de proveedores.",
+      "savedRefreshFailed": "Guardado, pero no se pudieron actualizar los ajustes. Recárgalos antes de hacer otro cambio.",
+      "resultUncertain": "Se desconoce el resultado del guardado. Revisa los ajustes actualizados antes de reintentar.",
+      "resetTitle": "¿Usar niveles recomendados de {provider}?",
+      "resetBody": "¿Reemplazar las ediciones guardadas y sin guardar de los niveles del Router por las recomendaciones de {provider}? El modo y el interruptor del Router no cambian. Los demás ajustes sin guardar se conservan.",
+      "resetConfirm": "Reemplazar por recomendaciones",
+      "resetSaved": "Niveles recomendados de {provider} guardados; el modo no ha cambiado.",
       "title": "Enrutamiento de modelos",
       "desc": "Elige cómo se selecciona el modelo para cada solicitud.",
+      "newSessionDefault": "Este es el valor predeterminado de los chats nuevos. Los chats existentes conservan su propio modo de enrutamiento.",
       "modeTitle": "Elige cómo usar los modelos",
       "providerFirstTitle": "Añade primero un servicio de modelos",
       "providerFirst": "El enrutado de modelos necesita al menos un proveedor guardado.",
@@ -954,7 +1186,7 @@
       "advancedDesc": "Nivel de respaldo y presentación del enrutado en el chat.",
       "visualModeLabel": "Estilo del panel de decisión de enrutamiento",
       "visualModeDesc": "Cómo se muestra la decisión de enrutado en las respuestas.",
-      "crossProviderNotice": "El routing entre proveedores está activo. Revisa cada nivel antes de guardar.",
+      "crossProviderNotice": "La ejecución entre proveedores está activada.",
       "cards": {
         "router": {
           "title": "Enrutamiento inteligente de modelos",
@@ -988,7 +1220,7 @@
       "openrouterFixedDesc": "Cuando el servicio de modelos usa {provider}, el enrutamiento agregado usa cuatro modelos proponentes y un agregador.",
       "openrouterFixedProposer": "Modelo proponente",
       "openrouterFixedAggregator": "Agregador",
-      "credentialReady": "Conectado",
+      "credentialReady": "Credenciales disponibles",
       "credentialNeeded": "Se necesitan credenciales de {provider}",
       "credentialMissingEnv": "Se necesita {envKey}",
       "credentialUnknown": "Credenciales no comprobadas",
@@ -1000,6 +1232,7 @@
       "removeCandidateAria": "Quitar {model}",
       "ensembleEmpty": "Aún no hay modelos candidatos. Guarda la configuración del servicio de modelos para generar niveles de enrutamiento, o agrega candidatos manualmente.",
       "ensemblePipeline": "Cómo funciona: los modelos proponentes redactan en paralelo y el agregador fusiona los borradores en la respuesta final. Solo el agregador puede invocar herramientas.",
+      "candidateModelHint": "El ensamble de modelos aún no admite el análisis de imágenes. Para analizar imágenes, cambia a «Enrutamiento inteligente de modelos» y configura un modelo compatible con imágenes, o selecciona uno en «Modelo fijo».",
       "ensembleFlowDesc": "Varios modelos redactan en paralelo y un agregador las combina en una respuesta. Usa más llamadas.",
       "legacyDynamicNotice": "Este plan de fusión heredado sigue los niveles de modelo guardados. Conviértelo en una alineación personalizada para editar sus miembros.",
       "legacyDynamicMigrate": "Convertir en alineación personalizada",
@@ -1018,7 +1251,7 @@
       "aggregatorNote": "Fusiona todos los borradores en la respuesta final; el único miembro que puede invocar herramientas",
       "aggregatorSectionLabel": "Agregador",
       "aggregatorSectionDesc": "Exactamente un agregador produce la respuesta final. Elige el modelo más potente de tu alineación.",
-      "aggregatorInheritedNote": "Sin agregador asignado — el modelo de chat actual fusiona los borradores",
+      "aggregatorInheritedNote": "Usa el modelo actual",
       "proposerSectionLabel": "Proponentes",
       "proposerRoleLabel": "Proponente",
       "aggregatorRoleLabel": "Agregador",
@@ -1028,13 +1261,6 @@
       "presetReadOnlyHint": "Esta alineación predefinida la gestiona el proveedor.",
       "presetProviderMismatchNotice": "Los turnos siguen usando la alineación predefinida guardada de {presetProvider}, no la de {activeProvider} — vuelve a seleccionar «Predefinido» para cambiar a {activeProvider}.",
       "importTierCandidates": "Importar desde niveles de modelo",
-      "roleSelectAria": "Rol de {model}",
-      "roleUnassigned": "Sin rol",
-      "role_primary": "Principal",
-      "role_contrast": "Contraste",
-      "role_fast_check": "Verificación rápida",
-      "role_critic": "Crítico",
-      "role_aggregator": "Agregador",
       "addCandidateRoleLabel": "Rol del candidato",
       "candidateActionsAria": "Acciones para {model}",
       "replaceModel": "Reemplazar modelo",
@@ -1043,7 +1269,7 @@
       "replaceCandidateConfirm": "Reemplazar",
       "candidateDuplicate": "Este modelo ya está en la lista de proponentes.",
       "addProposer": "Agregar proponente",
-      "chooseAggregator": "Elegir agregador",
+      "chooseAggregator": "Cambiar modelo",
       "aggregatorPickerTitle": "Elegir el agregador",
       "aggregatorFromProposers": "Usar un proponente existente",
       "aggregatorOtherModel": "O elegir otro modelo",
@@ -1062,7 +1288,8 @@
       "proposerRetriesDesc": "Solo fallos reintentables; la solicitud inicial no cuenta como reintento.",
       "proposerRetriesOption": "Como máximo {count} reintentos tras la solicitud inicial",
       "runtimeLimitsLabel": "Límites de tiempo",
-      "runtimeLimits": "Proponentes {proposerTimeout}s en total · inactividad del agregador entre eventos {aggregatorTimeout}s (configurado {configuredAggregatorTimeout}s) · límite total del turno separado"
+      "runtimeLimits": "Proponentes {proposerTimeout}s en total · inactividad del agregador entre eventos {aggregatorTimeout}s (configurado {configuredAggregatorTimeout}s) · límite total del turno separado",
+      "fallbackModelLabel": "Modelo de respaldo"
     },
     "behavior": {
       "title": "Comportamiento de la sesión",
@@ -1089,6 +1316,7 @@
       "colModel": "Modelo",
       "colThinking": "Razonamiento",
       "colImage": "Imagen",
+      "imageCapabilityAutomatic": "La capacidad de imagen se detecta automáticamente a partir de los metadatos del proveedor y los resultados de las solicitudes; no requiere ajustes manuales.",
       "tierProviderAria": "Entrada de solicitud de {tier}",
       "tierProviderManagedByEnsemble": "Determinada por la fusión multimodelo",
       "tierProviderManagedByEnsembleAria": "La entrada de solicitud de {tier} la determina el plan de fusión multimodelo",
@@ -1119,7 +1347,8 @@
       "tierLegacyDynamicEnsembleSummaryGeneric": "Usa el plan de fusión guardado que sigue los niveles de modelo; si falla, usa el modelo fijo y de respaldo.",
       "tierLegacyDynamicEnsembleFallbackMissingSummary": "Usa el plan de fusión guardado que sigue los niveles de modelo; todavía no hay un modelo fijo y de respaldo utilizable configurado.",
       "tierSingleModelAnnouncement": "C3 usa un solo modelo: {model}.",
-      "tierEnsembleImageRouting": "La fusión C3 no procesa imágenes; las solicitudes de imagen siguen usando la configuración del modelo de imagen.",
+      "tierEnsembleImageRouting": "La fusión C3 recibe indicaciones de texto para las imágenes. Router solo utiliza los modelos C0–C3 configurados para procesar imágenes.",
+      "tierLegacyImageRouting": "Configuración antigua de compatibilidad: este modelo se conserva, pero no se utiliza para las imágenes de entrada. Configure un modelo compatible con imágenes en C0–C3.",
       "tierThinkingManagedByEnsemble": "Determinada por el plan de fusión",
       "tierThinkingManagedByEnsembleAria": "El razonamiento de {tier} lo determina el plan de fusión multimodelo",
       "tierThinkingAria": "Nivel de razonamiento de {tier}",
@@ -1337,6 +1566,8 @@
       "tokenLabel": "Token",
       "optional": "opcional",
       "tokenDesc": "Token de portador para puertas de enlace que requieren autenticación. Se almacena solo en esta pestaña.",
+      "tokenRequired": "Se requiere un token",
+      "reasonTokenRequired": "La autenticación falló. Los reintentos automáticos están en pausa. Introduce un token de pasarela válido y selecciona Conectar.",
       "reconnect": "Reconectar",
       "connect": "Conectar",
       "disconnect": "Desconectar"
@@ -1381,12 +1612,12 @@
       "closeBehaviorFallbackQuit": "La ejecución en segundo plano no está disponible en esta plataforma, así que al cerrar la ventana la aplicación se cerrará.",
       "closeBehaviorRetry": "Reintentar",
       "previewModeLabel": "Modo predeterminado de vista previa web",
-      "previewModeDesc": "La vista previa completa usa una sesión temporal del navegador con acceso a la red. La vista previa sin conexión mantiene JavaScript activo, pero bloquea las solicitudes de red externas.",
-      "previewModeFull": "Vista previa completa con red",
-      "previewModeOffline": "Vista previa sin conexión",
+      "previewModeDesc": "La vista previa interactiva admite funciones conectadas de la página. La vista previa restringida puede limitar algunos contenidos externos y funciones web avanzadas.",
+      "previewModeFull": "Vista previa interactiva",
+      "previewModeOffline": "Vista previa restringida",
       "previewModeSaving": "Guardando…",
-      "previewModeSaveFailed": "No se pudo guardar la configuración de vista previa web: {error}",
-      "previewModeForcedOffline": "OPENSQUILLA_PREVIEW_FORCE_OFFLINE está forzando actualmente el modo sin conexión.",
+      "previewModeSaveFailed": "No se pudo guardar la configuración de vista previa web. Inténtalo de nuevo.",
+      "previewModeForcedOffline": "La política actual requiere la vista previa restringida.",
       "resetConfirmTitle": "¿Restablecer la configuración guardada?",
       "resetConfirmBody": "Esto borra la credencial de escritorio guardada y la configuración generada. El próximo inicio vuelve a ejecutar la configuración inicial.",
       "resetConfirmPrimary": "Restablecer",
@@ -1520,7 +1751,7 @@
       "migrationCompleteDismiss": "Cerrar"
     },
     "keyboard": {
-      "title": "Teclado",
+      "title": "Atajos",
       "desc": "Atajos globales para este navegador. Los cambios se aplican al instante; no es necesario guardar.",
       "addModifier": "Añade {modifier} (y opcionalmente ⇧ / ⌥) a la tecla.",
       "conflict": "Ya lo usa «{label}».",
@@ -1531,12 +1762,11 @@
     },
     "advanced": {
       "title": "Avanzado",
-      "desc": "Preferencias experimentales del cliente para este navegador. Se aplican al instante; no es necesario guardar. Los elementos marcados con",
+      "desc": "Funciones de memoria menos habituales, opciones experimentales y herramientas de gestión. Algunos ajustes se guardan mediante la puerta de enlace; las preferencias del cliente se aplican al instante. Los elementos marcados con",
       "reload": "recargar",
       "descReloadSuffix": "surten efecto tras actualizar la página.",
-      "foldLabel": "Nuevo renderizado de turnos en vivo",
-      "foldDesc": "Construye la tarjeta de trabajo en streaming desde un registro ordenado de eventos. Desactívalo solo para restaurar temporalmente el renderizado compatible.",
-      "foldAria": "Nuevo renderizado de turnos en vivo (surte efecto tras recargar)",
+      "experimentsGroup": "Experimentos",
+      "managementGroup": "Gestión",
       "revealLabel": "Ventana de revelado de la respuesta (ms)",
       "revealDesc": "Mantén el revelado de la respuesta en vivo en una ventana [mín., máx.] para que el enrutador pueda decidir primero. mín. ≤ máx.",
       "revealMinAria": "Milisegundos mínimos de revelado de la respuesta",
@@ -1557,18 +1787,19 @@
       "dataMaintenanceAria": "Abrir el mantenimiento de datos",
       "runTraceLabel": "Panel de traza de ejecución en Registros",
       "runTraceDesc": "Hace que las líneas de registro sean interactivas y abre un panel de detalle de pasos por nodo para cada línea en la vista de Registros.",
-      "runTraceAria": "Panel de traza de ejecución en Registros (surte efecto tras recargar)"
+      "runTraceAria": "Panel de traza de ejecución en Registros (surte efecto tras recargar)",
+      "configFileLabel": "Archivo de configuración",
+      "configFileDesc": "Puedes ajustar más opciones en el archivo de configuración."
     },
     "privacy": {
-      "title": "Privacidad",
-      "statusEnabled": "Los informes de red están activados.",
-      "statusDisabled": "Los informes de red están desactivados.",
-      "statusDisabledByEnv": "Los informes de red están desactivados por una variable de entorno.",
-      "disableNetworkObservabilityLabel": "Desactivar los informes de red",
-      "disableNetworkObservabilityDesc": "Detiene la telemetría de instalación y de uso diario, las comprobaciones de actualizaciones en segundo plano, los identificadores seudónimos de sesión y la cabecera opcional X-OpenSquilla-Install-Id entre sesiones, enviada de forma predeterminada solo a la API HTTPS oficial de TokenRhythm. El ID de instalación persistente puede derivarse de datos MAC/IP locales; nunca se envían las direcciones originales. Los entornos CI/pruebas y la exclusión heredada de telemetría también lo suprimen; desactivar solo las actualizaciones no. Tus propias solicitudes de modelo siguen funcionando.",
-      "memoryAutoCaptureLabel": "Captura automática de memoria",
-      "memoryAutoCaptureDesc": "Permite que OpenSquilla guarde información útil de las conversaciones en la memoria a largo plazo.",
-      "save": "Guardar privacidad"
+      "statusDisabledByEnv": "Desactivados por una configuración del entorno.",
+      "statusNotChosen": "Todavía no se ha guardado ninguna elección. No se envían datos hasta que se active.",
+      "reliabilityDiagnosticsLabel": "Diagnósticos de estabilidad",
+      "reliabilityDiagnosticsDesc": "Comparte resultados de operaciones, duraciones y huellas de error que preservan la privacidad para diagnosticar cierres y fallos. Nunca se incluye el contenido de conversaciones o archivos.",
+      "productAnalyticsLabel": "Análisis de producto y crecimiento",
+      "productAnalyticsDesc": "Comparte hitos de activación y el número de ejecuciones de MetaSkill y del modo de programación una vez iniciadas realmente, para medir la conversión y el uso de funciones. Nunca se incluyen el contenido de las conversaciones, los parámetros de tareas, los archivos ni los ID de cuenta sin transformar; se utiliza un identificador analítico aleatorio y específico.",
+      "networkReportingLabel": "Envío de diagnósticos y estadísticas de uso",
+      "networkReportingDesc": "Envía diagnósticos y estadísticas de uso anónimos, incluido el número de ejecuciones reales de MetaSkill y del modo de programación. También controla la búsqueda de actualizaciones. No incluye conversaciones, parámetros de tareas ni archivos."
     },
     "toast": {
       "loadFailed": "No se pudieron cargar los ajustes: {error}",
@@ -1581,6 +1812,7 @@
       "providerProfileRemoved": "Se eliminó {provider}.",
       "providerProfileRemovedImageEnv": "Se eliminó {provider} del servicio de modelos. La generación de imágenes sigue disponible mediante {envKey}.",
       "providerProfileRemovedImageNeedsCredential": "Se eliminó {provider}. La generación de imágenes conservó el proveedor y el modelo, pero ahora necesita una credencial.",
+      "providerRemovedRouterDisabled": "Se eliminó {provider}. El enrutamiento de modelos se desactivó porque sus niveles guardados usan otro proveedor.",
       "providerCredentialRemoved": "Se eliminaron las credenciales de {provider}.",
       "providerCredentialExternalStillActive": "Se eliminó la referencia a las credenciales de {provider} guardada en OpenSquilla, pero la variable de entorno del sistema {envKey} sigue proporcionando credenciales.",
       "providerActivated": "{provider} está activo.",
@@ -1594,8 +1826,6 @@
       "routerSaved": "Enrutador guardado.",
       "routerSavedRestart": "Enrutador guardado. Se requiere reiniciar.",
       "ensembleSaved": "Conjunto guardado.",
-      "presetApplied": "Preajuste de enrutamiento aplicado.",
-      "presetAppliedRestart": "Preajuste de enrutamiento aplicado. Se requiere reinicio.",
       "channelSaved": "Canal guardado: configuración validada localmente; usa «Probar conexión» para verificar las credenciales",
       "channelSavedLive": "Canal guardado y aplicado — en ejecución con la nueva configuración",
       "channelStartFailed": "Canal guardado, pero no pudo iniciarse — revisa su estado para ver el error y reintenta con Reiniciar",
@@ -1603,6 +1833,8 @@
       "memorySurface": "Incrustación de memoria",
       "memorySaved": "Memoria guardada.",
       "memorySavedRestart": "Memoria guardada. Se requiere reiniciar para los cambios de incrustación.",
+      "captureSaved": "Captura de conversaciones guardada.",
+      "captureSavedRestart": "Captura de conversaciones guardada. Se requiere reiniciar.",
       "imageSaved": "Generación de imágenes guardada.",
       "noAudioChanges": "No hay cambios de audio que guardar.",
       "audioSaved": "Audio guardado.",
@@ -1619,7 +1851,10 @@
       "channelEnabled": "Canal activado. Se requiere reiniciar.",
       "channelEnabledLive": "Canal habilitado e iniciado.",
       "channelDisabled": "Canal desactivado. Se requiere reiniciar.",
-      "channelDisabledLive": "Canal deshabilitado y detenido."
+      "channelDisabledLive": "Canal deshabilitado y detenido.",
+      "providerSavedAndActivated": "Se guardó {provider} y se estableció como principal.",
+      "modelStrategyPartialSaved": "Se guardaron algunos ajustes. El cambio del proveedor principal no se completó; los cambios pendientes siguen en el formulario.",
+      "modelStrategyPartialSaveUncertain": "Se guardaron algunos ajustes. No se pudo confirmar el cambio del proveedor principal; comprueba el estado guardado. Los cambios pendientes siguen en el formulario."
     },
     "needs": {
       "noApiKey": "No se requiere clave API.",
@@ -1750,10 +1985,98 @@
           "label": "Ventana de agrupación (s)"
         },
         "transport_name": {
+          "label": "Modo de conexión",
           "choices": {
             "polling": "Sondeo (polling)",
             "webhook": "Webhook"
           }
+        },
+        "access_token": {
+          "label": "Token de acceso"
+        },
+        "agent_id_int": {
+          "label": "ID de agente (entero)"
+        },
+        "app_password": {
+          "label": "Contraseña de aplicación"
+        },
+        "app_token": {
+          "label": "Token a nivel de aplicación (xapp-...)"
+        },
+        "application_id": {
+          "label": "ID de aplicación"
+        },
+        "cool_app_code": {
+          "label": "Cool App Code"
+        },
+        "corp_id": {
+          "label": "ID de organización"
+        },
+        "default_channel_id": {
+          "label": "ID de canal predeterminado"
+        },
+        "device_id": {
+          "label": "ID de dispositivo"
+        },
+        "domain": {
+          "label": "Dominio"
+        },
+        "drop_pending_updates": {
+          "label": "Descartar actualizaciones pendientes"
+        },
+        "encoding_aes_key": {
+          "label": "Clave AES de codificación"
+        },
+        "encrypt_key": {
+          "label": "Clave de cifrado"
+        },
+        "encryption": {
+          "label": "Cifrado"
+        },
+        "gateway_url": {
+          "label": "URL de la pasarela"
+        },
+        "intents": {
+          "label": "Máscara de bits de intents"
+        },
+        "password": {
+          "label": "Contraseña"
+        },
+        "poll_idle_sleep_s": {
+          "label": "Espera inactiva de sondeo (s)"
+        },
+        "poll_limit": {
+          "label": "Límite de sondeo"
+        },
+        "poll_timeout_s": {
+          "label": "Tiempo de espera de sondeo (s)"
+        },
+        "reply_in_thread": {
+          "label": "Responder en hilo"
+        },
+        "robot_code": {
+          "label": "Código de robot"
+        },
+        "slack_channel_id": {
+          "label": "ID de canal predeterminado"
+        },
+        "token": {
+          "label": "Token de bot (xoxb-...)"
+        },
+        "verification_token": {
+          "label": "Token de verificación"
+        },
+        "webhook_path": {
+          "label": "Ruta del webhook"
+        },
+        "webhook_secret_token": {
+          "label": "Token secreto del webhook"
+        },
+        "webhook_url": {
+          "label": "URL de webhook (solo webhook)"
+        },
+        "websocket_url": {
+          "label": "URL de WebSocket"
         }
       },
       "groups": {
@@ -2189,6 +2512,13 @@
       "enable": "Activar",
       "disable": "Desactivar",
       "notReported": "No informado",
+      "transport": {
+        "polling": "Sondeo (polling)",
+        "webhook": "Webhook",
+        "websocket": "WebSocket",
+        "http_sync": "Sincronización HTTP",
+        "mixed": "Múltiples modos de conexión"
+      },
       "tabs": {
         "overview": "Resumen",
         "pairings": "Miembros",
@@ -2430,6 +2760,9 @@
       "addAutomation": "Añadir automatización",
       "heroTitle": "Inicia tu primera automatización",
       "heroHint": "Deja que OpenSquilla gestione automáticamente recordatorios, organización, comprobaciones y tareas de agentes a la hora programada.",
+      "runningTitle": "Automatizaciones en ejecución",
+      "runningSummary": "{enabled} de {total} tareas activadas",
+      "enabledLabel": "Activadas",
       "overviewDesc": "Consulta el estado de las automatizaciones y la actividad reciente.",
       "templateDesc": "Elige un escenario para completar el horario y las instrucciones de la tarea.",
       "selectedCount": "{count} seleccionados",
@@ -2821,17 +3154,16 @@
       "installed": "Instalado",
       "add": "Añadir"
     },
-    "skillCard": {
-      "subSkillsTitle": "Subhabilidades que usa esta metahabilidad",
-      "uses": "usa",
-      "dependencies": "Dependencias declaradas",
-      "pythonCount": "Paquetes de Python: {count}",
-      "binaryCount": "Binarios: {count}",
-      "envCount": "Variables de entorno: {count}",
-      "missingCount": "Dependencias faltantes: {count}",
-      "advisoryCount": "Avisos: {count}"
-    },
     "skillDetail": {
+      "allowUse": "Allow use",
+      "allowUseHelp": "Applies to every skill with this name. Dependencies are installed separately.",
+      "enable": "Allow use",
+      "disable": "Disable use",
+      "saving": "Saving…",
+      "enabledSaved": "Skill use allowed.",
+      "disabledSaved": "Skill use disabled.",
+      "refreshPending": "Saved, but live refresh failed. Restart the Gateway before using this skill.",
+      "disabledContent": "Use is disabled. Allow use to read the skill instructions.",
       "dialogLabel": "Detalles de la habilidad: {name}",
       "triggers": "Disparadores",
       "composition": "Composición ({kind}, {count} subhabilidades)",
@@ -2890,7 +3222,16 @@
       "clearActivity": "Borrar actividad",
       "expandActivity": "Expandir actividad de instalación",
       "collapseActivity": "Contraer actividad de instalación",
+      "selectSkillDirectory": "Selecciona un directorio de habilidades",
+      "installPhase": {
+        "resolving": "Resolviendo la fuente",
+        "downloading": "Descargando archivos",
+        "scanning": "Analizando el contenido",
+        "committing": "Guardando la instalación"
+      },
       "queueStatus": {
+        "waiting": "Esperando el resultado de instalación",
+        "selection_required": "Elegir directorio",
         "queued": "En cola",
         "installing": "Instalando",
         "cancelling": "Cancelando",
@@ -3220,9 +3561,100 @@
     }
   },
   "chat": {
+    "skillPalette": {
+      "title": "Commands and skills",
+      "command": "Commands",
+      "skill": "Skills",
+      "meta": "Workflows",
+      "empty": "No matching commands or skills",
+      "loading": "Loading skills…",
+      "autoHint": "Desplázate o busca por nombre · Selección automática de habilidades",
+      "upgrade": "Update the Gateway to select skills for a message.",
+      "loadFailed": "Skills could not be loaded. Close and reopen the menu to retry.",
+      "disabled": "Disabled · Manage",
+      "needsSetup": "Needs setup · Manage",
+      "manualOnly": "Manual use only",
+      "thisMessage": "This message",
+      "remove": "Remove {name} from this message",
+      "queuedHint": "This message will run after the current task.",
+      "limit": "Select up to 16 skills per message.",
+      "metaTextOnly": "This workflow accepts text. Keep attachments and selected skills in a separate message.",
+      "commandAtStart": "Use this command at the start of a message.",
+      "usage": "Usage: {tokens} tokens",
+      "usageFailed": "Unable to load usage. Try again.",
+      "workflowTitle": "Start {name}",
+      "workflowRequest": "What would you like this workflow to do?",
+      "loaded": "Loaded",
+      "failed": "Load failed",
+      "loadingSkill": "Loading",
+      "user": "User selected",
+      "auto": "Automatic",
+      "selected": "Selected",
+      "unsupported": "Update the Gateway before sending a message with selected skills.",
+      "continue": "Continue",
+      "commandWithSkills": "Selected skills apply to a chat message. Remove the skill labels before running a command.",
+      "commandDescriptions": {
+        "new": "Iniciar un chat nuevo",
+        "compact": "Reducir el contexto actual",
+        "goal": "Establecer un objetivo continuo",
+        "meta": "Elegir un flujo de trabajo",
+        "plan": "Planificar la tarea actual",
+        "reset": "Restablecer la conversación",
+        "usage": "Ver el uso de tokens"
+      },
+      "items": {
+        "xlsx": {
+          "name": "Excel spreadsheets",
+          "description": "Create, edit, and analyze spreadsheets"
+        },
+        "docx": {
+          "name": "Word documents",
+          "description": "Create and edit documents"
+        },
+        "pptx": {
+          "name": "PowerPoint slides",
+          "description": "Create and edit presentations"
+        },
+        "pdf": {
+          "name": "PDF tools",
+          "description": "Read, merge, and edit PDFs"
+        },
+        "github": {
+          "name": "GitHub",
+          "description": "Work with issues and pull requests"
+        },
+        "html": {
+          "name": "Web pages",
+          "description": "Build and edit HTML pages"
+        },
+        "webpage": {
+          "name": "Website builder",
+          "description": "Build a complete website"
+        },
+        "kidsProject": {
+          "name": "Kids’ projects",
+          "description": "Plan a creative project for children"
+        },
+        "shortDrama": {
+          "name": "Short drama",
+          "description": "Turn an idea into a video"
+        },
+        "skillCreator": {
+          "name": "Workflow builder",
+          "description": "Combine skills into a workflow"
+        },
+        "paperWriting": {
+          "name": "Academic writing",
+          "description": "Research and draft a paper"
+        }
+      }
+    },
     "sessionCreated": {
       "title": "Chat creado",
-      "open": "Abrir chat"
+      "open": "Abrir chat",
+      "fallbackTitle": "Chat {suffix}",
+      "deleted": "Eliminado",
+      "missing": "La sesión se eliminó o no existe"
     },
     "promptCacheKeepalive": {
       "action": "Mantener caché del prompt",
@@ -3247,13 +3679,29 @@
       "autoPauseLabel": "Pausa automática",
       "states": { "off": "Desactivado", "waiting": "Esperando un prefijo estable", "scheduled": "Programado", "probing": "Sondeando", "paused": "Límite de inactividad alcanzado; esperando el siguiente mensaje", "stopped": "Detenido tras fallo" }
     },
+    "sendPending": "Enviando…",
     "send": "Enviar",
     "sendQueues": "Enviar (se pone en cola hasta después de la respuesta actual)",
     "sendSteers": "Enviar (redirige la respuesta actual ahora)",
     "sendQueuesUntilCompaction": "Enviar (se pone en cola hasta que termine la compactación)",
     "stopResponse": "Detener respuesta actual",
     "stopResponseEsc": "Detener respuesta actual (Esc)",
+    "stoppingResponse": "Deteniendo de forma segura… Los mensajes nuevos se pondrán en cola.",
     "messageToSend": "Mensaje que enviar",
+    "promptAnnotations": {
+      "label": "Anotaciones", "draftLabel": "Anotaciones de página pendientes", "sentLabel": "Anotaciones de página", "element": "Zona seleccionada",
+      "targetLabel": "{kind}: {text}",
+      "targetKinds": { "heading": "Título", "button": "Botón", "link": "Enlace", "image": "Imagen", "input": "Campo", "form": "Formulario", "section": "Sección", "list": "Lista", "table": "Tabla", "text": "Texto", "region": "Zona", "element": "Zona seleccionada" },
+      "emptyDraft": "Añadir una instrucción", "stale": "No se pudo localizar esta zona en la página actual",
+      "editingBlocked": "Añade o cancela la anotación que estás editando antes de enviar.",
+      "staleBlocked": "No se pudo localizar esta zona en la página actual. Aun así, puedes enviarla a la IA.",
+      "emptyBlocked": "Completa todas las instrucciones del artefacto.", "tooLongBlocked": "Acorta las instrucciones a 16 KiB de texto UTF-8 antes de enviarlas.", "editLabel": "Editar instrucción del artefacto",
+      "removeLabel": "Eliminar instrucción del artefacto", "updateFailed": "No se pudo guardar la instrucción del artefacto.",
+      "discardFailed": "No se pudo eliminar la instrucción del artefacto.", "focusUnavailable": "No se pudo localizar esta zona en la página actual. Aun así, puedes enviarla a la IA.",
+      "reuseLabel": "Copiar como anotación nueva", "reuseDescription": "Copia la solicitud de cambio y elige su objetivo en la página.", "reuseUnavailable": "No se pudo copiar esta solicitud de cambio. Abre la página correspondiente y elige su objetivo.", "applyPrompt": "Aplica las anotaciones de página adjuntas.",
+      "status": { "unknown": "No se pudo actualizar la página", "not_attempted": "No se pudo actualizar la página", "applied": "Página actualizada", "appliedCorrected": "Página actualizada", "not_applied": "No se pudo actualizar la página", "conflict": "No se pudo actualizar la página", "ambiguous": "Comprobando la actualización" },
+      "statusDetail": { "unknown": "Abre la página para comprobarlo.", "not_attempted": "La página no se actualizó.", "applied": "", "not_applied": "Inténtalo de nuevo.", "conflict": "Abre la página e inténtalo de nuevo.", "ambiguous": "Abre la página para comprobarlo antes de reintentarlo." }
+    },
     "placeholder": "Envía un mensaje...",
     "placeholderCompact": "Mensaje...",
     "placeholderLanding": "Asigna una tarea o pregunta lo que quieras",
@@ -3294,17 +3742,21 @@
     "loadingSession": "Restaurando el historial de la conversación…",
     "loadingSessionDescription": "Puedes seguir usando la conversación mientras se carga el historial.",
     "loadSessionFailed": "Historial de la conversación no disponible temporalmente",
-    "loadSessionDescription": "Es posible que la conexión se haya interrumpido o que el servicio de historial no esté disponible temporalmente. Vuelve a cargar para intentarlo de nuevo.",
+    "loadSessionDescription": "El historial de la conversación no está disponible temporalmente.",
     "reloadSession": "Volver a cargar el historial",
     "retryingSession": "Volviendo a cargar el historial…",
     "retryingSessionDescription": "Restaurando el historial de la conversación…",
     "retryingSessionAction": "Volviendo a cargar…",
     "liveConnecting": "Restaurando las actualizaciones en tiempo real…",
+    "liveConnectingConnected": "Gateway conectado. Restaurando las actualizaciones en tiempo real de esta sesión…",
+    "gatewayReconnecting": "Reconectando con el Gateway…",
+    "automaticRecoveryDescription": "La recuperación es automática. Puedes seguir editando; el texto y los archivos sin enviar se conservan aquí.",
     "liveUnavailable": "Las actualizaciones en tiempo real no están disponibles temporalmente",
-    "liveUnavailableDescription": "El historial sigue disponible. Vuelve a conectarte antes de enviar.",
+    "liveUnavailableDescription": "El historial sigue disponible. El envío se reanudará cuando se recuperen las actualizaciones en tiempo real.",
+    "liveUnavailableConnectedDescription": "La pasarela está conectada. Las actualizaciones en tiempo real de esta sesión no están disponibles temporalmente.",
     "reconnectLive": "Volver a conectar",
     "liveSendBlockedConnecting": "Se están restaurando las actualizaciones en tiempo real. Tu borrador está guardado.",
-    "liveSendBlockedDegraded": "Vuelve a conectar las actualizaciones en tiempo real antes de enviar. Tu borrador está guardado.",
+    "liveSendBlockedDegraded": "Las actualizaciones en tiempo real no están disponibles temporalmente. Tu borrador está guardado.",
     "noMessagesYet": "Aún no hay mensajes.",
     "newChat": "Nueva tarea",
     "chatWithSuffix": "Chat {suffix}",
@@ -3347,7 +3799,7 @@
     "audioUnsupported": "Este navegador no puede reproducir este formato de audio. Descarga el archivo en su lugar.",
     "playVideo": "Reproducir vídeo",
     "videoLoadFailed": "No se pudo cargar el vídeo.",
-    "videoUnsupported": "Este navegador no puede reproducir este formato de vídeo. Descarga el archivo en su lugar.",
+    "videoUnsupported": "Este navegador no puede reproducir este vídeo. Descárgalo en su lugar.",
     "previewOf": "Vista previa: {title}",
     "closePreview": "Cerrar vista previa",
     "previousImage": "Imagen anterior",
@@ -3356,7 +3808,6 @@
     "previewDownload": "Descargar vista previa",
     "previewTimedOut": "Se agotó el tiempo de la vista previa.",
     "previewFailed": "No se pudo cargar la vista previa.",
-    "videoUnsupported": "Este navegador no puede reproducir este vídeo. Descárgalo en su lugar.",
     "loadVideoPreview": "Cargar vista previa del vídeo",
     "loadVideoPreviewFor": "Cargar vista previa del vídeo {title}",
     "videoPreviewLoading": "Cargando la vista previa del vídeo. Puedes cancelar la descarga.",
@@ -3388,6 +3839,24 @@
     "subagentPrefix": "Subagente: ",
     "subagentCompletion": "Finalización del subagente",
     "turnFailed": "El turno falló",
+    "copyDiagnosticId": "Copiar ID de diagnóstico",
+    "copiedDiagnosticId": "ID de diagnóstico copiado",
+    "copyDiagnosticFailed": "No se pudo copiar. Selecciona el ID de arriba y cópialo manualmente.",
+    "partialFailureNote": "La respuesta anterior se conservó, pero este turno terminó con un error.",
+    "providerFailure": {
+      "rate_limited": "El proveedor está limitando las solicitudes. Inténtalo más tarde.",
+      "provider_overloaded": "El proveedor del modelo está ocupado temporalmente. Inténtalo más tarde.",
+      "auth_invalid": "El proveedor rechazó las credenciales. Compruébalas en los ajustes del proveedor.",
+      "context_overflow": "La solicitud supera el contexto del modelo. Acórtala o elige un modelo con un contexto mayor.",
+      "unsupported_feature": "El proveedor no admite esta solicitud. Comprueba las capacidades del modelo seleccionado.",
+      "insufficient_credits": "La cuenta del proveedor no tiene saldo suficiente. Comprueba el saldo o los ajustes de facturación.",
+      "model_not_found": "El modelo configurado no está disponible. Comprueba su nombre y tus permisos de acceso.",
+      "transport_transient": "Se interrumpió la conexión con el proveedor. Comprueba tu conexión y el estado del proveedor.",
+      "policy_refusal": "El proveedor rechazó la solicitud por su política. Revisa la solicitud y la política del proveedor.",
+      "empty_response": "El proveedor no devolvió una respuesta. Inténtalo de nuevo o elige otro modelo.",
+      "malformed_response": "El proveedor devolvió una respuesta no válida. Inténtalo de nuevo o elige otro modelo.",
+      "bad_request": "El proveedor rechazó la solicitud. Comprueba la solicitud y los ajustes del modelo."
+    },
     "restartInterruptedTitle": "El reinicio de OpenSquilla interrumpió esta tarea.",
     "restartInterruptedGuidance": "Esta tarea no continuará automáticamente. Revisa los resultados existentes o las acciones de las herramientas y, después, edita la solicitud original o continúa la conversación.",
     "usageAccountingBlockedTitle": "La contabilidad de uso no está disponible temporalmente",
@@ -3402,6 +3871,7 @@
     "provenance": {
       "cron": "Cron",
       "scheduled": "Programado",
+      "scheduledTrigger": "Activación programada",
       "cronSource": "Programado por {tool}"
     },
     "sandboxSetup": {
@@ -3437,6 +3907,8 @@
     "aiModelEnsembleRouter": "Enrutador agregado de modelos de IA",
     "routerFx": {
       "selectedModel": "El enrutador seleccionó {model}",
+      "executionModel": "Modelo en ejecución: {model}",
+      "executionModelCompleted": "Ejecutado por {model}",
       "ensembleModel": "Fusión multimodelo",
       "ensembleSelecting": "Enrutador agregado de modelos de IA · seleccionando candidatos",
       "ensembleHandedOff": "Enrutador agregado de modelos de IA · entregado al agente",
@@ -3489,6 +3961,7 @@
         "rateLimited": "Límite de solicitudes · reintento en {seconds}s",
         "retryWait": "Reintento en {seconds}s",
         "retrying": "Reintentando {attempt}/{limit}",
+        "retryingWithoutLimit": "Reintentando · intento {attempt}",
         "fallback": "Cambiando al modelo alternativo"
       },
       "purpose": {
@@ -3524,7 +3997,8 @@
       },
       "more": "{count} más",
       "stale": "Sigue trabajando — sin señal reciente",
-      "liveStep": "paso {n}"
+      "liveStep": "paso {n}",
+      "recordIncomplete": "El registro de actividad está incompleto; se muestra la vista de historial compatible."
     },
     "suggestedTasks": "Tareas sugeridas",
     "greetingMorning": "Buenos días.",
@@ -3549,11 +4023,23 @@
       "cancelled": "Cancelado"
     },
     "toolModal": {
+      "retry": "Reintentar",
+      "logPending": "El registro de ejecución aún se está guardando. Vuelva a intentarlo cuando termine el comando.",
+      "copyPage": "Copiar esta página",
       "tree": "Árbol",
       "raw": "Crudo",
       "wrapLines": "Ajustar líneas",
       "preserveLines": "Conservar ancho de línea",
-      "contentMeta": "{type} · {lines} líneas · {chars} caracteres"
+      "contentMeta": "{type} · {lines} líneas · {chars} caracteres",
+      "executionLog": "Ver registro de ejecución",
+      "toolResult": "Resultado de la herramienta",
+      "characterOffset": "Posición del carácter",
+      "go": "Ir",
+      "previous": "Anterior",
+      "next": "Siguiente",
+      "logRange": "Caracteres {start}–{end} de {total}",
+      "logReadFailed": "No se pudo cargar el registro de ejecución. Inténtalo de nuevo.",
+      "logIncomplete": "El registro está incompleto. Solo está disponible la salida guardada."
     },
     "approval": {
       "required": "Aprobación requerida",
@@ -3598,6 +4084,8 @@
       }
     },
     "plan": {
+      "hidePlan": "Ocultar plan",
+      "showPlan": "Mostrar plan",
       "label": "Plan",
       "process": "Proceso de planificación",
       "revision": "Revisión {id}",
@@ -3650,7 +4138,7 @@
     },
     "planMode": {
       "label": "Modo de plan",
-      "readOnly": "El agente investiga y propone un plan sin modificar archivos.",
+      "readOnly": "Investigar y discutir el plan antes de implementarlo. Las pruebas y compilaciones siguen los permisos habituales.",
       "nextTurn": "Se aplica al siguiente turno",
       "updating": "Actualizando…",
       "turnOff": "Desactivar modo de plan",
@@ -3671,11 +4159,13 @@
       "answerPlanQuestionnaire": "Responde la pregunta del plan de arriba",
       "previousQuestion": "Anterior",
       "nextQuestion": "Siguiente",
-      "outcomeDoneTitle": "Respuesta enviada · ejecución reanudada",
+      "outcomeDoneTitle": "Respuesta recibida",
       "outcomeBusyDetail": "Tu respuesta se está procesando ahora.",
-      "outcomeDoneDetail": "El agente ha aceptado esta respuesta y ha continuado.",
+      "outcomeDoneDetail": "El agente ha recibido tu respuesta.",
       "replyReceived": "Respuesta recibida · continuando la ejecución…",
       "sendingReply": "Enviando respuesta…",
+      "expiredTitle": "Pregunta caducada",
+      "expiredDetail": "Esta pregunta ya no está activa. Puedes enviar un nuevo mensaje.",
       "sendReply": "Enviar respuesta",
       "sendingContinuing": "Enviando respuesta · continuando la ejecución…"
     },
@@ -3694,6 +4184,26 @@
       }
     },
     "goal": {
+      "settings": "Configuración del objetivo",
+      "tokenBudget": "Presupuesto de tokens",
+      "noTokenBudget": "Sin límite de tokens",
+      "invalidTokenBudget": "Introduce un número entero positivo.",
+      "partialUsageHistory": "El uso anterior está incompleto y no se incluye en el presupuesto de tokens.",
+      "pendingUsageReceipts": "Esperando los datos de uso. Reanuda el objetivo cuando el uso esté completo.",
+      "usageReceiptsRecovered": "Los datos de uso están completos. Reanuda el objetivo cuando estés listo.",
+      "usageAccountingSince": "El presupuesto de tokens cuenta el uso registrado desde {time}.",
+      "usageAccountingPending": "El registro del presupuesto comienza con la próxima solicitud al modelo.",
+      "usageCoverageUnavailable": "El registro de uso no está disponible. No se puede establecer un presupuesto de tokens.",
+      "settingsNotConfirmed": "Esta conexión no ha confirmado que admita los ajustes seleccionados del objetivo. Los cambios no se aplicaron y se conservaron para volver a intentarlo.",
+      "emptyContinuations": "En pausa tras varios turnos sin salida ni actividad de herramientas. Revisa el objetivo y reanúdalo cuando estés listo.",
+      "removeTokenBudget": "Eliminar el presupuesto de tokens",
+      "executionPolicy": "Seguir ejecutando",
+      "foreground": "Mientras haya conexión",
+      "background": "En segundo plano",
+      "backgroundHint": "Continúa tras desconectarse. Reiniciar el servidor pausa el objetivo.",
+      "backgroundActive": "Segundo plano",
+      "tokenBudgetReached": "Presupuesto de tokens alcanzado",
+      "tokenBudgetUsage": "{used} / {budget} tokens",
       "placeholder": "Describe el objetivo y envía para empezar a trabajar en él",
       "modeLabel": "Modo objetivo",
       "modeDescription": "Iniciar un objetivo de larga duración",
@@ -3761,7 +4271,7 @@
         "busy": "El estado del objetivo aún se está consolidando. Arriba se muestra el estado más reciente.",
         "notResumable": "Este objetivo no se puede reanudar desde su estado actual.",
         "executionDisabled": "La ejecución de objetivos está desactivada en este espacio de trabajo.",
-        "connectionRequired": "Vuelve a conectar esta tarea antes de continuar el objetivo.",
+        "connectionRequired": "Esta tarea aún no está lista para continuar.",
         "planModeActive": "El objetivo esperará hasta que termine el modo Plan.",
         "planRunActive": "El objetivo esperará a que termine la ejecución activa del Plan.",
         "requestConflict": "Esta acción ya se usó para otra solicitud. Inténtalo de nuevo."
@@ -3785,7 +4295,11 @@
       "routerAnimationOn": "Animación del enrutador activada",
       "routerAnimationOff": "Animación del enrutador desactivada",
       "modelRouting": "Enrutamiento de modelos",
+      "sessionModelRouting": "Enrutamiento de modelos de este chat",
+      "modelRoutingSessionScope": "Los cambios solo se aplican a este chat. Un turno en curso conserva su modo actual.",
       "ensembleImageUnsupported": "Ensemble aún no admite entradas de imagen. En «Enrutamiento de modelos», usa «Enrutador monomodelo con IA» configurado para imágenes o «Desactivado» con un modelo compatible con imágenes.",
+      "imageInputUnsupported": "El modelo seleccionado no puede procesar imágenes. Elige un modelo compatible o elimina la imagen.",
+      "routingUpdateBlocked": "El enrutamiento de modelos se está actualizando. Espera antes de enviar.",
       "routingUpdateImageBlocked": "El enrutamiento de modelos se está actualizando. Espera antes de enviar imágenes.",
       "modelRoutingOff": "Desactivado",
       "modelRoutingOffDesc": "Envía cada turno al modelo seleccionado.",
@@ -3838,7 +4352,11 @@
         "generic": "La redirección no está disponible para la tarea actual. El mensaje permanece en cola."
       },
       "clearQueue": "Vaciar cola",
-      "removeMessage": "Quitar el mensaje pendiente {index}"
+      "removeMessage": "Quitar el mensaje pendiente {index}",
+      "offlineRejected": "El mensaje no fue aceptado. Edítalo para volver a intentarlo o elimínalo.",
+      "offlineQueued": "Guardado localmente. Se enviará cuando se restablezca la conexión.",
+      "identityChanged": "La identidad de la conexión ha cambiado. Vuelve a conectarte a la puerta de enlace y la cuenta originales para enviar este mensaje.",
+      "annotationUpgradeRequired": "Esta anotación pendiente usa el editor anterior. Edita el mensaje y vuelve a seleccionar la página antes de enviarlo."
     },
     "metaRuns": {
       "draft": "Borrador",
@@ -3912,6 +4430,8 @@
     "compact": {
       "compacting": "Compactando el contexto",
       "compacted": "Contexto compactado",
+      "temporarilyReduced": "Historial reducido temporalmente; continuando",
+      "summarySaved": "Resumen guardado",
       "historyPreserved": "Contexto anterior resumido; los mensajes originales siguen disponibles en el historial",
       "historyIncomplete": "Contexto anterior resumido; algunos mensajes originales no están disponibles",
       "historySummarized": "Contexto anterior resumido",
@@ -3932,6 +4452,35 @@
       "editFile": "Editar archivo",
       "createFile": "Crear archivo",
       "searchMemory": "Buscar en la memoria",
+      "readPage": "Leer página",
+      "updatePage": "Actualizar página",
+      "searchRunning": "Buscando",
+      "searchDone": "Búsqueda completada",
+      "searchFailed": "Error de búsqueda",
+      "fileReadRunning": "Leyendo archivos",
+      "fileReadDone": "Lectura de archivos completada",
+      "fileReadFailed": "Error al leer archivos",
+      "networkReadRunning": "Accediendo a la red",
+      "networkReadDone": "Acceso a la red completado",
+      "networkReadFailed": "Error de acceso a la red",
+      "commandRunning": "Ejecutando comando",
+      "commandDone": "Ejecución del comando completada",
+      "commandFailed": "Error al ejecutar el comando",
+      "subagentRunning": "Delegando tarea",
+      "subagentDone": "Delegación de tarea completada",
+      "subagentFailed": "Error al delegar la tarea",
+      "mutationRunning": "Aplicando cambios",
+      "mutationDone": "Cambios aplicados",
+      "mutationFailed": "Error al aplicar los cambios",
+      "fileWriteRunning": "Escribiendo archivo",
+      "fileWriteDone": "Archivo escrito",
+      "fileWriteFailed": "Error al escribir el archivo",
+      "fileEditRunning": "Editando archivo",
+      "fileEditDone": "Archivo editado",
+      "fileEditFailed": "Error al editar el archivo",
+      "genericRunning": "Llamando a la herramienta",
+      "genericDone": "Llamada a la herramienta completada",
+      "genericFailed": "Error en la llamada a la herramienta",
       "running": "Ejecutando",
       "failed": "Falló",
       "done": "Hecho",
@@ -3996,6 +4545,8 @@
       "waitAttachments": "Espera a que termine el procesamiento de los archivos adjuntos",
       "waitCompactionBeforeCommand": "Espera a que termine la compactación del contexto antes de ejecutar {command}.",
       "waitResponseBeforeCommand": "Espera a la respuesta actual antes de ejecutar {command}.",
+      "promptAnnotationBusy": "Espera a que termine la respuesta actual antes de enviar instrucciones del artefacto.",
+      "offlineQueueFailed": "No se pudo poner este mensaje en cola. Se conservó el borrador.",
       "queueFull": "La cola está llena — espera a que termine la respuesta actual.",
       "queuePersistenceUnavailable": "Conserva este mensaje en el editor hasta que termine la bifurcación; la recuperación duradera no está disponible.",
       "messageStillSaving": "Este mensaje aún no se ha guardado — inténtalo de nuevo en un momento.",
@@ -4036,7 +4587,8 @@
       "unknownProviderCalls": "{count} llamada al proveedor tiene uso desconocido | {count} llamadas al proveedor tienen uso desconocido"
     },
     "modelRouting": {
-      "updateFailed": "No se pudo cambiar el enrutamiento de modelos — revertido. Comprueba la conexión con la pasarela e inténtalo de nuevo."
+      "updateFailed": "No se pudo cambiar el enrutamiento de modelos — revertido. El cambio no está disponible temporalmente.",
+      "sessionUpdateFailed": "No se pudo actualizar el enrutamiento de modelos de este chat: {error}"
     },
     "routeFeedback": {
       "up": "Buena elección de modelo para este turno",
@@ -4168,17 +4720,33 @@
       "callsCount": "{count} llamadas",
       "resultsCount": "{count} resultados",
       "sectionInput": "entrada",
+      "sectionChanges": "cambios",
       "sectionDiagnostics": "diagnósticos",
       "sectionResult": "resultado",
       "sectionError": "error",
-      "viewFull": "ver completo",
+      "viewFull": "expandir contenido",
       "activityViewDetails": "ver detalles",
       "activityDetailsTitle": "detalles",
       "activityBytesWritten": "{size} escritos",
       "activityContentSize": "{lines} líneas · {characters} caracteres",
       "activityExitCode": "Código de salida {code}",
       "activityNotCompleted": "No se completó",
-      "activityPublished": "Publicado"
+      "activityPublished": "Publicado",
+      "documentErrorCategory": "Categoría: {category} ({code})",
+      "documentPreviewUnavailableCategory": "Vista previa no disponible",
+      "documentActionUnknownCategory": "Resultado de la acción desconocido",
+      "documentEditFailedCategory": "Error al editar el documento",
+      "documentPreviewUnavailableMessage": "La vista previa de edición no está disponible. No se aplicaron cambios sin confirmar.",
+      "documentActionUnknownMessage": "Es posible que la acción se haya ejecutado. Inspecciona la vista previa antes de continuar.",
+      "documentEditFailedMessage": "La operación del documento no se completó.",
+      "documentRetrySameTurn": "Política de reintento: continuar en esta tarea",
+      "documentRetryNewTurn": "Política de reintento: iniciar una tarea nueva",
+      "documentRetryNever": "Política de reintento: no reintentar",
+      "documentNextRetry": "Siguiente paso: reintentar",
+      "documentNextReinspect": "Siguiente paso: inspeccionar de nuevo",
+      "documentNextFinalize": "Siguiente paso: finalizar sin más herramientas",
+      "documentNextNewTurn": "Siguiente paso: iniciar una tarea nueva",
+      "documentNextStop": "Siguiente paso: detener"
     }
   },
   "channelStatus": {

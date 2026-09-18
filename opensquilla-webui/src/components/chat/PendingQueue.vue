@@ -31,6 +31,23 @@
       <p class="chat-pending-text" :title="displayText(item)">
         {{ displayText(item) }}
       </p>
+      <span v-if="item.retiredAnnotationInput" class="chat-pending-save-status" role="status">
+        {{ t('chat.pending.annotationUpgradeRequired') }}
+      </span>
+      <span
+        v-if="item.pendingDeliveryIdentity && item.pendingPersistenceState === 'retryable'"
+        class="chat-pending-save-status"
+        role="status"
+      >{{ t('chat.pending.offlineRejected') }}</span>
+      <span
+        v-if="item.pendingDeliveryIdentity && item.pendingPersistenceState !== 'saving'
+          && item.pendingPersistenceState !== 'cancelling'
+          && (offline || item.pendingDeliveryIdentity !== deliveryIdentity)"
+        class="chat-pending-save-status"
+        role="status"
+      >{{ t(item.pendingDeliveryIdentity !== deliveryIdentity
+        ? 'chat.pending.identityChanged'
+        : 'chat.pending.offlineQueued') }}</span>
       <span
         v-if="item.pendingPersistenceState === 'saving'"
         class="chat-pending-save-status"
@@ -44,6 +61,9 @@
         role="status"
       >
         {{ t('chat.pending.reorderRecovering') }}
+      </span>
+      <span v-if="item.selectedSkills?.length" class="chat-pending-attachments chat-pending-skills">
+        {{ item.selectedSkills.map(skill => skill.name).join(', ') }}
       </span>
       <span v-if="item.attachments?.length" class="chat-pending-attachments">
         {{ item.attachments.length }} · 📎
@@ -105,7 +125,7 @@
             <button
               type="button"
               role="menuitem"
-              :disabled="!!item.deliveryState || !!item.steerAttempt || hasUneditableMaterial(item)"
+              :disabled="!!item.deliveryState || !!item.steerAttempt || !!item.pageContext || hasUneditableMaterial(item)"
               @click="chooseEdit(item.pendingUiId)"
             >
               <Icon name="pencil" :size="15" />
@@ -119,6 +139,15 @@
         </div>
       </div>
     </article>
+    <p
+      v-if="showSteerUnavailableStatus"
+      key="steer-unavailable"
+      class="chat-pending-steer-status"
+      role="status"
+      aria-live="polite"
+    >
+      {{ steerUnavailableMessage }}
+    </p>
     <span key="reorder-announcement" class="chat-pending-announcement" aria-live="polite">
       {{ reorderAnnouncement }}
     </span>
@@ -145,13 +174,18 @@ interface PendingQueueItem {
   pendingInputId?: string
   displayTextOverride?: string
   hiddenControl?: boolean
+  retiredAnnotationInput?: boolean
+  pageContext?: import('@/types/pageContext').ChatPageContext
+  selectedSkills?: import('@/types/selectedSkills').SelectedSkillRef[]
   attachments?: Attachment[]
   deliveryState?: 'steering' | 'retryable'
   steerAttempt?: PendingSteerAttempt
   pendingPersistenceState?: 'saving' | 'staged' | 'local_only' | 'retryable' | 'cancelling'
+  pendingDeliveryIdentity?: string
 }
 
 type PendingSteerBlocker =
+  | 'skills'
   | 'controlInput'
   | 'attachment'
   | 'capability'
@@ -167,6 +201,8 @@ const props = withDefaults(defineProps<{
   steerAvailable?: boolean
   durableSteerAvailable?: boolean
   steerUnavailableMessage?: string
+  deliveryIdentity?: string | null
+  offline?: boolean
 }>(), {
   reorderEnabled: true,
 })
@@ -204,6 +240,18 @@ const effectiveMaxPending = computed(() => (
       ? 1
       : 0
   )
+))
+const showSteerUnavailableStatus = computed(() => (
+  props.steerAvailable === false
+  && Boolean(props.steerUnavailableMessage?.trim())
+  && !props.items.some(item => (
+    isSteering(item)
+    || item.deliveryState === 'retryable'
+    || isSteerRetry(item)
+  ))
+  && props.items.some(item => (
+    !item.hiddenControl
+  ))
 ))
 
 function displayText(item: PendingQueueItem): string {
@@ -265,7 +313,8 @@ function removeLabel(item: PendingQueueItem, index: number): string {
 }
 
 function canShowSteer(item: PendingQueueItem): boolean {
-  return !item.hiddenControl
+  return !item.hiddenControl && !item.retiredAnnotationInput && !item.pageContext
+    && !item.pendingDeliveryIdentity
 }
 
 function hasUnsendableAttachment(item: PendingQueueItem): boolean {
@@ -297,6 +346,7 @@ function attachmentBlockMessage(item: PendingQueueItem): string {
 }
 
 function pendingSteerBlocker(item: PendingQueueItem): PendingSteerBlocker | null {
+  if (item.selectedSkills?.length) return 'skills'
   if (isControlInput(item.text)) return 'controlInput'
   if (item.attachments?.length) return 'attachment'
   if (
@@ -320,6 +370,7 @@ function isSteerDisabled(item: PendingQueueItem): boolean {
 
 function steerTitle(item: PendingQueueItem): string {
   switch (pendingSteerBlocker(item)) {
+    case 'skills': return t('chat.skillPalette.queuedHint')
     case 'controlInput':
       return t('chat.sendQueues')
     case 'attachment':
@@ -642,6 +693,17 @@ onBeforeUnmount(() => {
   margin-top: 2px;
   line-height: 1.35;
   white-space: normal;
+}
+
+.chat-pending-skills {
+  overflow-wrap: anywhere;
+}
+
+.chat-pending-steer-status {
+  margin: -2px 4px 0;
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  line-height: 1.4;
 }
 
 .chat-pending-actions {

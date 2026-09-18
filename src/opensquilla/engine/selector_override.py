@@ -33,18 +33,37 @@ def _metadata_nonnegative_int(turn_metadata: dict[str, Any], key: str) -> int:
 
 
 def _large_context_capacity_required(turn_metadata: dict[str, Any]) -> bool:
-    return bool(turn_metadata.get("large_context_floor_min_tier")) and (
+    complete_request = bool(turn_metadata.get("large_context_capacity_required")) and (
+        _metadata_nonnegative_int(
+            turn_metadata,
+            "large_context_request_input_tokens",
+        )
+        > 0
+    )
+    legacy_floor = bool(turn_metadata.get("large_context_floor_min_tier")) and (
         _metadata_nonnegative_int(
             turn_metadata,
             "large_context_material_tokens",
         )
         > 0
     )
+    return complete_request or legacy_floor
 
 
-def _provider_config_has_request_capacity(
+def _bounded_fallback_chain_required(turn_metadata: dict[str, Any]) -> bool:
+    # A bare floor marker historically selected the bounded selector API even
+    # in light test/compatibility adapters that carried no admission metrics.
+    return _large_context_capacity_required(turn_metadata) or bool(
+        turn_metadata.get("large_context_floor_min_tier")
+    )
+
+
+def provider_config_has_request_capacity(
     config: Any,
     turn_metadata: dict[str, Any],
+    *,
+    provider: str = "",
+    model: str = "",
 ) -> bool:
     """Validate one final physical deployment against the routed material."""
 
@@ -59,11 +78,21 @@ def _provider_config_has_request_capacity(
     if not isinstance(thinking_budget, int) or isinstance(thinking_budget, bool):
         thinking_budget = MAX_THINKING_BUDGET_TOKENS
     return model_has_request_capacity(
-        provider=str(getattr(config, "provider", "") or "").strip(),
-        model=str(getattr(config, "model", "") or "").strip(),
+        provider=(
+            str(getattr(config, "provider", "") or "").strip()
+            or str(provider or "").strip()
+        ),
+        model=(
+            str(getattr(config, "model", "") or "").strip()
+            or str(model or "").strip()
+        ),
         material_tokens=_metadata_nonnegative_int(
             turn_metadata,
             "large_context_material_tokens",
+        ),
+        request_input_tokens=_metadata_nonnegative_int(
+            turn_metadata,
+            "large_context_request_input_tokens",
         ),
         thinking_budget_tokens=max(0, thinking_budget),
         context_window_override_tokens=_metadata_nonnegative_int(
@@ -89,14 +118,25 @@ def _require_provider_config_capacity(
     turn_metadata: dict[str, Any],
     *,
     reason: str,
+    provider: str = "",
+    model: str = "",
 ) -> None:
-    if _provider_config_has_request_capacity(config, turn_metadata):
+    if provider_config_has_request_capacity(
+        config,
+        turn_metadata,
+        provider=provider,
+        model=model,
+    ):
         return
-    from opensquilla.engine.capacity_admission import LargeContextCapacityError
+    from opensquilla.engine.capacity_admission import (
+        CAPACITY_CONFIGURATION_HINT,
+        LargeContextCapacityError,
+    )
 
     turn_metadata["large_context_capacity_blocked"] = True
-    turn_metadata["large_context_capacity_block_reason"] = reason
-    raise LargeContextCapacityError(reason)
+    actionable_reason = f"{reason} {CAPACITY_CONFIGURATION_HINT}"
+    turn_metadata["large_context_capacity_block_reason"] = actionable_reason
+    raise LargeContextCapacityError(actionable_reason)
 
 
 def _materialize_fallback_configs(
@@ -191,7 +231,7 @@ def _capacity_approved_fallback_entries(
     return [
         config
         for config in _materialize_fallback_configs(selector, entries)
-        if _provider_config_has_request_capacity(config, turn_metadata)
+        if provider_config_has_request_capacity(config, turn_metadata)
     ]
 
 
@@ -492,6 +532,74 @@ def _disable_selector_provider_state_replay(
         disable()
 
 
+def resolve_strict_router_fallback_chain(
+    config: Any,
+    turn_metadata: dict[str, Any],
+    *,
+    active_provider_id: str,
+    session_key: str = "",
+) -> list[object] | None:
+    """Resolve the private executable form of a strict Router fallback chain.
+
+    Turn metadata retains only provider/model identifiers.  Cross-provider
+    entries need their own configured credentials before the selector can
+    install them; same-provider entries remain compact mappings and reuse the
+    selector's active credentials.  Unresolvable cross-provider entries are
+    omitted instead of borrowing another provider's authority.
+    """
+
+    if turn_metadata.get("router_fallback_strict") is not True:
+        return None
+    raw_chain = turn_metadata.get("router_fallback_chain")
+    if not isinstance(raw_chain, list):
+        return None
+
+    active_provider = str(active_provider_id or "").strip().lower()
+    router_cfg = getattr(config, "squilla_router", None)
+    cross_provider_enabled = bool(
+        getattr(router_cfg, "cross_provider_tiers", False)
+    )
+    mismatch_policy = str(
+        getattr(router_cfg, "tier_provider_mismatch", "route") or "route"
+    ).strip().lower()
+    resolved_chain: list[object] = []
+    for raw_entry in raw_chain:
+        if not isinstance(raw_entry, dict):
+            continue
+        model = str(raw_entry.get("model") or "").strip()
+        if not model:
+            continue
+        provider = str(raw_entry.get("provider") or active_provider).strip().lower()
+        if not provider:
+            continue
+        if provider == active_provider:
+            entry = dict(raw_entry)
+            entry["provider"] = active_provider
+            resolved_chain.append(entry)
+            continue
+        if not cross_provider_enabled:
+            if mismatch_policy != "veto":
+                # Preserve the existing route-mode contract: foreign model ids
+                # execute through the configured active aggregator/provider.
+                entry = dict(raw_entry)
+                entry["provider"] = active_provider
+                resolved_chain.append(entry)
+            continue
+
+        # Keep fallback credential resolution private.  In particular, do not
+        # overwrite the selected head's routed_provider_resolution telemetry.
+        resolved = resolve_tier_provider_config(
+            config,
+            provider,
+            model,
+            session_key=session_key,
+            turn_metadata=None,
+        )
+        if resolved is not None:
+            resolved_chain.append(resolved)
+    return resolved_chain
+
+
 def apply_model_override(
     selector: Any,
     model: str,
@@ -499,6 +607,7 @@ def apply_model_override(
     turn_metadata: dict[str, Any],
     realign_routed_model: bool,
     tier_provider_config: Any | None = None,
+    strict_router_fallback_chain: Sequence[object] | None = None,
 ) -> Any:
     """Apply ``model`` to the cloned selector and resolve the provider.
 
@@ -510,8 +619,9 @@ def apply_model_override(
     ``routed_model`` intentionally records the would-be routed choice.
 
     ``tier_provider_config`` switches the turn to a cross-provider tier's
-    full ProviderConfig; the router fallback chain is skipped in that case
-    (its entries are same-provider models of the provider being left).
+    full ProviderConfig. A strict Router call may also supply an independently
+    resolved fallback chain whose cross-provider entries retain their own
+    configured credentials.
     """
     if turn_metadata.get("large_context_capacity_blocked") is True:
         from opensquilla.engine.capacity_admission import LargeContextCapacityError
@@ -522,6 +632,48 @@ def apply_model_override(
         )
         raise LargeContextCapacityError(reason)
 
+    router_fallback_chain = (
+        list(strict_router_fallback_chain)
+        if strict_router_fallback_chain is not None
+        else (
+            turn_metadata.get("router_fallback_chain")
+            if turn_metadata.get("routing_applied") is True
+            else None
+        )
+    )
+
+    def install_strict_model_chain(strict_model: str) -> None:
+        """Install a verifiably isolated Router chain or fail closed.
+
+        The optional third-party selector seam predates
+        ``preserve_existing_tail``.  Calling its legacy two-argument hook would
+        leave an opaque configured/plugin tail executable, which violates the
+        image route's authorization boundary.  A selector that cannot prove it
+        cleared that tail must not execute the turn.
+        """
+
+        if not isinstance(router_fallback_chain, list):
+            raise RuntimeError("strict router fallback chain is unavailable")
+        override_with_chain = getattr(
+            selector,
+            "override_model_with_fallback_chain",
+            None,
+        )
+        if not callable(override_with_chain):
+            raise RuntimeError(
+                "selector does not support strict router fallback isolation"
+            )
+        try:
+            override_with_chain(
+                strict_model,
+                router_fallback_chain,
+                preserve_existing_tail=False,
+            )
+        except TypeError as exc:
+            raise RuntimeError(
+                "selector does not support strict router fallback isolation"
+            ) from exc
+
     if tier_provider_config is not None and hasattr(selector, "override_provider_config"):
         _require_provider_config_capacity(
             tier_provider_config,
@@ -531,21 +683,56 @@ def apply_model_override(
                 "capacity for this attachment request."
             ),
         )
-        bounded_provider_override = getattr(
-            selector,
-            "override_provider_config_with_bounded_fallbacks",
-            None,
-        )
-        if (
-            turn_metadata.get("large_context_floor_min_tier")
-            and callable(bounded_provider_override)
-        ):
-            bounded_provider_override(
-                tier_provider_config,
-                _capacity_approved_configured_fallbacks(selector, turn_metadata),
+        if turn_metadata.get("router_fallback_strict") is True:
+            override_provider_with_chain = getattr(
+                selector,
+                "override_provider_config_with_fallback_chain",
+                None,
             )
+            if callable(override_provider_with_chain) and isinstance(
+                router_fallback_chain,
+                list,
+            ):
+                try:
+                    override_provider_with_chain(
+                        tier_provider_config,
+                        router_fallback_chain,
+                        preserve_existing_tail=False,
+                    )
+                except TypeError as exc:
+                    raise RuntimeError(
+                        "selector does not support strict router fallback isolation"
+                    ) from exc
+            else:
+                if router_fallback_chain:
+                    raise RuntimeError(
+                        "selector does not support strict router fallback isolation"
+                    )
+                try:
+                    selector.override_provider_config(
+                        tier_provider_config,
+                        preserve_existing_tail=False,
+                    )
+                except TypeError as exc:
+                    raise RuntimeError(
+                        "selector does not support strict artifact fallback isolation"
+                    ) from exc
         else:
-            selector.override_provider_config(tier_provider_config)
+            bounded_provider_override = getattr(
+                selector,
+                "override_provider_config_with_bounded_fallbacks",
+                None,
+            )
+            if (
+                _bounded_fallback_chain_required(turn_metadata)
+                and callable(bounded_provider_override)
+            ):
+                bounded_provider_override(
+                    tier_provider_config,
+                    _capacity_approved_configured_fallbacks(selector, turn_metadata),
+                )
+            else:
+                selector.override_provider_config(tier_provider_config)
         turn_metadata["routed_provider_applied"] = tier_provider_config.provider
         turn_metadata["provider_state_replay_disabled"] = "cross_provider_route"
         _disable_selector_provider_state_replay(selector, turn_metadata)
@@ -611,13 +798,13 @@ def apply_model_override(
         turn_metadata["routed_provider_fallback_model"] = str(
             getattr(current_config, "model", "") or ""
         )
+        if turn_metadata.get("router_fallback_strict") is True:
+            current_model = str(getattr(current_config, "model", "") or "").strip()
+            if not current_model:
+                raise RuntimeError("strict router fallback head is unavailable")
+            install_strict_model_chain(current_model)
         return _resolve_and_record_execution(selector, turn_metadata)
 
-    router_fallback_chain = (
-        turn_metadata.get("router_fallback_chain")
-        if turn_metadata.get("routing_applied") is True
-        else None
-    )
     override_with_fallback_chain = getattr(
         selector,
         "override_model_with_fallback_chain",
@@ -628,9 +815,10 @@ def apply_model_override(
         "override_model_with_bounded_fallback_chain",
         None,
     )
-    if turn_metadata.get("large_context_floor_min_tier") and callable(
-        override_with_bounded_fallback_chain
-    ):
+    bounded_fallbacks_required = _bounded_fallback_chain_required(turn_metadata)
+    if turn_metadata.get("router_fallback_strict") is True:
+        install_strict_model_chain(model)
+    elif bounded_fallbacks_required and callable(override_with_bounded_fallback_chain):
         approved_router_fallbacks = _capacity_approved_fallback_entries(
             selector,
             router_fallback_chain if isinstance(router_fallback_chain, list) else [],
@@ -645,6 +833,11 @@ def apply_model_override(
             approved_router_fallbacks,
             approved_configured_fallbacks,
         )
+    elif bounded_fallbacks_required:
+        # Compatibility selectors may predate the bounded-chain API. Keep the
+        # proven head executable, but never hand an opaque selector fallbacks
+        # whose physical deployment capacities cannot be audited.
+        selector.override_model(model)
     elif callable(override_with_fallback_chain) and isinstance(router_fallback_chain, list):
         override_with_fallback_chain(model, router_fallback_chain)
     else:
@@ -652,6 +845,8 @@ def apply_model_override(
     _require_provider_config_capacity(
         getattr(selector, "current_config", None),
         turn_metadata,
+        provider=active_provider or routed_provider,
+        model=model,
         reason=(
             "The final model deployment does not have proven capacity for this "
             "attachment request."

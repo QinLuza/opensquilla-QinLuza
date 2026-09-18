@@ -14,7 +14,7 @@ import type {
   SourcePart,
   StatusPart,
 } from '@/types/parts'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type { Frame, ReasoningBlock } from '@/types/turnlog'
 import {
   isEmptyToolPreview,
@@ -62,11 +62,11 @@ export interface ReconciledTextSnapshot {
 /**
  * Apply an authoritative terminal text snapshot without losing tool history.
  *
- * A strict extension is still an ordinary suffix and therefore stays after the
- * last streamed segment. A conflicting snapshot supersedes every streamed text
- * segment, but keeps tool groups in arrival order and places the one canonical
- * text segment after them. An empty snapshot intentionally clears text while
- * retaining those tool groups.
+ * A strict extension is still an ordinary answer suffix and therefore stays
+ * after the last streamed answer segment. A conflicting snapshot supersedes
+ * streamed answer text, but keeps tool groups and intermediate commentary in
+ * arrival order before the canonical answer. An empty snapshot intentionally
+ * clears answer text while retaining that work history.
  */
 export function reconcileTextSnapshot(
   segments: ChatStreamSegment[],
@@ -81,7 +81,7 @@ export function reconcileTextSnapshot(
     const suffix = snapshot.slice(accumulatedText.length)
     const next = segments.slice()
     const last = next[next.length - 1]
-    if (last?.type === 'text') {
+    if (last?.type === 'text' && last.presentation !== 'intermediate') {
       next[next.length - 1] = {
         ...last,
         raw: `${last.raw || ''}${suffix}`,
@@ -93,7 +93,9 @@ export function reconcileTextSnapshot(
     return { rawText: snapshot, segments: next, changed: true }
   }
 
-  const next = segments.filter(segment => segment.type !== 'text')
+  const next = segments.filter(segment => (
+    segment.type !== 'text' || segment.presentation === 'intermediate'
+  ))
   if (snapshot) {
     next.push({ type: 'text', raw: snapshot, html: '', dirty: true, presentation: 'answer' })
   }
@@ -148,7 +150,7 @@ function asRenderedMessage(folded: {
  * Incremental live-turn accumulator.
  *
  * `foldTurn` below intentionally stays a pure replay oracle for history and
- * parity tests.  The live UI, however, must not replay the entire accepted
+ * deterministic fold tests. The live UI must not replay the entire accepted
  * frame log for every token.  This accumulator applies each frame once and
  * only derives the small render projection when the frame scheduler publishes
  * a snapshot.
@@ -209,11 +211,34 @@ export class TurnAccumulator {
     return this.finalText ?? this.rawText
   }
 
+  /** Read bounded tool metadata without materializing the full render tree. */
+  currentToolCall(toolId: string): ChatToolCall | null {
+    const call = this.toolCallsById.get(toolId)
+    return call ? { ...call } : null
+  }
+
+  /** Return the first running tool using the same ordering as the live timeline. */
+  currentRunningToolCall(): ChatToolCall | null {
+    const call = this.toolCalls.find(candidate => candidate.isRunning)
+    return call ? { ...call } : null
+  }
+
+  hasToolBoundary(): boolean {
+    return this.toolCalls.length > 0
+      || this.segments.some(segment => segment.type === 'tool-group')
+  }
+
+  currentToolTiming(toolId: string): { startedAt: number; endedAt?: number } | null {
+    const timing = this.toolTimes.get(toolId)
+    return timing ? { ...timing } : null
+  }
+
   private ensureReasoningBlock(
     blockId: string | undefined,
     blockIndex: number | undefined,
     at: number,
     contentKind: 'summary' | 'reasoning' = 'reasoning',
+    activityOrder?: number,
   ): ReasoningBlock {
     const id = blockId || 'legacy-reasoning'
     const existing = this.reasoningBlocksById.get(id)
@@ -236,6 +261,7 @@ export class TurnAccumulator {
       status: 'streaming',
       startedAt: at,
       contentKind,
+      activityOrder,
     }
     this.reasoningBlocks.push(block)
     this.reasoningBlocksById.set(id, block)
@@ -274,10 +300,14 @@ export class TurnAccumulator {
     name: string,
     input: string,
     running: boolean,
+    activityOrder?: number,
+    authoritativeInput = false,
+    presentation?: ChatToolCall['presentation'],
   ): ChatToolCall {
     const existing = this.toolCallsById.get(toolId)
     if (existing) {
-      if (input) this.replaceToolInput(existing, input)
+      if (input || authoritativeInput) this.replaceToolInput(existing, input)
+      if (presentation) existing.presentation = presentation
       return existing
     }
 
@@ -297,7 +327,7 @@ export class TurnAccumulator {
       : `stream:tool-group:${operationKey}:${this.toolGroupSeq++}`
 
     if (lastSegment?.type !== 'tool-group' || lastSegment.groupId !== groupId) {
-      this.segments.push({ type: 'tool-group', groupId, operationKey })
+      this.segments.push({ type: 'tool-group', groupId, operationKey, activityOrder })
     }
 
     const call: ChatToolCall = {
@@ -313,6 +343,8 @@ export class TurnAccumulator {
       result: '',
       resultPreview: '',
       isOpen: false,
+      activityOrder,
+      presentation,
     }
     this.toolCalls.push(call)
     this.toolCallsById.set(toolId, call)
@@ -336,6 +368,7 @@ export class TurnAccumulator {
             html: '',
             dirty: true,
             presentation: frame.presentation,
+            activityOrder: frame.activityOrder,
           })
         } else {
           lastSegment.raw = `${lastSegment.raw || ''}${frame.text}`
@@ -347,7 +380,15 @@ export class TurnAccumulator {
         if (!this.toolTimes.has(frame.toolId)) {
           this.toolTimes.set(frame.toolId, { startedAt: frame.at })
         }
-        this.ensureCall(frame.toolId, frame.name, frame.input, true)
+        this.ensureCall(
+          frame.toolId,
+          frame.name,
+          frame.input,
+          true,
+          frame.activityOrder,
+          frame.authoritativeInput,
+          frame.presentation,
+        )
         break
       }
       case 'tool-delta': {
@@ -368,12 +409,21 @@ export class TurnAccumulator {
         break
       }
       case 'tool-result': {
-        const call = this.ensureCall(frame.toolId, frame.name, frame.input, false)
+        const call = this.ensureCall(
+          frame.toolId,
+          frame.name,
+          frame.input,
+          false,
+          frame.activityOrder,
+          frame.authoritativeInput,
+          frame.presentation,
+        )
         if (!frame.input) this.finalizeToolInput(call)
         call.isRunning = false
         call.status = frame.isError ? 'error' : 'success'
         call.isError = frame.isError
         call.result = frame.result
+        call.executionLogHandle = frame.executionLogHandle
         call.resultPreview = truncateToolPreview(frame.result, 200)
         const timing = this.toolTimes.get(call.toolId)
         if (timing && !timing.endedAt) timing.endedAt = frame.at
@@ -388,6 +438,7 @@ export class TurnAccumulator {
           frame.blockIndex,
           frame.at,
           frame.contentKind,
+          frame.activityOrder,
         )
         break
       case 'thinking': {
@@ -396,6 +447,8 @@ export class TurnAccumulator {
           frame.blockId,
           frame.blockIndex,
           frame.at,
+          'reasoning',
+          frame.activityOrder,
         )
         block.text += frame.text
         break
@@ -405,6 +458,8 @@ export class TurnAccumulator {
           frame.blockId,
           frame.blockIndex,
           frame.at,
+          'reasoning',
+          frame.activityOrder,
         )
         block.status = frame.status
         block.endedAt = frame.at
@@ -426,7 +481,11 @@ export class TurnAccumulator {
           if (displacedText?.type === 'text' && displacedText.presentation === 'answer') {
             displacedText.dirty = true
           }
-          this.segments.push({ type: 'interrupt', approvalId: frame.approvalId })
+          this.segments.push({
+            type: 'interrupt',
+            approvalId: frame.approvalId,
+            activityOrder: frame.activityOrder,
+          })
         } else {
           this.interrupts[index] = mergeInterruptData(
             this.interrupts[index]!,
@@ -442,6 +501,7 @@ export class TurnAccumulator {
           action: frame.action,
           label: frame.label,
           at: frame.at,
+          activityOrder: frame.activityOrder,
           ...(frame.id ? { id: frame.id } : {}),
           ...(frame.category ? { category: frame.category } : {}),
           ...(frame.state ? { state: frame.state } : {}),
@@ -460,6 +520,7 @@ export class TurnAccumulator {
               ...this.statusHistory[index],
               ...entry,
               at: this.statusHistory[index]!.at,
+              activityOrder: this.statusHistory[index]!.activityOrder,
             }
           }
         } else {
@@ -499,8 +560,7 @@ export class TurnAccumulator {
         // The production live answer is rendered by StreamingTextPart from
         // canonical raw text. Parsing the same growing answer here produced an
         // invisible full-prefix Markdown pass on every visual flush. Keep the
-        // rendered HTML only for intermediate narration and for the DEV shadow
-        // renderer, which still needs an exact legacy parity surface.
+        // rendered HTML only for intermediate narration.
         // Only the current trailing answer is owned by StreamingTextPart. If
         // a later tool arrives, that provisional answer moves back into the
         // activity chronology and needs rendered HTML like any other
@@ -563,16 +623,26 @@ export class TurnAccumulator {
     const timelineSegments = segments.flatMap((segment): ChatTimelineSegment[] => {
       if (segment.type === 'text') {
         const raw = String(segment.raw || '')
-        return raw ? [{ type: 'text', raw }] : []
+        return raw ? [{
+          type: 'text',
+          raw,
+          presentation: segment.presentation,
+          activityOrder: segment.activityOrder,
+        }] : []
       }
       if (segment.type === 'interrupt') {
         const approvalId = String(segment.approvalId || '')
-        return approvalId ? [{ type: 'interrupt', approvalId }] : []
+        return approvalId ? [{
+          type: 'interrupt',
+          approvalId,
+          activityOrder: segment.activityOrder,
+        }] : []
       }
       return [{
         type: 'tool-group',
         groupId: segment.groupId,
         operationKey: segment.operationKey,
+        activityOrder: segment.activityOrder,
       }]
     })
     const base = {
@@ -640,6 +710,7 @@ export function foldTurn(
     blockIndex: number | undefined,
     at: number,
     contentKind: 'summary' | 'reasoning' = 'reasoning',
+    activityOrder?: number,
   ): ReasoningBlock {
     const id = blockId || 'legacy-reasoning'
     const existing = reasoningBlocksById.get(id)
@@ -668,6 +739,7 @@ export function foldTurn(
       status: 'streaming',
       startedAt: at,
       contentKind,
+      activityOrder,
     }
     reasoningBlocks.push(block)
     reasoningBlocksById.set(id, block)
@@ -677,14 +749,23 @@ export function foldTurn(
   // Mirror ensureStreamToolCall's group derivation: a tool joins the trailing
   // tool-group segment when the operationKey matches, else opens a new group
   // with a monotonic counter. Returns the existing call when already seen.
-  function ensureCall(toolId: string, name: string, input: string, running: boolean): ChatToolCall {
+  function ensureCall(
+    toolId: string,
+    name: string,
+    input: string,
+    running: boolean,
+    activityOrder?: number,
+    authoritativeInput = false,
+    presentation?: ChatToolCall['presentation'],
+  ): ChatToolCall {
     const existing = toolCallsById.get(toolId)
     if (existing) {
-      if (input) {
+      if (input || authoritativeInput) {
         existing.inputRaw = input
         existing.inputPreview = truncateToolPreview(input, 200)
         existing.displayName = toolDisplayName(existing.name, input)
       }
+      if (presentation) existing.presentation = presentation
       return existing
     }
 
@@ -695,7 +776,7 @@ export function foldTurn(
       : `stream:tool-group:${operationKey}:${toolGroupSeq++}`
 
     if (lastSegment?.type !== 'tool-group' || lastSegment.groupId !== groupId) {
-      segments.push({ type: 'tool-group', groupId, operationKey })
+      segments.push({ type: 'tool-group', groupId, operationKey, activityOrder })
     }
 
     const call: ChatToolCall = {
@@ -711,6 +792,8 @@ export function foldTurn(
       result: '',
       resultPreview: '',
       isOpen: false,
+      activityOrder,
+      presentation,
     }
     toolCalls.push(call)
     toolCallsById.set(toolId, call)
@@ -733,6 +816,7 @@ export function foldTurn(
             html: '',
             dirty: true,
             presentation: frame.presentation,
+            activityOrder: frame.activityOrder,
           })
         } else {
           lastSegment.raw = (lastSegment.raw || '') + frame.text
@@ -745,7 +829,15 @@ export function foldTurn(
         if (!toolTimes.has(frame.toolId)) {
           toolTimes.set(frame.toolId, { startedAt: frame.at })
         }
-        ensureCall(frame.toolId, frame.name, frame.input, true)
+        ensureCall(
+          frame.toolId,
+          frame.name,
+          frame.input,
+          true,
+          frame.activityOrder,
+          frame.authoritativeInput,
+          frame.presentation,
+        )
         break
       }
       case 'tool-delta': {
@@ -760,11 +852,20 @@ export function foldTurn(
         break
       }
       case 'tool-result': {
-        const tc = ensureCall(frame.toolId, frame.name, frame.input, false)
+        const tc = ensureCall(
+          frame.toolId,
+          frame.name,
+          frame.input,
+          false,
+          frame.activityOrder,
+          frame.authoritativeInput,
+          frame.presentation,
+        )
         tc.isRunning = false
         tc.status = frame.isError ? 'error' : 'success'
         tc.isError = frame.isError
         tc.result = frame.result
+        tc.executionLogHandle = frame.executionLogHandle
         tc.resultPreview = truncateToolPreview(frame.result, 200)
         const timing = toolTimes.get(tc.toolId)
         if (timing && !timing.endedAt) timing.endedAt = frame.at
@@ -780,6 +881,7 @@ export function foldTurn(
           frame.blockIndex,
           frame.at,
           frame.contentKind,
+          frame.activityOrder,
         )
         break
       }
@@ -789,6 +891,8 @@ export function foldTurn(
           frame.blockId,
           frame.blockIndex,
           frame.at,
+          'reasoning',
+          frame.activityOrder,
         )
         block.text += frame.text
         break
@@ -798,6 +902,8 @@ export function foldTurn(
           frame.blockId,
           frame.blockIndex,
           frame.at,
+          'reasoning',
+          frame.activityOrder,
         )
         block.status = frame.status
         block.endedAt = frame.at
@@ -814,7 +920,11 @@ export function foldTurn(
         if (i === undefined) {
           interruptIndex.set(frame.approvalId, interrupts.length)
           interrupts.push({ kind: frame.interruptKind, approvalId: frame.approvalId, data: frame.data })
-          segments.push({ type: 'interrupt', approvalId: frame.approvalId })
+          segments.push({
+            type: 'interrupt',
+            approvalId: frame.approvalId,
+            activityOrder: frame.activityOrder,
+          })
         } else {
           // A later requested-frame for the same id (re-broadcast / hydration
           // backfill) merges richer data without reordering.
@@ -832,6 +942,7 @@ export function foldTurn(
           action: frame.action,
           label: frame.label,
           at: frame.at,
+          activityOrder: frame.activityOrder,
           ...(frame.id ? { id: frame.id } : {}),
           ...(frame.category ? { category: frame.category } : {}),
           ...(frame.state ? { state: frame.state } : {}),
@@ -853,6 +964,7 @@ export function foldTurn(
               ...statusHistory[index],
               ...entry,
               at: statusHistory[index]!.at,
+              activityOrder: statusHistory[index]!.activityOrder,
             }
           }
         } else {
@@ -909,16 +1021,26 @@ export function foldTurn(
   const timelineSegments = segments.flatMap((segment): ChatTimelineSegment[] => {
     if (segment.type === 'text') {
       const raw = String(segment.raw || '')
-      return raw ? [{ type: 'text', raw }] : []
+      return raw ? [{
+        type: 'text',
+        raw,
+        presentation: segment.presentation,
+        activityOrder: segment.activityOrder,
+      }] : []
     }
     if (segment.type === 'interrupt') {
       const approvalId = String(segment.approvalId || '')
-      return approvalId ? [{ type: 'interrupt', approvalId }] : []
+      return approvalId ? [{
+        type: 'interrupt',
+        approvalId,
+        activityOrder: segment.activityOrder,
+      }] : []
     }
     return [{
       type: 'tool-group',
       groupId: segment.groupId,
       operationKey: segment.operationKey,
+      activityOrder: segment.activityOrder,
     }]
   })
   const base = { timelineItems, toolCalls, artifacts, rawText }

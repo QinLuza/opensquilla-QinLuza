@@ -1,4 +1,13 @@
 {
+  "resourceActions": {
+    "more": "ファイル操作", "preview": "アプリ内でプレビュー", "openSource": "既定のアプリで開く",
+    "reveal": "ファイルマネージャーで表示", "revealFinder": "Finder で表示", "revealExplorer": "エクスプローラーで表示",
+    "openCopy": "ローカルコピーを開く", "saveAs": "名前を付けて保存…", "copyPath": "パスをコピー",
+    "copyGatewayPath": "サーバーのパスをコピー", "copyContents": "ファイル内容をコピー", "saved": "ファイルを保存しました",
+    "singleFile": "この HTML のみ保存します。参照するスタイル、画像、他のページは含まれません。",
+    "textOnly": "コピーできるのは 1 MiB 以下の UTF-8 テキストです。ファイルを保存してください。",
+    "unavailable": "現在のソースファイルを利用できません。既存のプレビューとダウンロードは変更されません。", "failed": "ファイル操作に失敗しました。"
+  },
   "workspaces": {
     "projects": "プロジェクト",
     "createProject": "プロジェクトを作成",
@@ -67,6 +76,13 @@
     "viewRelease": "リリースを表示",
     "dismiss": "閉じる",
     "desktop": {
+      "installErrorTitle": "インストールを開始できませんでした",
+      "quitAndInstall": "終了してインストール",
+      "signedDownloadedDesc": "OpenSquilla {version} のインストーラーは検証済みです。「終了してインストール」でバックグラウンドサービスを停止し、インストーラーを開きます。",
+      "manualApplyingStatus": "バックグラウンドサービスを停止中",
+      "manualApplyingDesc": "OpenSquilla のバックグラウンドサービスを停止しています。停止後にインストーラーが開きます。",
+      "errorSignatureInvalid": "インストーラーの署名が無効か、発行元が OpenSquilla と一致しないため、インストールをブロックしました。更新を再ダウンロードしてください。",
+      "errorSignatureUnavailable": "インストーラーの署名を検証できないため、インストールをブロックしました。後でもう一度お試しください。",
       "indicatorAvailable": "更新 {version}",
       "indicatorDownloaded": "更新準備完了",
       "indicatorInstallerReady": "インストーラ検証済み",
@@ -77,7 +93,7 @@
       "availableDesc": "準備ができたらダウンロードしてください。OpenSquilla は再起動後にだけインストールします。",
       "manualAvailableDesc": "このバージョン専用の Windows インストーラーをダウンロードします。Windows の案内に従ってインストールを完了してください。",
       "manualDownloadedTitle": "検証済みインストーラの準備完了",
-      "manualDownloadedDesc": "OpenSquilla {version} は GitHub の正規チェックサムで検証され、フォルダに表示されました。準備ができたらインストーラを手動で実行してください。",
+      "manualDownloadedDesc": "OpenSquilla {version} のインストーラーは検証済みです。「インストーラを表示」でファイルの場所を確認し、準備ができたら手動で実行してください。",
       "downloadedTitle": "インストール準備完了",
       "downloadedDesc": "OpenSquilla を再起動して {version} への更新を完了します。",
       "downloadingTitle": "更新をダウンロード中",
@@ -88,8 +104,8 @@
       "errorFallback": "設定からもう一度確認してください。",
       "errorSourceUnreachable": "更新元に一時的に接続できません。しばらくしてからもう一度お試しください。",
       "errorManifestInvalid": "リリースチャンネルのデータが無効なため、更新を安全に確認できません。",
-      "errorChecksumUnavailable": "GitHub の正規チェックサムを取得できないため、インストーラを検証できません。インストーラは開かれていません。",
-      "errorIntegrityFailed": "ダウンロードしたインストーラは整合性検証に失敗したため削除されました。",
+      "errorChecksumUnavailable": "公式アップデートのチェックサムを取得できないため、インストーラを検証できません。インストーラは開かれていません。",
+      "errorIntegrityFailed": "インストーラーの整合性を確認できませんでした。更新を再ダウンロードしてください。",
       "errorDownloadFailed": "更新をダウンロードできませんでした。接続を確認してもう一度お試しください。",
       "errorInstallFailed": "インストーラーを準備または開くことができませんでした。もう一度試すか、リリースページを使用してください。",
       "idleDesc": "新しいデスクトップ版を確認します。",
@@ -145,6 +161,14 @@
     "pixels": "ピクセル",
     "empty": "この項目には利用できるプレビューがありません。",
     "itemLimitReached": "隔離プレビューが 8 件開いています。別のプレビューを開く前に 1 件閉じてください。",
+    "resources": {
+      "title": "ファイル", "count": "ファイル（{count}）", "empty": "ファイルまたはリンクはまだありません。",
+      "groups": { "files": "ファイル", "links": "リンク", "attachments": "ファイル", "documents": "ファイル", "deliverables": "ファイル", "urls": "リンク" },
+      "open": "{name} を開く", "preparing": "エディターを準備しています…", "retry": "再試行", "preview": "{name} をプレビュー", "download": "{name} をダウンロード", "edit": "{name} のコピーを編集", "publish": "{name} を公開",
+      "imported": "{name} を編集できます。", "published": "{name} を共有できます。",
+      "publishUnavailable": "このドキュメントには公開可能な現在のリビジョンがありません。", "actionFailed": "ワークベンチ操作に失敗しました。",
+      "unavailableReasons": { "htmlEncodingUnsupported": "この HTML は有効な UTF-8 ではないため、安全にプレビューまたは編集できません。", "htmlValidationFailed": "この HTML は安全なプレビューまたは編集の検証に失敗しました。", "htmlEditTooLarge": "この HTML はアプリ内で編集するには大きすぎます。ダウンロードは引き続き可能です。", "htmlPreviewTooLarge": "この HTML はアプリ内で安全にプレビューするには大きすぎます。ダウンロードは引き続き可能です。", "officeAdapterNotAvailable": "Office の編集機能はまだ利用できません。", "unsupported": "この操作はこのリソースでは利用できません。" }
+    },
     "browser": {
       "back": "戻る",
       "forward": "進む",
@@ -157,6 +181,35 @@
       "failed": "サイドブラウザーが停止しました",
       "failedDetail": "隔離ブラウザーを再読み込みして続行してください。"
     },
+    "artifactAnnotation": {
+      "start": "プレビューに注釈",
+      "stop": "注釈を終了",
+      "selectElement": "注釈するページ要素を選択",
+      "selectElementShort": "要素を選択",
+      "unavailable": "プレビュー注釈は利用できません。",
+      "desktopEditingOnly": "ページ要素の選択と AI 編集はデスクトップアプリで利用できます。",
+      "createFailed": "選択した要素を添付できませんでした。",
+      "elementChanged": "添付前に選択した要素が変更されました。現在のプレビューでもう一度選択してください。",
+      "rearmFailed": "要素ピッカーを再起動できなかったため、注釈モードを終了しました。もう一度有効にしてください。",
+      "updateFailed": "注釈の下書きを保存できませんでした。",
+      "discardFailed": "注釈を破棄できませんでした。再試行できるよう開いたままにします。",
+      "closeFailed": "注釈エディターを閉じられませんでした。もう一度お試しください。",
+      "replacementCleanupFailed": "新しい注釈は保持されましたが、以前の下書きを削除できませんでした。",
+      "overlayFallback": "以下で注釈を続けてください。",
+      "fallbackTitle": "注釈を続ける",
+      "fallbackDetail": "プレビューは一時的に非表示です。注釈は保持されています。",
+      "frozenPreview": "選択したページ領域のプレビュー",
+      "placeholder": "この領域の変更内容を入力…",
+      "newlineHint": "{shortcut} で改行",
+      "keepDraft": "注釈を保持",
+      "submit": "注釈を追加",
+      "contextLabel": "現在の選択",
+      "bodyLabel": "ページの注釈",
+      "emptyBody": "希望する変更を記入してください。",
+      "reselectHint": "ページ上の対応する領域を選択してください。",
+      "reuseHint": "変更要求をコピーしました。対応する領域を選択してください。",
+      "screenshotUploadFailed": "ページのスクリーンショットを添付できませんでした。注釈は保持されています。画像を手動で追加できます。"
+    },
     "artifactPreview": {
       "refresh": "プレビューを更新",
       "openExternal": "外部で開く",
@@ -165,26 +218,25 @@
       "readyWithWarnings": "プレビューは警告付きで実行されています。",
       "warningsShort": "警告あり",
       "suspended": "プレビューを一時停止しました",
-      "nativePreview": "ネイティブ HTML プレビュー",
+      "nativePreview": "インタラクティブプレビュー",
       "allowRemoteResources": "オンラインの画像、スタイル、メディアを許可",
       "blockRemoteResources": "オンラインの画像、スタイル、メディアをブロック",
       "remoteResourcesConfirmTitle": "オンラインリソースを読み込みますか？",
       "remoteResourcesConfirmBody": "この HTML は画像、スタイル、フォント、メディアを読み込むために外部サイトへ接続できます。接続先には IP アドレスが伝わり、成果物が組み立てた URL が送信される場合があります。外部スクリプトとデータ要求は引き続きブロックされます。",
       "remoteResourcesConfirmAction": "今回のみ許可",
-      "fullMode": "完全ネットワークプレビュー",
-      "offlineMode": "オフラインプレビュー",
-      "fullShort": "完全",
-      "offlineShort": "オフライン",
+      "fullMode": "インタラクティブプレビュー",
+      "offlineMode": "制限付きプレビュー",
+      "fullShort": "インタラクティブ",
+      "offlineShort": "制限付き",
       "modeControl": "プレビューモード：{mode}",
       "modeDefaultOption": "{mode}（デフォルト）",
       "modeDefaults": "デフォルト設定",
-      "switchFull": "完全ネットワークプレビューに切り替える",
-      "switchOffline": "オフラインプレビューに切り替える",
+      "switchFull": "インタラクティブプレビューに切り替える",
+      "switchOffline": "制限付きプレビューに切り替える",
       "setDefaultMode": "このモードを既定にする",
       "restoreDefaultMode": "既定のプレビューモードに戻す",
       "defaultModeSaved": "既定のプレビューモードを保存しました。",
-      "fullModeNotice": "完全プレビューはブラウザー同様にネットワークへ接続できますが、OpenSquilla の権限、ローカルファイル、システムブラウザーのログインは共有しません。",
-      "offlineWebLimits": "オフライン Web プレビューは不透明なオリジンのサンドボックス内でバンドルのスクリプトを実行し、バンドル内リソースを読み込みます。Worker、Service Worker、永続ストレージ、ルート絶対パスの動作は保証されず、外部ネットワークへのアクセスは遮断されます。",
+      "offlineWebLimits": "制限付きプレビューでは、一部の外部コンテンツや高度な Web 機能を利用できない場合があります。",
       "compatibilityFallback": "この Desktop バージョンでは従来の単一ファイルプレビューのみ利用できます。",
       "upgradeDesktopShort": "Desktop を更新",
       "permissionTitle": "ページの権限を許可しますか？",
@@ -203,6 +255,72 @@
       "integrityErrorDetail": "保存された成果物が破損しているか、記録されたチェックサムと一致しません。再公開するか、ダウンロードして確認してください。",
       "invalidContent": "ダウンロードした内容が成果物の種類と一致しません。",
       "failedDetail": "プレビューを再試行するか、ファイルをダウンロードしてください。"
+    },
+    "artifactErrors": {
+      "documentChanged": "ページが更新されました。再読み込みしてからもう一度お試しください。",
+      "writeBusy": "ページを更新しています。しばらくしてからもう一度お試しください。",
+      "mutationNotApplied": "ページは更新されませんでした。もう一度お試しいただけます。",
+      "mutationOutcomePending": "更新結果を確認できません。ページを開いてご確認ください。",
+      "documentUnavailable": "このページは一時的に利用できません。もう一度お試しください。",
+      "resourceUnsupported": "このファイルはここでは編集できません。",
+      "permissionDenied": "このページを更新する権限がありません。",
+      "previewCapabilityExpired": "プレビューを開き直してください。",
+      "previewRendererFailed": "プレビューを表示できませんでした。開き直してみてください。",
+      "previewPageUnsupported": "現在のクライアントまたは Gateway は、このサブページを直接開くことに対応していません。更新してから再試行してください。",
+      "annotationUnavailable": "この注釈は一時的に利用できません。",
+      "annotationBusy": "注釈を更新しています。しばらくしてからもう一度お試しください。",
+      "invalidRequest": "リクエストを完了できませんでした。入力を確認してもう一度お試しください。",
+      "internalError": "操作を完了できませんでした。もう一度お試しください。",
+      "documentEditingRetired": "クライアントを更新してページを開き直し、注釈をチャット入力として送信してください。"
+    },
+    "artifactDocument": {
+      "sections": "成果物ドキュメントのセクション",
+      "preview": "プレビュー",
+      "source": "ソース",
+      "versions": "バージョン",
+      "changes": "変更",
+      "comments": "コメント",
+      "syncing": "同期中…",
+      "publishHead": "現在のバージョンを公開",
+      "publishing": "公開中…",
+      "publishFailed": "現在のバージョンを公開できませんでした。",
+      "downloadLatest": "最新バージョンをダウンロード",
+      "officeDownloadOnlyTitle": "Office のプレビューと編集は有効になっていません",
+      "officeDownloadOnlyDetail": "現在のクライアントは元の Office ファイルをそのまま保持し、最新バージョンをダウンロードできます。",
+      "downloadOnlyTitle": "この成果物はダウンロード専用です",
+      "downloadOnlyDetail": "このファイル形式はアプリ内でのプレビューと編集に対応していません。",
+      "noEditingClaim": "互換エディターが有効になるまで、変更が適用済みとして表示されることはありません。",
+      "noVersions": "バージョン履歴はまだありません。",
+      "noChanges": "提案された変更はまだありません。",
+      "noComments": "コメントはまだありません。",
+      "commentsUnavailable": "この成果物ではコメントが有効になっていません。",
+      "versionNumber": "バージョン {generation}",
+      "versionOriginal": "元のバージョン",
+      "versionByYou": "あなたが編集",
+      "versionByOpenSquilla": "OpenSquilla が更新",
+      "versionRestored": "復元",
+      "versionUndone": "取り消し",
+      "changeApplied": "ページを更新",
+      "changeEdited": "ページを編集",
+      "current": "現在",
+      "operationCount": "{count} 件の操作",
+      "actor": "{kind}",
+      "downloadVersion": "このバージョンをダウンロード",
+      "restoreVersion": "このバージョンに復元",
+      "restoring": "復元中…",
+      "revertChange": "この変更を元に戻す",
+      "reverting": "元に戻しています…",
+      "addComment": "コメントを追加",
+      "commentPlaceholder": "レビューコメントを入力…",
+      "addCommentAction": "コメントを追加",
+      "addingComment": "追加中…",
+      "resolveComment": "解決",
+      "resolving": "解決中…",
+      "restoreFailed": "このバージョンを復元できませんでした。最新バージョンを確認して再試行してください。",
+      "revertFailed": "この変更を元に戻せませんでした。最新バージョンを確認して再試行してください。",
+      "commentCreateFailed": "コメントを追加できませんでした。文書の最新状態を確認して再試行してください。",
+      "commentResolveFailed": "コメントを解決できませんでした。コメントの最新状態を確認して再試行してください。",
+      "sourceUnavailable": "HTML ソースを利用できません。"
     }
   },
   "nav": {
@@ -283,8 +401,8 @@
   },
   "settings": {
     "appearance": {
-      "title": "外観",
-      "desc": "このブラウザーのテーマ、言語、ローカルの表示設定です。プリセットは即時に反映され、カスタム幅は「適用」で確定します。",
+      "title": "インターフェース",
+      "desc": "このブラウザーのテーマとローカルの表示設定です。プリセットは即時に反映され、カスタム幅は「適用」で確定します。",
       "themeLabel": "テーマ",
       "themeDesc": "システムに従うか、ライトまたはダークを指定します。サイドバーの切り替えはこの設定へのショートカットです。",
       "languageLabel": "言語",
@@ -469,7 +587,7 @@
       "builtin": "組み込み",
       "actions": { "add": "追加", "remove": "削除", "retry": "再試行", "copy": "コピー", "saving": "保存中…", "redetect": "再検出" },
       "mode": {
-        "title": "既定のアクセスモード", "description": "新しいタスクの開始モードを選びます。能力検証に失敗した場合、Safe は選択できません。",
+        "title": "既定のアクセスモード", "description": "全体のアクセスモードを設定します。初めて Safe を選ぶとサンドボックスの設定が開きます。初期化に失敗した場合や未対応の場合は選択できません。",
         "default": "既定モード", "safe": "Safe", "full": "完全アクセス", "resetWarning": "起動時の警告を再表示"
       },
       "setup": {
@@ -493,7 +611,18 @@
         "title": "ネットワーク保護", "description": "公開ネットワークは既定で許可し、SSRF とメタデータ保護を維持します。",
         "blockAll": "すべてのネットワークを遮断", "blockAllDescription": "許可ドメインだけを例外にします。", "allowDomains": "許可ドメイン", "denyDomains": "拒否ドメイン"
       },
-      "runtimes": { "title": "同梱ランタイム", "description": "安全モードは同梱ツールを優先し、フルアクセスはホストツールを優先します。", "target": "パッケージ対象" },
+      "runtimes": {
+        "title": "ランタイムパック", "description": "ダウンロード後は自動的に有効になります。安全モードはインストール済みパックを優先し、フルアクセスはホストツールを優先します。", "target": "ランタイム対象",
+        "allowRuntime": "{runtime} を許可", "progress": "{runtime} のダウンロード：{progress}%",
+        "states": {
+          "unknown": "状態を取得できません", "notInstalled": "未インストール", "disabled": "無効", "installed": "インストール済み", "installedVersion": "インストール済み · {version}", "updatePaused": "更新を一時停止",
+          "unsupported": "このシステムでは利用できません", "corrupt": "修復が必要です", "queued": "ダウンロード待ち", "downloading": "ダウンロード中", "downloadingProgress": "ダウンロード中 · {progress}%",
+          "verifying": "ダウンロードを検証中", "extracting": "インストール中", "probing": "ランタイムを確認中", "activating": "インストールを完了中", "cancelling": "キャンセル中", "queuedRemoval": "削除待ち", "removing": "削除中",
+          "cancelled": "ダウンロードをキャンセルしました", "failed": "ダウンロードに失敗しました", "removeFailed": "削除に失敗しました", "removeInterrupted": "削除が中断されました", "interrupted": "ダウンロードを一時停止しました"
+        },
+        "actions": { "enable": "有効にする", "download": "ダウンロード", "cancel": "キャンセル", "discardDownload": "ダウンロードを削除", "resume": "再開", "retry": "再試行", "repair": "修復", "remove": "削除", "retryRemove": "削除を再試行" },
+        "sources": { "oss": "北京 OSS", "github": "GitHub リリース" }
+      },
       "lan": {
         "listen": "ローカルネットワークで待ち受ける", "listenDescription": "再起動後に全ローカルインターフェイスへバインドします。公開ピアは引き続き拒否されます。",
         "allowedCidrs": "許可するクライアント CIDR", "cidrDescription": "任意。空欄では loopback、RFC1918、IPv6 ULA を許可し、指定時は範囲を狭めることだけができます。",
@@ -529,30 +658,49 @@
       "moreOptionsIn": "その他のオプションは次の場所にあります",
       "copyConfigPath": "設定パスをコピー",
       "applyLiveNote": "ほとんどの変更は即時に反映されます。一部はゲートウェイの再起動が必要です",
-      "discardTitle": "未保存の変更を破棄しますか？",
-      "discardBody": "未保存の編集があります。今閉じると失われます。",
+      "discardTitle": "未保存の変更があります",
+      "discardBody": "閉じる前に保存するか、変更を破棄してください。",
+      "saveAndClose": "保存して閉じる",
       "discardConfirmPrimary": "変更を破棄"
     },
+    "gateway": {
+      "title": "ゲートウェイ",
+      "desc": "ゲートウェイへ接続し、デスクトップではローカルランタイムも管理します。"
+    },
+    "general": {
+      "title": "一般",
+      "desc": "アプリ全体の言語、セッション、デスクトップウィンドウの既定値を設定します。"
+    },
+    "securityPrivacy": {
+      "title": "セキュリティとプライバシー",
+      "desc": "診断設定、デスクトッププレビュー、ツール分離を管理します。"
+    },
+    "memoryOverview": {
+      "title": "メモリ",
+      "desc": "OpenSquilla が記憶する内容と任意の学習機能を管理します。",
+      "autoCaptureLabel": "会話記録の保存",
+      "autoCaptureDesc": "監査と復旧のため、会話とターンの生データをローカルに保存します。長期メモリには追加されず、検索用のインデックスも作成されません。",
+      "learningSummary": "メモリと自己学習（詳細）",
+      "learningDesc": "任意の学習機能は追加のモデルトークンを使い、再起動が必要な場合があります。",
+      "profileImportLabel": "プロフィールのインポート",
+      "profileImportDesc": "互換性のある ID とメモリのデータを確認して取り込みます。",
+      "profileImportAction": "開く"
+    },
     "rail": {
-      "connection": "接続",
-      "runtime": "ランタイム",
+      "gateway": "ゲートウェイ",
       "provider": "モデルサービス",
       "modelStrategy": "モデルルーティング",
-      "behavior": "動作",
-      "privacy": "プライバシー",
-      "sandbox": "サンドボックス",
-      "memory": "メモリとプロフィール",
-      "router": "ルーター",
-      "ensemble": "アンサンブル",
       "capabilities": "機能",
-      "appearance": "外観",
-      "keyboard": "キーボード",
+      "general": "一般",
+      "interface": "インターフェース",
+      "shortcuts": "ショートカット",
+      "securityPrivacy": "セキュリティとプライバシー",
+      "memory": "メモリとエクスポート",
       "advanced": "詳細設定",
       "groups": {
-        "gateway": "ゲートウェイ",
         "ai": "AI 設定",
         "preferences": "環境設定",
-        "capabilities": "機能"
+        "safetyData": "セキュリティとデータ"
       }
     }
   },
@@ -581,11 +729,52 @@
     }
   },
   "setup": {
+    "capacity": {
+      "customOpenAI": "カスタム · OpenAI 互換",
+      "customAnthropic": "カスタム · Anthropic 互換",
+      "partialSaved": "保存済み：{saved}。未保存：{pending}。未保存の入力は保持されています。",
+      "providerPartialSaved": "プロバイダーは保存されました。モデル上限は保存されていません。入力は保持されています。",
+      "backToRouting": "スマートルーティングに戻る",
+      "editSharedEnsemble": "共有アンサンブルを編集",
+      "sharedEnsemble": "C3 とモデル融合はこの構成を共有します。",
+      "title": "モデル設定",
+      "forModel": "モデル設定 — {model}",
+      "unknown": "上限未確認",
+      "contextWindow": "コンテキストウィンドウ",
+      "maxOutputTokens": "最大出力長",
+      "scope": "このプロバイダーで同じモデルを使用するすべての場所に適用されます。",
+      "current": "現在 {value} トークン · {source}",
+      "source": {
+        "catalog": "モデルカタログ",
+        "default": "システムの既定値",
+        "config": "全体設定",
+        "override": "手動設定"
+      },
+      "autoValue": "自動（{value}）",
+      "autoHint": "空欄で自動値を使用します。変更するには正の整数を入力してください。",
+      "requestHint": "モデルの出力上限です。実際の応答は短くなる場合があります。",
+      "localHint": "ローカルモデルサーバーのコンテキスト設定と一致させてください。",
+      "serverControlled": "出力の長さはサーバーが制御します。",
+      "restore": "自動設定に戻す",
+      "positiveInteger": "正の整数を入力するか、空欄にして自動値を使用してください。",
+      "upgrade": "モデル上限を表示・編集するには Gateway を更新してください。既存のモデル設定は引き続き利用できます。",
+      "loadFailed": "モデル上限を読み込めませんでした。変更内容は保持されています。",
+      "retry": "再試行",
+      "draftHint": "完了後、設定ページの「変更を保存」で反映されます。",
+      "done": "完了",
+      "invalid": "保存する前にモデル上限の値を確認してください。",
+      "saved": "モデル上限を保存しました。",
+      "saveFailed": "モデル上限を保存できませんでした。未保存の入力は保持されています。",
+      "unknownHint": "モデル上限の一方または両方が未確認です。既定値が使用されています。ここで上限を設定できます。",
+      "automaticSource": "自動 · {source}",
+      "unsaved": "未保存",
+      "effective": "実際の上限：{value} トークン"
+    },
     "cli": {
       "advancedTitle": "詳細 · 内蔵 CLI",
       "hintBundled": "これらのコマンドはアプリ内蔵の CLI を使用します。ターミナルに貼り付けて実行できます。",
       "hintDev": "開発モード：コマンドは uv 経由でソースチェックアウトから実行されます。",
-      "restartHint": "アプリの「設定 → ランタイム → 再起動」で反映してください。"
+      "restartHint": "アプリの「設定 → ゲートウェイ → 再起動」で反映してください。"
     },
     "common": {
       "apiKey": "API キー",
@@ -638,6 +827,11 @@
       "memoryOptions": "メモリのオプション"
     },
     "provider": {
+      "moreActions": "{provider} のその他の操作",
+      "routerOutcomeSynchronized": "Router の推奨階層を保存済みの主用プロバイダーに同期しました。",
+      "routerOutcomePreserved": "保存済みの Router 階層を保持しました。",
+      "routerOutcomeDisabled": "モデルルーティングはオフです。保存済みの階層を保持しました。",
+      "primarySavedAdditionalFailed": "プロバイダーを保存しましたが、追加設定を保存できませんでした。再試行する前に設定を確認してください。",
       "title": "プロバイダー",
       "pageTitle": "モデルサービス",
       "pageDesc": "プロバイダーを接続し、認証情報とモデルを管理します。",
@@ -646,6 +840,7 @@
       "configuredSummary": "{ready} / {count} 準備完了。テストは小さなリクエストを 1 回送信します。",
       "configuredDesc": "保存したプロバイダーは、手動で削除するまでルーティングに利用できます。構成の検証では保存済み設定を使って小規模なモデルリクエストを送信するため、プロバイダー料金が発生する場合があります。",
       "activeBadge": "使用中",
+      "currentPrimary": "現在の主用",
       "editingBadge": "編集中",
       "profileReady": "認証情報の準備完了",
       "profileNeedsCredentials": "認証情報が必要",
@@ -809,7 +1004,7 @@
       "runtimeDefaultsDesc": "通常のすべてのモデルリクエストで共有されるゲートウェイ全体の動作です。",
       "timeoutLabel": "リクエストのタイムアウト（秒）",
       "timeoutDesc": "1 回のモデル応答がタイムアウトするまでの待機時間です。低速なローカルモデル（Ollama、vLLM、LM Studio）では値を大きくしてください。",
-      "timeoutGlobalDesc": "すべてのプロバイダーにまたがる通常のモデルリクエスト用のゲートウェイ全体のタイムアウトです。構成の検証には別の 30 秒タイムアウトを使用します。",
+      "timeoutGlobalDesc": "すべてのプロバイダーにまたがる通常のモデルリクエスト用タイムアウトです。接続確認とモデルテストには、それぞれ固定の制限時間を使用します。",
       "contextWindowLabel": "コンテキストウィンドウの上書き（token 数）",
       "contextWindowDesc": "このモデルのプロンプト組み立て予算に上限を設けます。空欄の場合は自動検出されたウィンドウを使用します。",
       "contextWindowIdentityLabel": "コンテキストウィンド · {provider} / {model}",
@@ -860,7 +1055,14 @@
       "credentialSourceOptions": "認証情報のソース",
       "credentialRevealUnavailable": "Couldn't reveal the saved API key.",
       "connectionLabel": "現在の構成",
-      "connectionDesc": "現在のキー、エンドポイント、検証モデルで小規模なモデルリクエストを送信し、ストリームが完了することを確認します。プロバイダーの料金が発生する場合があります。",
+      "connectionDesc": "まずエンドポイントへの接続を短時間で確認し、必要に応じて実際のストリーミングモデル呼び出しをテストします。モデルテストには料金が発生する場合があります。",
+      "checkConnection": "接続を確認",
+      "checkingConnection": "接続を確認中…",
+      "cancelConnectionCheck": "接続確認をキャンセル",
+      "testModel": "モデルをテスト",
+      "testingModel": "モデルをテスト中…",
+      "cancelTest": "テストをキャンセル",
+      "testSavedModel": "保存済みモデルをテスト",
       "testConnection": "構成を検証",
       "testCurrentSettings": "現在の構成を検証",
       "testing": "構成を検証中…",
@@ -870,6 +1072,11 @@
       "lastVerifyFailedAgo": "前回の検証に失敗 · {ago}",
       "currentSettingsNotTested": "現在の構成は未検証",
       "endpointVerified": "構成を検証済み",
+      "reachableNotModelTested": "エンドポイントに接続済み · モデル未テスト",
+      "endpointResponded": "エンドポイントが応答しました — {reason}",
+      "modelVerified": "モデル呼び出し成功",
+      "modelTimedOut": "モデル応答がタイムアウト · 検証未完了",
+      "reachabilityTimedOut": "接続確認がタイムアウト · 到達性は未確認",
       "probeMissingRequired": "検証前に必須項目を入力してください：{fields}。",
       "requiredFieldJoiner": "、",
       "connected": "✓ 構成を検証済み",
@@ -888,6 +1095,7 @@
       "failureModelNotFound": "プロバイダーがこのモデル ID を認識できません。",
       "failureUnreachable": "エンドポイントに到達できませんでした。",
       "failureBadRequest": "プロバイダーがリクエストを拒否しました。",
+      "failureProbeTimeout": "検証の制限時間を超えました。",
       "failureGeneric": "構成の検証に失敗しました。",
       "modelListLabel": "検出されたモデル",
       "modelOptionsToggle": "モデルカタログ · {count}",
@@ -919,26 +1127,50 @@
       "modelNoMatches": "一致するモデルがありません — 入力した値をそのまま使えます。",
       "modelListTruncated": "{total} 件中 {shown} 件を表示 — 入力を続けると絞り込めます。",
       "modelProvenance": "プロバイダーのライブ一覧 · 機能情報の出典：{sources}",
-      "modelMetadataProvenance": "プロバイダーのライブ一覧 · 公式値を優先し、ない場合はカタログ値を使用"
+      "modelMetadataProvenance": "プロバイダーのライブ一覧 · 公式値を優先し、ない場合はカタログ値を使用",
+      "modelMultimodal": "マルチモーダル",
+      "modelMultimodalTitle": "画像入力に対応",
+      "saveAndStart": "保存して使い始める",
+      "saveAndMakeActive": "保存して主用に設定",
+      "saveActivateUpgradeHint": "保存と主用への切り替えを一度に行うには Gateway を更新してください。",
+      "primaryRoleHint": "主用プロバイダーは既定の直接接続とフォールバックを担当します。カスタムの複数モデル戦略は既存の設定で動作します。",
+      "activationCredentialRequired": "主用に設定する前に使用可能な認証情報を追加してください。",
+      "routerConflictTitle": "既存のモデルルートの扱いを選択",
+      "routerConflictBody": "保存済みの Router は {conflicts} を使用し、{provider} と競合しています。{provider} の推奨設定を使うと、保存済みと未保存の階層編集が置き換わります。オフの選択肢がある場合は階層を保持してルーティングを無効化できます。キャンセルするとモードと下書きが保持されます。",
+      "routerUseRecommended": "切り替え先の推奨ルートを使用",
+      "routerDisablePreserve": "ルートを保持して Router をオフ",
+      "alreadyActive": "対象プロバイダーは既に主用です。この認証情報の編集は保存されていません。",
+      "primarySaveUncertain": "保存結果を確認できません。下書きを保持しました。再試行前に保存済み設定を確認してください。主用になっていても認証情報の編集が保存されたとは限りません。"
     },
     "preset": {
-      "summary": "ルーティングテンプレート: {label}",
-      "desc": "一度適用してモデルルーティングを埋めます。アクティブな階層はそこで編集します。",
-      "customizedSummary": "モデルルーティングはすでに {label} を使用しています。",
-      "customizedDesc": "アクティブな階層はモデルルーティングで編集します。",
-      "synthesizedLabel": "生成済みルーティングテンプレート",
-      "synthesizedBadge": "生成済みテンプレート",
-      "customize": "テンプレート詳細を表示 →",
-      "hide": "テンプレート詳細を隠す",
-      "apply": "モデルルーティングに適用",
-      "viewInRouter": "モデルルーティングを開く →",
-      "modeRecommended": "ルーティングテンプレート",
-      "modeCustom": "カスタム",
-      "modeDisabled": "オフ"
+      "modeCustom": "カスタム"
     },
     "modelStrategy": {
+      "summaryPrimary": "保存済みの主用プロバイダー",
+      "summaryRouter": "モデルルーティング",
+      "summaryOn": "オン",
+      "summaryOff": "オフ",
+      "bindingFollowPrimary": "推奨 · 主用に追従",
+      "bindingCustom": "カスタム階層",
+      "bindingLegacy": "既存の階層 · 追従は未指定",
+      "resetRecommended": "{provider} の推奨階層を使用",
+      "resettingRecommended": "推奨階層を更新中…",
+      "resetKeepsOff": "階層を更新し、モデルルーティングはオフのままにします。",
+      "resetKeepsMode": "階層を置き換え、現在のモードを維持します。",
+      "retainedDrafts": "未保存のルーティング変更",
+      "crossProviderDisabledMismatch": "保存済みの階層は他のプロバイダーを使用していますが、プロバイダー間の実行はオフです。",
+      "resetUpgradeHint": "推奨階層を一度に適用するには Gateway を更新してください。",
+      "operationPending": "別のプロバイダーまたはルーティング操作が進行中です。",
+      "activationUpgradeHint": "この Gateway は Router を安全に有効化できるか確認できません。更新してプロバイダーの競合を確認・解決してください。",
+      "savedRefreshFailed": "保存しましたが、最新の設定を取得できませんでした。次の変更の前に設定を再読み込みしてください。",
+      "resultUncertain": "保存結果が不明です。再試行する前に更新された設定を確認してください。",
+      "resetTitle": "{provider} の推奨階層を使用しますか？",
+      "resetBody": "保存済みと未保存の Router 階層の編集を {provider} の推奨階層に置き換えますか？現在のモードと Router スイッチは維持されます。他の未保存設定は保持されます。",
+      "resetConfirm": "推奨階層に置き換える",
+      "resetSaved": "{provider} の推奨階層を保存しました。現在のモードは変更されません。",
       "title": "モデルルーティング",
       "desc": "リクエストごとのモデルの選び方を設定します。",
+      "newSessionDefault": "これは新しいチャットの既定値です。既存のチャットはそれぞれのルーティングモードを維持します。",
       "modeTitle": "モデルの使い方を選択",
       "providerFirstTitle": "最初にモデルサービスを追加",
       "providerFirst": "モデルルーティングには保存済みプロバイダーが少なくとも 1 つ必要です。",
@@ -954,7 +1186,7 @@
       "advancedDesc": "フォールバックレベルとチャットでのルーティング表示。",
       "visualModeLabel": "ルーティング決定パネルの表示スタイル",
       "visualModeDesc": "チャット返信でのルーティング決定の表示方法。",
-      "crossProviderNotice": "プロバイダー横断ルーティングが有効です。保存前に各ティアを確認してください。",
+      "crossProviderNotice": "プロバイダー間の実行が有効です。",
       "cards": {
         "router": {
           "title": "インテリジェントモデルルーティング",
@@ -988,7 +1220,7 @@
       "openrouterFixedDesc": "モデルサービスで {provider} を使用する場合、集約ルーティングは 4 つの提案モデルと 1 つの集約モデルを使います。",
       "openrouterFixedProposer": "提案モデル",
       "openrouterFixedAggregator": "集約モデル",
-      "credentialReady": "接続済み",
+      "credentialReady": "認証情報あり",
       "credentialNeeded": "{provider} の認証情報が必要",
       "credentialMissingEnv": "{envKey} が必要",
       "credentialUnknown": "認証情報は未確認",
@@ -1000,6 +1232,7 @@
       "removeCandidateAria": "{model} を削除",
       "ensembleEmpty": "候補モデルがまだありません。モデルサービスの設定を保存してルーティング階層を生成するか、候補を手動で追加してください。",
       "ensemblePipeline": "仕組み:候補モデルが並行してドラフトを作成し、集約モデルがドラフトを集約して最終回答を生成します。ツールを呼び出せるのは集約モデルのみです。",
+      "candidateModelHint": "モデルアンサンブルは現在、画像分析に対応していません。画像を分析するには、「インテリジェントモデルルーティング」に切り替えて画像対応モデルを設定するか、「固定モデル」で画像対応モデルを選択してください。",
       "ensembleFlowDesc": "複数モデルが並行して下書きし、アグリゲーターが 1 つの回答に統合します。呼び出しは増えます。",
       "legacyDynamicNotice": "この従来の融合プランは保存済みのモデル階層に従います。メンバーを編集するにはカスタム編成に変換してください。",
       "legacyDynamicMigrate": "カスタム編成に変換",
@@ -1018,7 +1251,7 @@
       "aggregatorNote": "全ドラフトを集約して最終回答を生成。ツールを呼び出せる唯一のメンバー",
       "aggregatorSectionLabel": "集約モデル",
       "aggregatorSectionDesc": "最終回答を生成する集約モデルは 1 つだけです。編成内で最も強力なモデルを選んでください。",
-      "aggregatorInheritedNote": "集約モデル未指定 — 現在のチャットモデルがドラフトを集約します",
+      "aggregatorInheritedNote": "現在のモデルを使用",
       "proposerSectionLabel": "提案モデル",
       "proposerRoleLabel": "提案",
       "aggregatorRoleLabel": "集約",
@@ -1028,13 +1261,6 @@
       "presetReadOnlyHint": "プリセット編成はプロバイダーによって管理されています。",
       "presetProviderMismatchNotice": "ターンは保存済みの {presetProvider} プリセットで実行され、{activeProvider} のプリセットではありません — 「プリセット」を選び直すと {activeProvider} に切り替わります。",
       "importTierCandidates": "モデル階層からインポート",
-      "roleSelectAria": "{model} の役割",
-      "roleUnassigned": "役割なし",
-      "role_primary": "主力",
-      "role_contrast": "対照",
-      "role_fast_check": "高速チェック",
-      "role_critic": "批評",
-      "role_aggregator": "集約モデル",
       "addCandidateRoleLabel": "候補の役割",
       "candidateActionsAria": "{model} の操作",
       "replaceModel": "モデルを置き換え",
@@ -1043,7 +1269,7 @@
       "replaceCandidateConfirm": "置き換え",
       "candidateDuplicate": "このモデルは提案モデルの一覧に既にあります。",
       "addProposer": "提案モデルを追加",
-      "chooseAggregator": "集約モデルを選択",
+      "chooseAggregator": "モデルを変更",
       "aggregatorPickerTitle": "集約モデルを選択",
       "aggregatorFromProposers": "既存の提案モデルから選択",
       "aggregatorOtherModel": "または別のモデルを選択",
@@ -1062,7 +1288,8 @@
       "proposerRetriesDesc": "再試行可能な失敗のみ。最初のリクエストは再試行に含みません。",
       "proposerRetriesOption": "最初のリクエスト後に最大 {count} 回再試行",
       "runtimeLimitsLabel": "制限時間",
-      "runtimeLimits": "提案モデルは合計 {proposerTimeout} 秒 · 集約モデルはプロバイダーイベント間のアイドル {aggregatorTimeout} 秒（設定値 {configuredAggregatorTimeout} 秒）· ターン全体の期限は別管理"
+      "runtimeLimits": "提案モデルは合計 {proposerTimeout} 秒 · 集約モデルはプロバイダーイベント間のアイドル {aggregatorTimeout} 秒（設定値 {configuredAggregatorTimeout} 秒）· ターン全体の期限は別管理",
+      "fallbackModelLabel": "フォールバックモデル"
     },
     "behavior": {
       "title": "セッションの動作",
@@ -1089,6 +1316,7 @@
       "colModel": "モデル",
       "colThinking": "思考",
       "colImage": "画像",
+      "imageCapabilityAutomatic": "画像対応はプロバイダーのメタデータとリクエストの結果から自動判定されます。手動設定は不要です。",
       "tierProviderAria": "{tier} のリクエスト入口",
       "tierProviderManagedByEnsemble": "マルチモデル融合が決定",
       "tierProviderManagedByEnsembleAria": "{tier} のリクエスト入口はマルチモデル融合プランによって決まります",
@@ -1119,7 +1347,8 @@
       "tierLegacyDynamicEnsembleSummaryGeneric": "以前保存したモデル階層追従型の融合プランを使用し、失敗時は「固定・フォールバックモデル」を使用します。",
       "tierLegacyDynamicEnsembleFallbackMissingSummary": "以前保存したモデル階層追従型の融合プランを使用しますが、利用可能な「固定・フォールバックモデル」がまだ設定されていません。",
       "tierSingleModelAnnouncement": "C3 は単一モデルを使用します：{model}。",
-      "tierEnsembleImageRouting": "C3 融合は画像を処理しません。画像リクエストには引き続き画像モデル設定が使用されます。",
+      "tierEnsembleImageRouting": "C3 融合は画像の代わりにテキストの注記を受け取ります。Router の画像処理には、設定済みの C0–C3 モデルのみを使用します。",
+      "tierLegacyImageRouting": "旧バージョンとの互換設定：このモデルは保持されますが、画像入力には使用されません。C0–C3 に画像対応モデルを設定してください。",
       "tierThinkingManagedByEnsemble": "融合プランが決定",
       "tierThinkingManagedByEnsembleAria": "{tier} の思考レベルはマルチモデル融合プランによって決まります",
       "tierThinkingAria": "{tier} の思考レベル",
@@ -1337,6 +1566,8 @@
       "tokenLabel": "トークン",
       "optional": "任意",
       "tokenDesc": "認証が必要なゲートウェイ向けのベアラートークンです。このタブにのみ保存されます。",
+      "tokenRequired": "トークンが必要です",
+      "reasonTokenRequired": "認証に失敗しました。自動再試行を一時停止しました。有効なゲートウェイトークンを入力し、接続を選択してください。",
       "reconnect": "再接続",
       "connect": "接続",
       "disconnect": "切断"
@@ -1381,12 +1612,12 @@
       "closeBehaviorFallbackQuit": "このプラットフォームではバックグラウンド実行を利用できないため、ウィンドウを閉じるとアプリは終了します。",
       "closeBehaviorRetry": "再試行",
       "previewModeLabel": "ウェブプレビューのデフォルトモード",
-      "previewModeDesc": "完全プレビューはネットワークに接続できる一時的なブラウザーセッションを使用します。オフラインプレビューは JavaScript を有効にしたまま、外部ネットワーク要求を遮断します。",
-      "previewModeFull": "完全なオンラインプレビュー",
-      "previewModeOffline": "オフラインプレビュー",
+      "previewModeDesc": "インタラクティブプレビューは接続されたページ機能に対応します。制限付きプレビューでは、一部の外部コンテンツや高度な Web 機能が制限される場合があります。",
+      "previewModeFull": "インタラクティブプレビュー",
+      "previewModeOffline": "制限付きプレビュー",
       "previewModeSaving": "保存中…",
-      "previewModeSaveFailed": "ウェブプレビュー設定を保存できませんでした：{error}",
-      "previewModeForcedOffline": "現在、OPENSQUILLA_PREVIEW_FORCE_OFFLINE によりオフラインモードが強制されています。",
+      "previewModeSaveFailed": "ウェブプレビュー設定を保存できませんでした。もう一度お試しください。",
+      "previewModeForcedOffline": "現在のポリシーにより制限付きプレビューが必要です。",
       "resetConfirmTitle": "保存済みのセットアップをリセットしますか？",
       "resetConfirmBody": "保存済みのデスクトップ認証情報と生成された設定が消去されます。次回起動時に初回セットアップが再実行されます。",
       "resetConfirmPrimary": "リセット",
@@ -1520,7 +1751,7 @@
       "migrationCompleteDismiss": "閉じる"
     },
     "keyboard": {
-      "title": "キーボード",
+      "title": "ショートカット",
       "desc": "このブラウザーのグローバルショートカットです。変更は即時に反映され、保存は不要です。",
       "addModifier": "キーに {modifier}（および任意で ⇧ / ⌥）を追加します。",
       "conflict": "すでに「{label}」で使用されています。",
@@ -1531,12 +1762,11 @@
     },
     "advanced": {
       "title": "詳細設定",
-      "desc": "このブラウザー向けの実験的なクライアント設定です。即時に反映されます。次のマークが付いた項目は",
+      "desc": "使用頻度の低いメモリ機能、実験的なオプション、管理ツールです。一部の設定はゲートウェイに保存され、クライアント設定はすぐに反映されます。次のマークが付いた項目は",
       "reload": "再読み込み",
       "descReloadSuffix": "ページ更新後に有効になります。",
-      "foldLabel": "新しいライブターン描画",
-      "foldDesc": "順序付きイベントログからストリーミング中の作業カードを描画します。互換描画へ一時的に戻す場合のみオフにします。",
-      "foldAria": "新しいライブターン描画（再読み込み後に有効）",
+      "experimentsGroup": "実験機能",
+      "managementGroup": "管理",
       "revealLabel": "回答の表示ウィンドウ（ミリ秒）",
       "revealDesc": "ルーターが先に判断できるよう、ライブ回答の表示を [最小, 最大] のウィンドウ内で保持します。最小 ≤ 最大。",
       "revealMinAria": "回答表示の最小ミリ秒",
@@ -1557,18 +1787,19 @@
       "dataMaintenanceAria": "データメンテナンスを開く",
       "runTraceLabel": "ログの実行トレースドロワー",
       "runTraceDesc": "ログ行を操作可能にし、ログビューで行ごとのノードステップ詳細ドロワーを開きます。",
-      "runTraceAria": "ログの実行トレースドロワー（再読み込み後に有効）"
+      "runTraceAria": "ログの実行トレースドロワー（再読み込み後に有効）",
+      "configFileLabel": "設定ファイル",
+      "configFileDesc": "その他のオプションは設定ファイルで変更できます。"
     },
     "privacy": {
-      "title": "プライバシー",
-      "statusEnabled": "ネットワーク報告はオンです。",
-      "statusDisabled": "ネットワーク報告はオフです。",
-      "statusDisabledByEnv": "環境変数の設定により、ネットワーク報告はオフになっています。",
-      "disableNetworkObservabilityLabel": "ネットワーク報告をオフにする",
-      "disableNetworkObservabilityDesc": "インストールおよび日次使用量テレメトリ、バックグラウンドの更新確認、公式 TokenRhythm HTTPS API にのみ送信されるセッション用の仮名識別子と、デフォルトで送信されるセッションをまたぐ任意の X-OpenSquilla-Install-Id ヘッダーを停止します。永続化されたインストール ID はローカルの MAC/IP データから派生する場合がありますが、生のアドレスは送信されません。CI/テスト環境および旧テレメトリ拒否設定でも抑制されますが、更新確認だけを無効にしても抑制されません。自分で開始したモデルリクエストはそのまま動作します。",
-      "memoryAutoCaptureLabel": "自動メモリ",
-      "memoryAutoCaptureDesc": "OpenSquilla が会話の有用な情報を長期メモリに保存することを許可します。",
-      "save": "プライバシーを保存"
+      "statusDisabledByEnv": "環境設定により無効になっています。",
+      "statusNotChosen": "選択はまだ保存されていません。有効にするまでデータは送信されません。",
+      "reliabilityDiagnosticsLabel": "安定性診断",
+      "reliabilityDiagnosticsDesc": "クラッシュや失敗の診断に役立てるため、操作結果、所要時間、プライバシーに配慮したエラー指紋を共有します。会話やファイルの内容は含まれません。",
+      "productAnalyticsLabel": "製品・成長分析",
+      "productAnalyticsDesc": "コンバージョンと機能利用を測定するため、有効化マイルストーンと、実際に開始された MetaSkill およびコーディングモードの実行回数を共有します。会話内容、タスク引数、ファイル、元のアカウント ID は含めず、ランダムな分析専用識別子を使用します。",
+      "networkReportingLabel": "診断・利用統計の送信",
+      "networkReportingDesc": "MetaSkill とコーディングモードの実際の実行回数を含む、匿名の診断情報と利用統計を送信します。アップデート確認も制御します。会話内容、タスク引数、ファイルは含まれません。"
     },
     "toast": {
       "loadFailed": "設定の読み込みに失敗しました: {error}",
@@ -1581,6 +1812,7 @@
       "providerProfileRemoved": "{provider} を削除しました。",
       "providerProfileRemovedImageEnv": "モデルサービスから {provider} を削除しました。画像生成は {envKey} により引き続き利用できます。",
       "providerProfileRemovedImageNeedsCredential": "{provider} を削除しました。画像生成のプロバイダーとモデルは保持されていますが、認証情報の設定が必要です。",
+      "providerRemovedRouterDisabled": "{provider} を削除しました。保存済みの階層が別のプロバイダーを使用しているため、モデルルーティングをオフにしました。",
       "providerCredentialRemoved": "{provider} の認証情報を削除しました。",
       "providerCredentialExternalStillActive": "OpenSquilla に保存された {provider} の認証情報参照を削除しましたが、システム環境変数 {envKey} から引き続き認証情報が提供されています。",
       "providerActivated": "{provider} をアクティブにしました。",
@@ -1594,8 +1826,6 @@
       "routerSaved": "ルーターを保存しました。",
       "routerSavedRestart": "ルーターを保存しました。再起動が必要です。",
       "ensembleSaved": "アンサンブルを保存しました。",
-      "presetApplied": "ルーティングプリセットを適用しました。",
-      "presetAppliedRestart": "ルーティングプリセットを適用しました。再起動が必要です。",
       "channelSaved": "チャンネルを保存しました — ローカル検証済み。「接続テスト」で認証情報を確認できます",
       "channelSavedLive": "チャネルを保存して適用しました——新しい設定で稼働中",
       "channelStartFailed": "チャネルは保存されましたが起動に失敗しました——ステータスでエラーを確認し、再起動で再試行してください",
@@ -1603,6 +1833,8 @@
       "memorySurface": "メモリの埋め込み",
       "memorySaved": "メモリを保存しました。",
       "memorySavedRestart": "メモリを保存しました。埋め込みの変更には再起動が必要です。",
+      "captureSaved": "会話記録の設定を保存しました。",
+      "captureSavedRestart": "会話記録の設定を保存しました。再起動が必要です。",
       "imageSaved": "画像生成を保存しました。",
       "noAudioChanges": "保存するオーディオの変更はありません。",
       "audioSaved": "オーディオを保存しました。",
@@ -1619,7 +1851,10 @@
       "channelEnabled": "チャンネルを有効化しました。再起動が必要です。",
       "channelEnabledLive": "チャネルを有効化して起動しました。",
       "channelDisabled": "チャンネルを無効化しました。再起動が必要です。",
-      "channelDisabledLive": "チャネルを無効化して停止しました。"
+      "channelDisabledLive": "チャネルを無効化して停止しました。",
+      "providerSavedAndActivated": "{provider} を保存し主用に設定しました。",
+      "modelStrategyPartialSaved": "一部のモデル設定は保存されました。主用への変更は完了していません。未保存の編集はフォームに保持されています。",
+      "modelStrategyPartialSaveUncertain": "一部のモデル設定は保存されました。主用への切り替え結果を確認できませんでした。保存済みの状態を確認してください。残りの編集はフォームに保持されています。"
     },
     "needs": {
       "noApiKey": "API キーは不要です。",
@@ -1750,10 +1985,98 @@
           "label": "デバウンス期間（秒）"
         },
         "transport_name": {
+          "label": "接続方式",
           "choices": {
             "polling": "ポーリング",
             "webhook": "Webhook"
           }
+        },
+        "access_token": {
+          "label": "アクセストークン"
+        },
+        "agent_id_int": {
+          "label": "エージェント ID（整数）"
+        },
+        "app_password": {
+          "label": "アプリパスワード"
+        },
+        "app_token": {
+          "label": "アプリレベルトークン（xapp-...）"
+        },
+        "application_id": {
+          "label": "アプリケーション ID"
+        },
+        "cool_app_code": {
+          "label": "Cool App Code"
+        },
+        "corp_id": {
+          "label": "企業 ID"
+        },
+        "default_channel_id": {
+          "label": "デフォルトチャンネル ID"
+        },
+        "device_id": {
+          "label": "デバイス ID"
+        },
+        "domain": {
+          "label": "ドメイン"
+        },
+        "drop_pending_updates": {
+          "label": "未処理のアップデートを破棄"
+        },
+        "encoding_aes_key": {
+          "label": "Encoding AES キー"
+        },
+        "encrypt_key": {
+          "label": "暗号化キー"
+        },
+        "encryption": {
+          "label": "暗号化方式"
+        },
+        "gateway_url": {
+          "label": "ゲートウェイ URL"
+        },
+        "intents": {
+          "label": "Intents ビットマスク"
+        },
+        "password": {
+          "label": "パスワード"
+        },
+        "poll_idle_sleep_s": {
+          "label": "ポーリングアイドル待機（秒）"
+        },
+        "poll_limit": {
+          "label": "1回のポーリング取得上限"
+        },
+        "poll_timeout_s": {
+          "label": "ポーリングタイムアウト（秒）"
+        },
+        "reply_in_thread": {
+          "label": "スレッドで返信"
+        },
+        "robot_code": {
+          "label": "ロボットコード"
+        },
+        "slack_channel_id": {
+          "label": "デフォルトチャンネル ID"
+        },
+        "token": {
+          "label": "ボットトークン（xoxb-...）"
+        },
+        "verification_token": {
+          "label": "検証トークン"
+        },
+        "webhook_path": {
+          "label": "Webhook パス"
+        },
+        "webhook_secret_token": {
+          "label": "Webhook シークレットトークン"
+        },
+        "webhook_url": {
+          "label": "Webhook URL（Webhook のみ）"
+        },
+        "websocket_url": {
+          "label": "WebSocket URL"
         }
       },
       "groups": {
@@ -2189,6 +2512,13 @@
       "enable": "有効化",
       "disable": "無効化",
       "notReported": "報告なし",
+      "transport": {
+        "polling": "ポーリング",
+        "webhook": "Webhook",
+        "websocket": "WebSocket",
+        "http_sync": "HTTP同期",
+        "mixed": "複数の接続方式"
+      },
       "tabs": {
         "overview": "概要",
         "pairings": "メンバー",
@@ -2430,6 +2760,9 @@
       "addAutomation": "自動化を追加",
       "heroTitle": "最初の自動化を始めましょう",
       "heroHint": "指定した時間に、リマインダー、整理、チェック、エージェントタスクを OpenSquilla が自動で実行します。",
+      "runningTitle": "自動化を実行中",
+      "runningSummary": "{total} 件中 {enabled} 件が有効",
+      "enabledLabel": "有効",
       "overviewDesc": "自動化の状態と最近の実行状況を確認します。",
       "templateDesc": "シナリオを選ぶと、実行時間とタスク内容が自動入力されます。",
       "selectedCount": "{count} 件選択",
@@ -2821,17 +3154,16 @@
       "installed": "インストール済み",
       "add": "追加"
     },
-    "skillCard": {
-      "subSkillsTitle": "このメタスキルが使用するサブスキル",
-      "uses": "使用",
-      "dependencies": "宣言済み依存関係",
-      "pythonCount": "Python パッケージ: {count}",
-      "binaryCount": "バイナリ: {count}",
-      "envCount": "環境変数: {count}",
-      "missingCount": "不足している依存関係: {count}",
-      "advisoryCount": "注意事項: {count}"
-    },
     "skillDetail": {
+      "allowUse": "Allow use",
+      "allowUseHelp": "Applies to every skill with this name. Dependencies are installed separately.",
+      "enable": "Allow use",
+      "disable": "Disable use",
+      "saving": "Saving…",
+      "enabledSaved": "Skill use allowed.",
+      "disabledSaved": "Skill use disabled.",
+      "refreshPending": "Saved, but live refresh failed. Restart the Gateway before using this skill.",
+      "disabledContent": "Use is disabled. Allow use to read the skill instructions.",
       "dialogLabel": "スキルの詳細: {name}",
       "triggers": "トリガー",
       "composition": "構成（{kind}、{count} 個のサブスキル）",
@@ -2890,7 +3222,16 @@
       "clearActivity": "履歴を消去",
       "expandActivity": "インストール状況を展開",
       "collapseActivity": "インストール状況を折りたたむ",
+      "selectSkillDirectory": "スキルのディレクトリを選択",
+      "installPhase": {
+        "resolving": "スキルの取得元を確認中",
+        "downloading": "スキルファイルをダウンロード中",
+        "scanning": "スキルの内容を確認中",
+        "committing": "インストール結果を保存中"
+      },
       "queueStatus": {
+        "waiting": "インストール結果を待っています",
+        "selection_required": "ディレクトリの選択待ち",
         "queued": "待機中",
         "installing": "インストール中",
         "cancelling": "キャンセル中",
@@ -3220,9 +3561,100 @@
     }
   },
   "chat": {
+    "skillPalette": {
+      "title": "Commands and skills",
+      "command": "Commands",
+      "skill": "Skills",
+      "meta": "Workflows",
+      "empty": "No matching commands or skills",
+      "loading": "Loading skills…",
+      "autoHint": "スクロールまたは名前で検索 · スキルは自動で選択",
+      "upgrade": "Update the Gateway to select skills for a message.",
+      "loadFailed": "Skills could not be loaded. Close and reopen the menu to retry.",
+      "disabled": "Disabled · Manage",
+      "needsSetup": "Needs setup · Manage",
+      "manualOnly": "Manual use only",
+      "thisMessage": "This message",
+      "remove": "Remove {name} from this message",
+      "queuedHint": "This message will run after the current task.",
+      "limit": "Select up to 16 skills per message.",
+      "metaTextOnly": "This workflow accepts text. Keep attachments and selected skills in a separate message.",
+      "commandAtStart": "Use this command at the start of a message.",
+      "usage": "Usage: {tokens} tokens",
+      "usageFailed": "Unable to load usage. Try again.",
+      "workflowTitle": "Start {name}",
+      "workflowRequest": "What would you like this workflow to do?",
+      "loaded": "Loaded",
+      "failed": "Load failed",
+      "loadingSkill": "Loading",
+      "user": "User selected",
+      "auto": "Automatic",
+      "selected": "Selected",
+      "unsupported": "Update the Gateway before sending a message with selected skills.",
+      "continue": "Continue",
+      "commandWithSkills": "Selected skills apply to a chat message. Remove the skill labels before running a command.",
+      "commandDescriptions": {
+        "new": "新しいチャットを開始",
+        "compact": "現在の文脈を圧縮",
+        "goal": "継続的な目標を設定",
+        "meta": "ワークフローを選択",
+        "plan": "現在のタスクを計画",
+        "reset": "会話をリセット",
+        "usage": "使用量を表示"
+      },
+      "items": {
+        "xlsx": {
+          "name": "Excel spreadsheets",
+          "description": "Create, edit, and analyze spreadsheets"
+        },
+        "docx": {
+          "name": "Word documents",
+          "description": "Create and edit documents"
+        },
+        "pptx": {
+          "name": "PowerPoint slides",
+          "description": "Create and edit presentations"
+        },
+        "pdf": {
+          "name": "PDF tools",
+          "description": "Read, merge, and edit PDFs"
+        },
+        "github": {
+          "name": "GitHub",
+          "description": "Work with issues and pull requests"
+        },
+        "html": {
+          "name": "Web pages",
+          "description": "Build and edit HTML pages"
+        },
+        "webpage": {
+          "name": "Website builder",
+          "description": "Build a complete website"
+        },
+        "kidsProject": {
+          "name": "Kids’ projects",
+          "description": "Plan a creative project for children"
+        },
+        "shortDrama": {
+          "name": "Short drama",
+          "description": "Turn an idea into a video"
+        },
+        "skillCreator": {
+          "name": "Workflow builder",
+          "description": "Combine skills into a workflow"
+        },
+        "paperWriting": {
+          "name": "Academic writing",
+          "description": "Research and draft a paper"
+        }
+      }
+    },
     "sessionCreated": {
       "title": "チャットを作成しました",
-      "open": "チャットを開く"
+      "open": "チャットを開く",
+      "fallbackTitle": "チャット {suffix}",
+      "deleted": "削除済み",
+      "missing": "セッションは削除されたか存在しません"
     },
     "promptCacheKeepalive": {
       "action": "プロンプトキャッシュの維持",
@@ -3247,13 +3679,29 @@
       "autoPauseLabel": "自動一時停止",
       "states": { "off": "オフ", "waiting": "安定したプレフィックスを待機", "scheduled": "予定済み", "probing": "プローブ中", "paused": "アイドル上限に到達；次のメッセージを待機中", "stopped": "失敗後に停止" }
     },
+    "sendPending": "送信中…",
     "send": "送信",
     "sendQueues": "送信（現在の応答後にキューへ追加）",
     "sendSteers": "送信（現在の応答を今すぐ誘導）",
     "sendQueuesUntilCompaction": "送信（圧縮の完了までキューへ追加）",
     "stopResponse": "現在の応答を停止",
     "stopResponseEsc": "現在の応答を停止（Esc）",
+    "stoppingResponse": "安全に停止しています… 新しいメッセージはキューに入ります。",
     "messageToSend": "送信するメッセージ",
+    "promptAnnotations": {
+      "label": "注釈", "draftLabel": "保留中のページ注釈", "sentLabel": "ページ注釈", "element": "選択した領域",
+      "targetLabel": "{kind}：{text}",
+      "targetKinds": { "heading": "見出し", "button": "ボタン", "link": "リンク", "image": "画像", "input": "入力欄", "form": "フォーム", "section": "セクション", "list": "リスト", "table": "表", "text": "テキスト", "region": "領域", "element": "選択した領域" },
+      "emptyDraft": "指示を追加", "stale": "現在のページでこの部分を特定できません",
+      "editingBlocked": "編集中の注釈を追加またはキャンセルしてから送信してください。",
+      "staleBlocked": "現在のページでこの部分を特定できませんが、そのまま AI に送信できます。",
+      "emptyBlocked": "すべての成果物指示を完成してください。", "tooLongBlocked": "成果物指示を UTF-8 で 16 KiB 以内に短くしてから送信してください。", "editLabel": "成果物指示を編集",
+      "removeLabel": "成果物指示を削除", "updateFailed": "成果物指示を保存できませんでした。",
+      "discardFailed": "成果物指示を削除できませんでした。", "focusUnavailable": "現在のページでこの部分を特定できませんが、そのまま AI に送信できます。",
+      "reuseLabel": "新しい注釈としてコピー", "reuseDescription": "変更要求をコピーし、ページ上で対象を選択します。", "reuseUnavailable": "この変更要求をコピーできませんでした。対応するページを開いて対象を選択してください。", "applyPrompt": "添付されたページ注釈を適用してください。",
+      "status": { "unknown": "ページを更新できませんでした", "not_attempted": "ページを更新できませんでした", "applied": "ページを更新しました", "appliedCorrected": "ページを更新しました", "not_applied": "ページを更新できませんでした", "conflict": "ページを更新できませんでした", "ambiguous": "更新を確認中" },
+      "statusDetail": { "unknown": "ページを開いて確認してください。", "not_attempted": "ページは更新されませんでした。", "applied": "", "not_applied": "もう一度お試しください。", "conflict": "ページを開いてもう一度お試しください。", "ambiguous": "再試行する前にページを開いて確認してください。" }
+    },
     "placeholder": "メッセージを送信...",
     "placeholderCompact": "メッセージ...",
     "placeholderLanding": "タスクを割り当てるか、何でも質問してください",
@@ -3294,17 +3742,21 @@
     "loadingSession": "会話履歴を復元しています…",
     "loadingSessionDescription": "履歴の読み込み中も、この会話を引き続き使用できます。",
     "loadSessionFailed": "会話履歴を一時的に読み込めません",
-    "loadSessionDescription": "接続が中断されたか、履歴サービスが一時的に利用できない可能性があります。再読み込みしてください。",
+    "loadSessionDescription": "会話履歴は一時的に利用できません。",
     "reloadSession": "履歴を再読み込み",
     "retryingSession": "会話履歴を再読み込みしています…",
     "retryingSessionDescription": "会話履歴を復元しています…",
     "retryingSessionAction": "再読み込み中…",
     "liveConnecting": "リアルタイム更新を復元しています…",
+    "liveConnectingConnected": "Gateway に接続済みです。このセッションのリアルタイム更新を復元しています…",
+    "gatewayReconnecting": "Gateway に再接続しています…",
+    "automaticRecoveryDescription": "自動的に復旧しています。編集を続けられます。未送信のテキストと添付ファイルはここに保持されます。",
     "liveUnavailable": "リアルタイム更新を一時的に利用できません",
-    "liveUnavailableDescription": "履歴は引き続き表示できます。送信前に再接続してください。",
+    "liveUnavailableDescription": "履歴は引き続き表示できます。リアルタイム更新の復旧後に送信を再開します。",
+    "liveUnavailableConnectedDescription": "Gateway は接続されています。このセッションのリアルタイム更新は一時的に利用できません。",
     "reconnectLive": "再接続",
-    "liveSendBlockedConnecting": "リアルタイム更新を復旧しています。下書きは保持されています。",
-    "liveSendBlockedDegraded": "送信前にリアルタイム更新を再接続してください。下書きは保持されています。",
+    "liveSendBlockedConnecting": "リアルタイム更新は一時的に利用できません。下書きは保持されています。",
+    "liveSendBlockedDegraded": "リアルタイム更新は一時的に利用できません。下書きは保持されています。",
     "noMessagesYet": "メッセージはまだありません。",
     "newChat": "新規タスク",
     "chatWithSuffix": "チャット {suffix}",
@@ -3347,7 +3799,7 @@
     "audioUnsupported": "このブラウザではこの音声形式を再生できません。代わりにファイルをダウンロードしてください。",
     "playVideo": "動画を再生",
     "videoLoadFailed": "動画を読み込めませんでした。",
-    "videoUnsupported": "このブラウザではこの動画形式を再生できません。代わりにファイルをダウンロードしてください。",
+    "videoUnsupported": "このブラウザーでは動画を再生できません。代わりにダウンロードしてください。",
     "previewOf": "プレビュー: {title}",
     "closePreview": "プレビューを閉じる",
     "previousImage": "前の画像",
@@ -3356,7 +3808,6 @@
     "previewDownload": "プレビューのダウンロード",
     "previewTimedOut": "プレビューがタイムアウトしました。",
     "previewFailed": "プレビューの読み込みに失敗しました。",
-    "videoUnsupported": "このブラウザーでは動画を再生できません。代わりにダウンロードしてください。",
     "loadVideoPreview": "動画プレビューを読み込む",
     "loadVideoPreviewFor": "{title} の動画プレビューを読み込む",
     "videoPreviewLoading": "動画プレビューを読み込んでいます。ダウンロード中にキャンセルできます。",
@@ -3388,6 +3839,24 @@
     "subagentPrefix": "サブエージェント: ",
     "subagentCompletion": "サブエージェントの完了",
     "turnFailed": "ターンが失敗しました",
+    "copyDiagnosticId": "診断番号をコピー",
+    "copiedDiagnosticId": "診断番号をコピーしました",
+    "copyDiagnosticFailed": "コピーできませんでした。上の番号を選択して手動でコピーしてください。",
+    "partialFailureNote": "上の回答は保持されていますが、このターンはエラーで終了しました。",
+    "providerFailure": {
+      "rate_limited": "モデル提供元がリクエストを制限しています。しばらくしてから再試行してください。",
+      "provider_overloaded": "モデル提供元が一時的に混雑しています。しばらくしてから再試行してください。",
+      "auth_invalid": "モデル提供元が認証情報を拒否しました。設定で提供元の認証情報を確認してください。",
+      "context_overflow": "リクエストがモデルのコンテキスト長を超えています。短くするか、より長いコンテキストに対応するモデルを選んでください。",
+      "unsupported_feature": "モデル提供元はこのリクエストに対応していません。選択したモデルの機能を確認してください。",
+      "insufficient_credits": "提供元アカウントの残高が不足しています。残高または課金設定を確認してください。",
+      "model_not_found": "設定されたモデルは利用できません。モデル名とアクセス権を確認してください。",
+      "transport_transient": "モデル提供元との接続が中断されました。接続と提供元の稼働状況を確認してください。",
+      "policy_refusal": "提供元がポリシーに基づきリクエストを拒否しました。リクエストと提供元のポリシーを確認してください。",
+      "empty_response": "モデル提供元から回答が返されませんでした。再試行するか別のモデルを選んでください。",
+      "malformed_response": "モデル提供元から無効な応答が返されました。再試行するか別のモデルを選んでください。",
+      "bad_request": "モデル提供元がリクエストを拒否しました。リクエストとモデル設定を確認してください。"
+    },
     "restartInterruptedTitle": "OpenSquilla の再起動によりタスクが中断されました。",
     "restartInterruptedGuidance": "このタスクは自動的には続行されません。既存の結果やツール操作を確認してから、元のリクエストを編集するか、会話を続けてください。",
     "usageAccountingBlockedTitle": "使用量の記録を一時的に利用できません",
@@ -3402,6 +3871,7 @@
     "provenance": {
       "cron": "Cron",
       "scheduled": "スケジュール実行",
+      "scheduledTrigger": "スケジュールによる開始",
       "cronSource": "{tool} によるスケジュール実行"
     },
     "sandboxSetup": {
@@ -3437,6 +3907,8 @@
     "aiModelEnsembleRouter": "AI モデル集約ルーター",
     "routerFx": {
       "selectedModel": "ルーターが {model} を選択しました",
+      "executionModel": "現在の実行モデル：{model}",
+      "executionModelCompleted": "実際に実行したモデル：{model}",
       "ensembleModel": "マルチモデル融合",
       "ensembleSelecting": "AI モデル集約ルーター · 候補を選択中",
       "ensembleHandedOff": "AI モデル集約ルーター · エージェントへ引き継ぎ済み",
@@ -3489,6 +3961,7 @@
         "rateLimited": "レート制限 · {seconds}秒後に再試行",
         "retryWait": "{seconds}秒後に再試行",
         "retrying": "再試行中 {attempt}/{limit}",
+        "retryingWithoutLimit": "再試行中 · {attempt}回目",
         "fallback": "予備モデルに切り替え中"
       },
       "purpose": {
@@ -3524,7 +3997,8 @@
       },
       "more": "ほか {count} 項目",
       "stale": "処理を継続中 — 最近の信号はありません",
-      "liveStep": "ステップ {n}"
+      "liveStep": "ステップ {n}",
+      "recordIncomplete": "アクティビティ記録が不完全なため、互換履歴ビューを表示しています。"
     },
     "suggestedTasks": "おすすめのタスク",
     "greetingMorning": "おはようございます。",
@@ -3549,11 +4023,23 @@
       "cancelled": "キャンセル"
     },
     "toolModal": {
+      "retry": "再試行",
+      "logPending": "実行ログを保存しています。コマンドの終了後に再試行してください。",
+      "copyPage": "このページをコピー",
       "tree": "ツリー",
       "raw": "Raw",
       "wrapLines": "行を折り返す",
       "preserveLines": "行幅を維持",
-      "contentMeta": "{type} · {lines} 行 · {chars} 文字"
+      "contentMeta": "{type} · {lines} 行 · {chars} 文字",
+      "executionLog": "実行ログを表示",
+      "toolResult": "ツールの結果",
+      "characterOffset": "文字位置",
+      "go": "移動",
+      "previous": "前へ",
+      "next": "次へ",
+      "logRange": "{total} 文字中 {start}–{end}",
+      "logReadFailed": "実行ログを読み込めませんでした。再試行してください。",
+      "logIncomplete": "ログは不完全です。保存済みの出力のみ表示できます。"
     },
     "approval": {
       "required": "承認が必要です",
@@ -3598,6 +4084,8 @@
       }
     },
     "plan": {
+      "hidePlan": "計画を非表示",
+      "showPlan": "計画を表示",
       "label": "プラン",
       "process": "計画プロセス",
       "revision": "リビジョン {id}",
@@ -3650,7 +4138,7 @@
     },
     "planMode": {
       "label": "プランモード",
-      "readOnly": "エージェントはファイルを変更せず、調査してプランを提案します。",
+      "readOnly": "まず調査してプランを話し合い、実装はまだ行いません。必要なテストやビルドには通常の権限が適用されます。",
       "nextTurn": "次のターンから適用",
       "updating": "更新中…",
       "turnOff": "プランモードをオフ",
@@ -3671,11 +4159,13 @@
       "answerPlanQuestionnaire": "上の計画の質問に回答してください",
       "previousQuestion": "前へ",
       "nextQuestion": "次へ",
-      "outcomeDoneTitle": "返信を送信しました · 実行を再開",
+      "outcomeDoneTitle": "返信を受信しました",
       "outcomeBusyDetail": "返信を現在処理しています。",
-      "outcomeDoneDetail": "エージェントはこの返信を受け入れ、次へ進みました。",
+      "outcomeDoneDetail": "エージェントが返信を受信しました。",
       "replyReceived": "返信を受信しました · 実行を継続中…",
       "sendingReply": "返信を送信中…",
+      "expiredTitle": "質問は無効になりました",
+      "expiredDetail": "この質問への回答は受け付けていません。新しいメッセージを送信できます。",
       "sendReply": "返信を送信",
       "sendingContinuing": "返信を送信中 · 実行を継続中…"
     },
@@ -3694,6 +4184,26 @@
       }
     },
     "goal": {
+      "settings": "目標の設定",
+      "tokenBudget": "トークン予算",
+      "noTokenBudget": "トークン制限なし",
+      "invalidTokenBudget": "正の整数を入力してください。",
+      "partialUsageHistory": "過去の使用量は不完全なため、トークン予算には含まれません。",
+      "pendingUsageReceipts": "使用量の記録を待っています。記録が揃ったら Goal を再開してください。",
+      "usageReceiptsRecovered": "使用量の記録が揃いました。準備ができたら Goal を再開してください。",
+      "usageAccountingSince": "トークン予算は {time} 以降に記録された使用量を集計します。",
+      "usageAccountingPending": "次のモデルリクエストから予算の集計を開始します。",
+      "usageCoverageUnavailable": "使用量の集計状況を確認できないため、トークン予算を設定できません。",
+      "settingsNotConfirmed": "現在の接続では選択した目標設定への対応を確認できません。変更は適用されず、再試行できるよう保持されています。",
+      "emptyContinuations": "出力やツール操作のないターンが続いたため一時停止しました。目標を確認してから再開してください。",
+      "removeTokenBudget": "トークン予算を解除",
+      "executionPolicy": "実行の継続",
+      "foreground": "接続中のみ",
+      "background": "バックグラウンド",
+      "backgroundHint": "切断後も続行します。サーバー再起動時には目標を一時停止します。",
+      "backgroundActive": "バックグラウンド",
+      "tokenBudgetReached": "トークン予算に到達",
+      "tokenBudgetUsage": "{used} / {budget} トークン",
       "placeholder": "目標を説明して送信すると、取り組みを開始します",
       "modeLabel": "Goal モード",
       "modeDescription": "長期的な目標を開始",
@@ -3761,7 +4271,7 @@
         "busy": "目標の状態を確定中です。最新の状態は上に表示されています。",
         "notResumable": "現在の状態からこの目標を再開できません。",
         "executionDisabled": "このワークスペースでは Goal の実行が無効です。",
-        "connectionRequired": "タスクを再接続してから目標を続行してください。",
+        "connectionRequired": "このタスクはまだ続行できません。",
         "planModeActive": "目標は Plan モードの終了を待ちます。",
         "planRunActive": "目標は進行中の Plan 実行の終了を待ちます。",
         "requestConflict": "この目標操作は別のリクエストですでに使用されています。もう一度お試しください。"
@@ -3785,7 +4295,11 @@
       "routerAnimationOn": "ルーターアニメーション オン",
       "routerAnimationOff": "ルーターアニメーション オフ",
       "modelRouting": "モデルルーティング",
+      "sessionModelRouting": "このチャットのモデルルーティング",
+      "modelRoutingSessionScope": "変更はこのチャットにのみ適用されます。実行中のターンは現在のモードを維持します。",
       "ensembleImageUnsupported": "Ensemble はまだ画像入力に対応していません。「モデルルーティング」で、画像モデルを設定した「AI搭載シングルモデルルーター」、または「オフ」と画像対応モデルを選択してください。",
+      "imageInputUnsupported": "選択したモデルは画像を処理できません。画像対応モデルを選択するか、画像を削除してください。",
+      "routingUpdateBlocked": "モデルルーティングを更新しています。送信する前にお待ちください。",
       "routingUpdateImageBlocked": "モデルルーティングを更新しています。画像を送信する前にお待ちください。",
       "modelRoutingOff": "オフ",
       "modelRoutingOffDesc": "各ターンを選択中のモデルへ送信します。",
@@ -3838,7 +4352,11 @@
         "generic": "現在のタスクでは誘導を利用できません。メッセージはキューに残ります。"
       },
       "clearQueue": "キューをクリア",
-      "removeMessage": "保留中のメッセージ {index} を削除"
+      "removeMessage": "保留中のメッセージ {index} を削除",
+      "offlineRejected": "メッセージは受け付けられませんでした。編集して再試行するか、削除してください。",
+      "offlineQueued": "ローカルに保存しました。接続が復旧すると送信します。",
+      "identityChanged": "接続の認証情報が変わりました。元のゲートウェイとアカウントに再接続して送信してください。",
+      "annotationUpgradeRequired": "この保留中の注釈は旧エディターの形式です。メッセージを編集し、ページを選び直して送信してください。"
     },
     "metaRuns": {
       "draft": "ドラフト",
@@ -3912,6 +4430,8 @@
     "compact": {
       "compacting": "コンテキストを圧縮中",
       "compacted": "コンテキストを圧縮しました",
+      "temporarilyReduced": "履歴を一時的に短縮して処理を続けています",
+      "summarySaved": "要約を保存しました",
       "historyPreserved": "以前のコンテキストを要約しました。元のメッセージは履歴で引き続き確認できます",
       "historyIncomplete": "以前のコンテキストを要約しました。一部の元のメッセージは利用できません",
       "historySummarized": "以前のコンテキストを要約しました",
@@ -3932,6 +4452,35 @@
       "editFile": "ファイルを編集",
       "createFile": "ファイルを作成",
       "searchMemory": "メモリを検索",
+      "readPage": "ページを読み取る",
+      "updatePage": "ページを更新",
+      "searchRunning": "検索中",
+      "searchDone": "検索完了",
+      "searchFailed": "検索に失敗",
+      "fileReadRunning": "ファイルを読み取り中",
+      "fileReadDone": "ファイルの読み取り完了",
+      "fileReadFailed": "ファイルの読み取りに失敗",
+      "networkReadRunning": "ネットワークにアクセス中",
+      "networkReadDone": "ネットワークアクセス完了",
+      "networkReadFailed": "ネットワークアクセスに失敗",
+      "commandRunning": "コマンドを実行中",
+      "commandDone": "コマンドの実行が完了",
+      "commandFailed": "コマンドの実行に失敗",
+      "subagentRunning": "タスクを委任中",
+      "subagentDone": "タスクの委任が完了",
+      "subagentFailed": "タスクの委任に失敗",
+      "mutationRunning": "変更を適用中",
+      "mutationDone": "変更を適用しました",
+      "mutationFailed": "変更の適用に失敗",
+      "fileWriteRunning": "ファイルを書き込み中",
+      "fileWriteDone": "ファイルの書き込みが完了",
+      "fileWriteFailed": "ファイルの書き込みに失敗",
+      "fileEditRunning": "ファイルを編集中",
+      "fileEditDone": "ファイルの編集が完了",
+      "fileEditFailed": "ファイルの編集に失敗",
+      "genericRunning": "ツールを呼び出し中",
+      "genericDone": "ツールの呼び出しが完了",
+      "genericFailed": "ツールの呼び出しに失敗",
       "running": "実行中",
       "failed": "失敗",
       "done": "完了",
@@ -3996,6 +4545,8 @@
       "waitAttachments": "ファイル添付の処理が完了するまでお待ちください",
       "waitCompactionBeforeCommand": "{command} を実行する前にコンテキストの圧縮が完了するまでお待ちください。",
       "waitResponseBeforeCommand": "{command} を実行する前に現在の応答が完了するまでお待ちください。",
+      "promptAnnotationBusy": "現在の応答が完了してから、成果物の編集指示を送信してください。",
+      "offlineQueueFailed": "送信待ちに追加できませんでした。下書きは保持されています。",
       "queueFull": "キューがいっぱいです — 現在の応答が完了するまでお待ちください。",
       "queuePersistenceUnavailable": "分岐が完了するまでこのメッセージを入力欄に残してください。永続的な復旧は現在利用できません。",
       "messageStillSaving": "このメッセージはまだ保存が完了していません — しばらくしてからもう一度お試しください。",
@@ -4036,7 +4587,8 @@
       "unknownProviderCalls": "{count} 件のプロバイダー呼び出しの使用量が不明"
     },
     "modelRouting": {
-      "updateFailed": "モデルルーティングを切り替えられませんでした。元に戻しました。ゲートウェイ接続を確認して再試行してください。"
+      "updateFailed": "モデルルーティングを切り替えられず、元に戻しました。この変更は一時的に利用できません。",
+      "sessionUpdateFailed": "このチャットのモデルルーティングを更新できませんでした: {error}"
     },
     "routeFeedback": {
       "up": "このターンのモデル選択は適切だった",
@@ -4168,17 +4720,33 @@
       "callsCount": "{count} 件の呼び出し",
       "resultsCount": "{count} 件の結果",
       "sectionInput": "入力",
+      "sectionChanges": "変更",
       "sectionDiagnostics": "診断",
       "sectionResult": "結果",
       "sectionError": "エラー",
-      "viewFull": "全文を表示",
+      "viewFull": "内容を展開",
       "activityViewDetails": "詳細を表示",
       "activityDetailsTitle": "詳細",
       "activityBytesWritten": "{size} を書き込み",
       "activityContentSize": "{lines} 行 · {characters} 文字",
       "activityExitCode": "終了コード {code}",
       "activityNotCompleted": "完了できませんでした",
-      "activityPublished": "公開済み"
+      "activityPublished": "公開済み",
+      "documentErrorCategory": "カテゴリ: {category} ({code})",
+      "documentPreviewUnavailableCategory": "プレビューを利用できません",
+      "documentActionUnknownCategory": "操作結果が不明です",
+      "documentEditFailedCategory": "ドキュメントの編集に失敗しました",
+      "documentPreviewUnavailableMessage": "編集プレビューを利用できません。未確定の変更は適用されていません。",
+      "documentActionUnknownMessage": "操作が実行された可能性があります。続行前に現在のプレビューを確認してください。",
+      "documentEditFailedMessage": "ドキュメント操作は完了しませんでした。",
+      "documentRetrySameTurn": "再試行方針: このタスクで続行",
+      "documentRetryNewTurn": "再試行方針: 新しいタスクを開始",
+      "documentRetryNever": "再試行方針: 再試行しない",
+      "documentNextRetry": "次の操作: 再試行",
+      "documentNextReinspect": "次の操作: 再確認",
+      "documentNextFinalize": "次の操作: ツールを使わずに終了",
+      "documentNextNewTurn": "次の操作: 新しいタスクを開始",
+      "documentNextStop": "次の操作: 停止"
     }
   },
   "channelStatus": {

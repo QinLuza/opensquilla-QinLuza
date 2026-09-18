@@ -1,7 +1,8 @@
+import { copySelectedSkills, sameSelectedSkills, type SelectedSkillRef } from '@/types/selectedSkills'
+import { normalizePageContext, pageContextForAnnotations, pageAnnotationSnapshots, type ChatPageContext } from '@/types/pageContext'
 import { computed, ref, watch, type ComputedRef, type Ref } from 'vue'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
-import type { RpcClientError } from '@/lib/rpc'
 import type {
   Attachment,
   ChatMessage,
@@ -9,16 +10,28 @@ import type {
   ChatPendingItem,
   ChatSteerCapability,
 } from '@/types/chat'
-import type { ModelRoutingMode } from '@/types/modelRouting'
+import type {
+  GatewayModelRoutingMode,
+  ImageInputAdmission,
+  ModelRoutingMode,
+} from '@/types/modelRouting'
 import type { CollaborationMode } from '@/types/plans'
+import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type { SandboxRunMode } from '@/types/sandbox'
 import { normalizeSandboxRunMode } from '@/types/sandbox'
 import type {
-  ChatSendParams,
-  ChatSendResponse,
-  SessionSteerV2Params,
-  SessionSteerV2Response,
-} from '@/types/rpc'
+  TurnSendParams,
+  TurnSendSource,
+} from '@/modules/turnCommands'
+import type {
+  TurnSendRequest,
+  TurnCancelRequest,
+  TurnSendResponse,
+  TurnSteerRequest,
+  TurnCommands,
+} from '@/modules/turnCommands'
+import { TurnCommandError } from '@/modules/turnCommands'
+import type { MetaRunCenter } from '@/modules/metaRunCenter'
 import type { ChatRpcStreamApi } from '@/composables/chat/useChatRpcEventHandlers'
 import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
 import type {
@@ -33,6 +46,7 @@ import type { SlashCommandClassification } from '@/composables/chat/useChatSlash
 import { recordSessionNavigationDiag } from '@/utils/chat/sessionNavigationDiag'
 import { canonicalSessionKey } from '@/utils/chat/sessionKeys'
 import {
+  hasModelInputImageAttachment,
   hasSendableModelInputImageAttachment,
   isSendableAttachment,
   serializeDisplayAttachment,
@@ -40,6 +54,10 @@ import {
   type SendableAttachment,
 } from '@/utils/chat/attachments'
 import { localizedChatErrorMessage } from '@/utils/chat/errors'
+import {
+  classifyArtifactProductError,
+  isKnownArtifactProductErrorCode,
+} from '@/utils/artifactProductErrors'
 import { isControlInput } from '@/utils/chat/inputSemantics'
 import {
   createClientMessageId,
@@ -69,8 +87,78 @@ import {
   taskTerminalMessage,
 } from '@/utils/chat/streamEvents'
 
-type RpcClient = {
-  call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
+/**
+ * The pending-steer WAL and delivery helper still store the historical v4
+ * identity spellings. Keep that persistence shape private to this composable
+ * while the TurnCommands Module uses canonical names. This type is a
+ * transitional storage seam, not a public application contract.
+ */
+interface PersistedTurnSteerRequest {
+  key: string
+  message: string
+  expected_turn_id: string
+  client_request_id: string
+  client_message_id: string
+  pendingInputId?: string
+  requestFingerprint?: string
+  expectedRevision?: number
+  surface_id?: string
+  _source?: TurnSendSource
+  [key: string]: unknown
+}
+
+function toCanonicalTurnSteerRequest(
+  params: PersistedTurnSteerRequest,
+): TurnSteerRequest {
+  return {
+    key: params.key,
+    message: params.message,
+    expectedTurnId: params.expected_turn_id,
+    clientRequestId: params.client_request_id,
+    clientMessageId: params.client_message_id,
+    ...(params.pendingInputId !== undefined
+      ? { pendingInputId: params.pendingInputId }
+      : {}),
+    ...(params.requestFingerprint !== undefined
+      ? { requestFingerprint: params.requestFingerprint }
+      : {}),
+    ...(params.expectedRevision !== undefined
+      ? { expectedRevision: params.expectedRevision }
+      : {}),
+    ...(params.surface_id !== undefined ? { surfaceId: params.surface_id } : {}),
+    ...(params._source !== undefined ? { source: params._source } : {}),
+  }
+}
+
+function toPersistedTurnSteerRequest(
+  request: TurnSteerRequest,
+): PersistedTurnSteerRequest {
+  const {
+    key,
+    message,
+    expectedTurnId,
+    clientRequestId,
+    clientMessageId,
+    pendingInputId,
+    requestFingerprint,
+    expectedRevision,
+    surfaceId,
+    source,
+    ...extensions
+  } = request
+  return {
+    ...extensions,
+    key,
+    message,
+    expected_turn_id: expectedTurnId,
+    client_request_id: clientRequestId,
+    client_message_id: clientMessageId,
+    ...(pendingInputId !== undefined ? { pendingInputId } : {}),
+    ...(requestFingerprint !== undefined ? { requestFingerprint } : {}),
+    ...(expectedRevision !== undefined ? { expectedRevision } : {}),
+    ...(surfaceId !== undefined ? { surface_id: surfaceId } : {}),
+    ...(source !== undefined ? { _source: source } : {}),
+  }
 }
 
 interface SendAttempt {
@@ -78,25 +166,33 @@ interface SendAttempt {
   clientMessageId: string
   composerText: string
   requestSessionKey: string
+  deliveryIdentity?: string | null
+  draftIds: string[]
+  promptAnnotations: PromptAnnotationSnapshot[]
+  promptAnnotationsAcknowledged?: boolean
+  selectedSkills: SelectedSkillRef[]
+  composerSkillRefs?: SelectedSkillRef[]
+  unconsumedComposer?: ComposerSnapshot
+  pageContext: ChatPageContext | null
   queueMode?: 'steer'
   text: string
   attachments: SendableAttachment[]
   intent: string | null
   initialCollaborationMode: CollaborationMode | null
+  initialRoutingMode: GatewayModelRoutingMode | null
   forkBeforeMessageId: string | null
   workspaceId: string | null
   restoreComposerOnHandoffFailure?: boolean
   handoffWalOwnerId?: string
   handoffWalRevision?: number
   replayCoordinationKey?: string
-  params: ChatSendParams
+  params: TurnSendParams
   requiresIdempotentReplay?: boolean
   // A Stop issued before durable acceptance is known belongs to this exact
   // idempotent request, not to whichever session happens to be visible later.
   stopRequested?: boolean
-  acceptanceRpc?: {
-    method: 'chat.send' | 'sessions.pending_inputs.dispatch'
-    params: Record<string, unknown>
+  acceptanceRequest?: {
+    request: TurnSendRequest
   }
   acceptanceResolved?: boolean
   acceptanceInFlight?: boolean
@@ -116,28 +212,37 @@ interface ExplicitSendPayload {
   forkBeforeMessageId: string | null
   workspaceId?: string | null
   initialCollaborationMode?: CollaborationMode | null
+  selectedSkills?: SelectedSkillRef[]
+  pageContext?: ChatPageContext | null
+  initialRoutingMode?: GatewayModelRoutingMode | null
 }
 
 interface ComposerSnapshot {
   revision: number | null
   inputText: string
+  draftIds: string[]
+  selectedSkills: SelectedSkillRef[]
+  pageContext: ChatPageContext | null
   attachmentRefs: Attachment[]
   payloadAttachments: Attachment[]
   intent: string | null
   forkBeforeMessageId: string | null
   workspaceId: string | null
   initialCollaborationMode: CollaborationMode | null
+  initialRoutingMode: GatewayModelRoutingMode | null
   queueOwnerRequestId: string | null
 }
 
 interface DispatchSendOptions {
   composerText?: string
+  draftIds?: readonly string[]
   queueMode?: 'steer'
   payload?: ExplicitSendPayload
   preserveComposer?: boolean
   composerSnapshot?: ComposerSnapshot
   cancelIfComposerChanged?: boolean
   retryAttempt?: SendAttempt | null
+  idempotentReplay?: boolean
   rememberRetryableAttempt?: (attempt: SendAttempt) => void
   durablePendingItem?: ChatPendingItem
   /** Delay branch truncation and optimistic rendering until ingress accepts. */
@@ -159,6 +264,7 @@ interface DispatchSendOptions {
 }
 
 export interface UsageBarrierReplayPayload {
+  selectedSkills?: SelectedSkillRef[]
   text: string
   forkBeforeMessageId: string
 }
@@ -211,41 +317,54 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
 
+function turnCommandFailure(err: unknown): TurnCommandError | null {
+  return err instanceof TurnCommandError ? err : null
+}
+
 function errorCode(err: unknown): string | undefined {
-  const code = (err as RpcClientError | null | undefined)?.code
-  return typeof code === 'string' && code ? code : undefined
+  return turnCommandFailure(err)?.failureCode
 }
 
 function sendFailureMessage(err: unknown): string {
-  return localizedChatErrorMessage(errorCode(err), 'Send failed: ' + errorMessage(err))
+  const code = errorCode(err)
+  const artifactFailure = turnCommandFailure(err)?.artifactFailure
+  if (artifactFailure?.artifactScoped && isKnownArtifactProductErrorCode(artifactFailure.code)) {
+    const classified = classifyArtifactProductError(artifactFailure)
+    const translated = String(i18n.global.t(classified.messageKey))
+    return translated === classified.messageKey
+      ? classified.fallbackMessage
+      : translated
+  }
+  return localizedChatErrorMessage(code, 'Send failed: ' + errorMessage(err))
 }
 
 function shouldRestoreSendAttempt(err: unknown): boolean {
   // Unknown acceptance (for example a lost response) is safe to retry because
   // the exact attempt keeps its durable clientRequestId. Only a positive
   // accepted signal proves that restoring the composer would be misleading.
-  return (err as RpcClientError | null | undefined)?.accepted !== true
+  return turnCommandFailure(err)?.accepted !== true
 }
 
 function hasUnknownAcceptance(err: unknown): boolean {
-  const accepted = (err as RpcClientError | null | undefined)?.accepted
+  const accepted = turnCommandFailure(err)?.accepted
   return accepted !== true && accepted !== false
 }
 
-function rpcErrorDetail(err: unknown, key: string): unknown {
-  const rpcError = err as RpcClientError | null | undefined
-  if (rpcError && Object.prototype.hasOwnProperty.call(rpcError, key)) {
-    return (rpcError as unknown as Record<string, unknown>)[key]
-  }
-  const details = rpcError?.details
+function turnFailureDetail(err: unknown, key: string): unknown {
+  const failure = turnCommandFailure(err)
+  if (!failure) return undefined
+  if (key === 'retryable') return failure.retryable
+  if (key === 'retry_after_ms' || key === 'retryAfterMs') return failure.retryAfterMs
+  if (key === 'accepted') return failure.accepted
+  const details = failure.details
   return details && typeof details === 'object'
     ? (details as Record<string, unknown>)[key]
     : undefined
 }
 
 function steerFallbackSafe(err: unknown): boolean {
-  return rpcErrorDetail(err, 'fallback_safe') === true
-    || rpcErrorDetail(err, 'fallbackSafe') === true
+  return turnFailureDetail(err, 'fallback_safe') === true
+    || turnFailureDetail(err, 'fallbackSafe') === true
 }
 
 interface AcceptedErrorInfo {
@@ -255,17 +374,17 @@ interface AcceptedErrorInfo {
 }
 
 function acceptedErrorInfo(err: unknown): AcceptedErrorInfo | null {
-  const rpcError = err as RpcClientError | null | undefined
-  if (rpcError?.accepted !== true) return null
-  const details = rpcError.details && typeof rpcError.details === 'object'
-    ? rpcError.details as Record<string, unknown>
+  const failure = turnCommandFailure(err)
+  if (failure?.accepted !== true) return null
+  const details = failure.details && typeof failure.details === 'object'
+    ? failure.details as Record<string, unknown>
     : {}
   const rawMessageId = details.orphan_message_id ?? details.orphanMessageId
   const rawSessionKey = details.session_key ?? details.sessionKey
   return {
     messageId: typeof rawMessageId === 'string' ? rawMessageId : '',
     sessionKey: typeof rawSessionKey === 'string' ? rawSessionKey : '',
-    terminalWithoutTask: rpcError.code === 'QUEUE_FULL_DIRTY',
+    terminalWithoutTask: failure.failureCode === 'QUEUE_FULL_DIRTY',
   }
 }
 
@@ -277,20 +396,19 @@ const TERMINAL_TASK_STATUSES = new Set([
   'abandoned',
 ])
 
-function terminalResponseStatus(response: ChatSendResponse | null | undefined): string {
-  const status = String(response?.task_status || response?.taskStatus || '').toLowerCase()
+function terminalResponseStatus(response: TurnSendResponse | null | undefined): string {
+  const status = String(response?.taskStatus || '').toLowerCase()
   return TERMINAL_TASK_STATUSES.has(status) ? status : ''
 }
 
-function terminalReplayMessage(response: ChatSendResponse, status: string): string {
-  const supplied = response.terminal_message || response.terminalMessage ||
-    response.terminal_reason || response.terminalReason || response.reason
+function terminalReplayMessage(response: TurnSendResponse, status: string): string {
+  const supplied = response.terminalMessage || response.terminalReason || response.reason
   if (typeof supplied === 'string' && supplied.trim()) return supplied.trim()
   return taskTerminalMessage(status, {})
 }
 
-function terminalReplayErrorCode(response: ChatSendResponse, status: string): string {
-  const reason = response.terminal_reason || response.terminalReason || response.reason
+function terminalReplayErrorCode(response: TurnSendResponse, status: string): string {
+  const reason = response.terminalReason || response.reason
   const normalized = typeof reason === 'string' ? reason.trim().toLowerCase() : ''
   return /^[a-z][a-z0-9_.-]*$/.test(normalized) ? normalized : status
 }
@@ -314,26 +432,34 @@ function matchesRecoveredDraft(
   attempt: SendAttempt,
   input: {
     requestSessionKey: string
+    draftIds: readonly string[]
+    selectedSkills: SelectedSkillRef[]
+    pageContext: ChatPageContext | null
     text: string
     attachments: SendableAttachment[]
     intent: string | null
     initialCollaborationMode: CollaborationMode | null
+    initialRoutingMode: GatewayModelRoutingMode | null
     forkBeforeMessageId: string | null
     workspaceId: string | null
   },
 ): boolean {
   return (
     attempt.requestSessionKey === input.requestSessionKey &&
+    JSON.stringify(attempt.draftIds) === JSON.stringify(input.draftIds) &&
+    JSON.stringify(attempt.pageContext) === JSON.stringify(input.pageContext) &&
+    sameSelectedSkills(attempt.selectedSkills, input.selectedSkills) &&
     attempt.text === input.text &&
     attempt.intent === input.intent &&
     attempt.initialCollaborationMode === input.initialCollaborationMode &&
+    attempt.initialRoutingMode === input.initialRoutingMode &&
     attempt.forkBeforeMessageId === input.forkBeforeMessageId &&
     attempt.workspaceId === input.workspaceId &&
     sameSendableAttachments(input.attachments, attempt)
   )
 }
 
-function chatSourceMetadata(options: UseChatSendOptions): ChatSendParams['_source'] {
+function chatSourceMetadata(options: UseChatSendOptions): TurnSendSource {
   const elevated = options.normalizeElevatedMode(options.elevatedMode.value)
   return {
     ...(elevated ? { elevated } : {}),
@@ -342,10 +468,16 @@ function chatSourceMetadata(options: UseChatSendOptions): ChatSendParams['_sourc
 }
 
 export interface UseChatSendOptions {
-  rpc: RpcClient
-  supportsMethod?: (method: string) => boolean
+  metaRunCenter?: Pick<MetaRunCenter, 'discardDraft'>
+  /** Semantic command port; v4 method aliases live in the Gateway Adapter. */
+  turnCommands: TurnCommands
   activeSteerCapability?: Readonly<Ref<ChatSteerCapability | null>>
   inputText: Ref<string>
+  selectedSkills?: Ref<SelectedSkillRef[]>
+  consumeAcceptedDraft?: (
+    sessionKey: string,
+    snapshot: { text: string; selectedSkills: SelectedSkillRef[] },
+  ) => boolean | void | Promise<boolean | void>
   messages: Ref<ChatMessage[]>
   sessionKey: Ref<string>
   pendingQueueOwnerContext: Ref<PendingQueueOwnerContext | null>
@@ -354,15 +486,30 @@ export interface UseChatSendOptions {
   busySendMode: Ref<BusySendMode>
   modelRoutingMode: Readonly<Ref<ModelRoutingMode>>
   modelRoutingSettingsBusy: Readonly<Ref<boolean>>
+  imageInputAdmission?: Readonly<Ref<ImageInputAdmission>>
   elevatedMode: Ref<string>
   runMode: Ref<SandboxRunMode>
   pendingAttachments: Ref<Attachment[]>
   composerRevision?: Readonly<Ref<number>>
   pendingSessionIntent: Ref<string | null>
   initialCollaborationMode: Readonly<Ref<CollaborationMode>>
+  initialRoutingMode: Readonly<Ref<GatewayModelRoutingMode | null>>
   pendingForkBeforeMessageId: Ref<string | null>
+  draftIds?: Readonly<Ref<readonly string[]>>
+  promptAnnotationSnapshots?: (ids: readonly string[]) => PromptAnnotationSnapshot[]
+  annotationAttachments?: (ids: readonly string[]) => Attachment[]
+  acknowledgePromptAnnotations?: (
+    snapshots: readonly PromptAnnotationSnapshot[],
+    sessionKey: string,
+    requestSessionKey?: string,
+  ) => void
   pendingWorkspaceId?: Ref<string | null>
   sendBlockedReason?: Readonly<Ref<string | null>>
+  /** Proven identity supplied only for an eligible, never-sent offline click. */
+  offlineQueueIdentity?: Readonly<Ref<string | null>>
+  deliveryIdentity?: Readonly<Ref<string | null>>
+  /** Transport/admission-only gate used by exact replays after unknown acceptance. */
+  idempotentReplayBlockedReason?: Readonly<Ref<string | null>>
   validateActiveProjectBeforeSend?: () => Promise<string | null>
   acceptPendingWorkspaceBinding?: (workspaceId: string | null) => void
   materializeDraftSession?: (sessionKey: string) => void
@@ -402,14 +549,28 @@ export interface UseChatSendOptions {
     isCurrent?: () => boolean
     attachments?: Attachment[]
   }) => Promise<boolean>
+  preparePromptAnnotationsForSend?: (
+    ids: readonly string[],
+    options?: { isCurrent?: () => boolean },
+  ) => Promise<boolean>
   enqueuePendingInput: (
     text: string,
     owner?: PendingQueueOwner,
-    enqueueOptions?: { confirmedPlainText?: boolean },
+    enqueueOptions?: {
+      confirmedPlainText?: boolean
+      draftIds?: readonly string[]
+      selectedSkills?: SelectedSkillRef[]
+      pageContext?: ChatPageContext
+      attachments?: Attachment[]
+      deliveryIdentity?: string
+    },
   ) => boolean | Promise<boolean>
   enqueuePendingPayload?: (
     payload: {
       text: string
+      draftIds?: readonly string[]
+      selectedSkills?: SelectedSkillRef[]
+      pageContext?: ChatPageContext
       attachments?: Attachment[]
       intent?: string | null
       confirmedPlainText?: boolean
@@ -468,6 +629,12 @@ export function useChatSend(options: UseChatSendOptions) {
   const hiddenDispatchInFlight = new Map<string, Promise<HiddenControlDispatchResult>>()
   const renderedHiddenControls = new Set<string>()
   const acceptanceRecoveryVersion = ref(0)
+  const composerSubmissions = new Map<symbol, { sessionKey: string; snapshot: ComposerSnapshot }>()
+  const composerSubmissionVersion = ref(0)
+  const sendPending = computed(() => {
+    composerSubmissionVersion.value
+    return [...composerSubmissions.values()].some(entry => entry.sessionKey === options.sessionKey.value)
+  })
 
   function noteAcceptanceRecoveryChanged() {
     acceptanceRecoveryVersion.value += 1
@@ -499,10 +666,66 @@ export function useChatSend(options: UseChatSendOptions) {
 
   const recoveredQueuedAttempts = new WeakMap<ChatPendingItem, SendAttempt>()
 
+  function currentAnnotationDraftIds(): string[] {
+    return [...(options.draftIds?.value || [])]
+      .map(value => String(value || '').trim())
+      .filter((value, index, values) => Boolean(value) && values.indexOf(value) === index)
+      .slice(0, 16)
+  }
+
+  function acknowledgeAttemptPromptAnnotations(
+    attempt: SendAttempt,
+    response: TurnSendResponse,
+  ) {
+    if (!attempt.promptAnnotations.length || attempt.promptAnnotationsAcknowledged) return
+    attempt.promptAnnotationsAcknowledged = true
+    setAttemptPromptAnnotations(attempt, attempt.promptAnnotations)
+    const acceptedSessionKey = String(
+      response.sessionKey
+        || attempt.acceptedSessionKey
+        || attempt.requestSessionKey,
+    ).trim() || attempt.requestSessionKey
+    attempt.acceptedSessionKey = acceptedSessionKey
+    options.acknowledgePromptAnnotations?.(
+      attempt.promptAnnotations,
+      acceptedSessionKey,
+      acceptedSessionKey === attempt.requestSessionKey ? undefined : attempt.requestSessionKey,
+    )
+  }
+
+  function setAttemptPromptAnnotations(
+    attempt: SendAttempt,
+    snapshots: readonly PromptAnnotationSnapshot[],
+  ): void {
+    const messageIndex = options.messages.value.findIndex(message => (
+      message.clientId === attempt.clientMessageId
+    ))
+    if (messageIndex >= 0) {
+      const message = options.messages.value[messageIndex]
+      if (message) {
+        const next = { ...message }
+        if (snapshots.length > 0) next.promptAnnotations = [...snapshots]
+        else delete next.promptAnnotations
+        options.messages.value[messageIndex] = next
+      }
+    }
+  }
+
   function pendingWorkspaceForIntent(intent: string | null): string | null {
     return intent === 'new_chat'
       ? options.pendingWorkspaceId?.value || null
       : null
+  }
+
+  function composerAttachments(ids = currentAnnotationDraftIds()): Attachment[] {
+    const attachments = [
+      ...options.pendingAttachments.value,
+      ...(options.annotationAttachments?.(ids) || []),
+    ]
+    return attachments.filter((item, index) => attachments.findIndex(candidate => (
+      candidate.local_id === item.local_id
+      || (item.file_uuid && candidate.file_uuid === item.file_uuid)
+    )) === index)
   }
 
   function captureComposerSnapshot(): ComposerSnapshot {
@@ -512,12 +735,18 @@ export function useChatSend(options: UseChatSendOptions) {
     return {
       revision: options.composerRevision?.value ?? null,
       inputText: options.inputText.value,
+      selectedSkills: copySelectedSkills(options.selectedSkills?.value),
+      draftIds: currentAnnotationDraftIds(),
+      pageContext: pageContextForAnnotations(
+        options.promptAnnotationSnapshots?.(currentAnnotationDraftIds()) || [],
+      ),
       attachmentRefs,
-      payloadAttachments: attachmentRefs.map(attachment => ({ ...attachment })),
+      payloadAttachments: composerAttachments().map(attachment => ({ ...attachment })),
       intent,
       forkBeforeMessageId: options.pendingForkBeforeMessageId.value,
       workspaceId: pendingWorkspaceForIntent(intent),
       initialCollaborationMode: initialModeForIntent(intent),
+      initialRoutingMode: initialRoutingModeForIntent(intent),
       queueOwnerRequestId: queueOwnerContext?.sessionKey === options.sessionKey.value
         ? queueOwnerContext.ownerRequestId
         : null,
@@ -546,6 +775,8 @@ export function useChatSend(options: UseChatSendOptions) {
     ) return false
     return (
       options.inputText.value === snapshot.inputText
+      && sameSelectedSkills(options.selectedSkills?.value, snapshot.selectedSkills)
+      && JSON.stringify(currentAnnotationDraftIds()) === JSON.stringify(snapshot.draftIds)
       && options.pendingSessionIntent.value === snapshot.intent
       && options.pendingForkBeforeMessageId.value === snapshot.forkBeforeMessageId
       && pendingWorkspaceForIntent(options.pendingSessionIntent.value) === snapshot.workspaceId
@@ -563,13 +794,16 @@ export function useChatSend(options: UseChatSendOptions) {
       forkBeforeMessageId: snapshot.forkBeforeMessageId,
       workspaceId: snapshot.workspaceId,
       initialCollaborationMode: snapshot.initialCollaborationMode,
+      pageContext: snapshot.pageContext,
+      selectedSkills: copySelectedSkills(snapshot.selectedSkills),
+      initialRoutingMode: snapshot.initialRoutingMode,
     }
   }
 
   function modelImageSendBlocked(attachments: readonly Attachment[]): boolean {
-    if (!hasSendableModelInputImageAttachment(attachments)) return false
+    if (!hasModelInputImageAttachment(attachments)) return false
     return options.modelRoutingSettingsBusy.value
-      || options.modelRoutingMode.value === 'llm_ensemble'
+      || options.imageInputAdmission?.value === 'blocked'
   }
 
   function activeSteerCapability(): ChatSteerCapability | null {
@@ -588,8 +822,8 @@ export function useChatSend(options: UseChatSendOptions) {
     ).trim()
   }
 
-  function taskAcceptanceStatus(response: ChatSendResponse | null | undefined): string {
-    return String(response?.task_status || response?.taskStatus || '').trim().toLowerCase()
+  function taskAcceptanceStatus(response: TurnSendResponse | null | undefined): string {
+    return String(response?.taskStatus || '').trim().toLowerCase()
   }
 
   function hasAuthoritativeWork(): boolean {
@@ -599,7 +833,7 @@ export function useChatSend(options: UseChatSendOptions) {
   }
 
   function noteAcceptedTask(
-    response: ChatSendResponse | null | undefined,
+    response: TurnSendResponse | null | undefined,
     requestSessionKey: string,
   ): {
     taskId: string
@@ -631,12 +865,11 @@ export function useChatSend(options: UseChatSendOptions) {
     const activeTaskId = String(options.activeStreamTaskId.value || '').trim()
     const inputKinds = capability?.input_kinds
     return Boolean(
-      options.supportsMethod?.('sessions.steer.v2')
+      options.turnCommands.supports('same-turn-steer')
       && capability?.mode === 'same_turn'
       && expectedTurnId
       && activeTaskId === expectedTurnId
       && (!inputKinds?.length || inputKinds.includes('text'))
-      && options.modelRoutingMode.value !== 'llm_ensemble',
     )
   }
 
@@ -776,12 +1009,12 @@ export function useChatSend(options: UseChatSendOptions) {
       const isCurrentRequest = options.sessionKey.value === attempt.requestSessionKey
       if (isCurrentRequest) options.taskOwnership?.requestStop(taskId)
       try {
-        const abort = await options.rpc.call<{ aborted?: boolean, reason?: string }>('chat.abort', {
+        const abort = await options.turnCommands.cancel({
           sessionKey: attempt.acceptedSessionKey || attempt.requestSessionKey,
           taskId,
           source: 'webui_stop',
           scope: 'task',
-        })
+        } satisfies TurnCancelRequest)
         if (abort?.aborted !== true) {
           if (isCurrentRequest) {
             await options.reconcileTaskOwnership?.()
@@ -821,8 +1054,10 @@ export function useChatSend(options: UseChatSendOptions) {
 
   async function settleRecoveredAcceptance(
     attempt: SendAttempt,
-    response: ChatSendResponse,
+    response: TurnSendResponse,
   ): Promise<boolean> {
+    consumeAcceptedComposer(attempt)
+    acknowledgeAttemptPromptAnnotations(attempt, response)
     attempt.acceptanceResolved = true
     attempt.acceptedTaskId = acceptedTaskId(response)
     attempt.acceptedSessionKey = response.sessionKey || attempt.requestSessionKey
@@ -869,7 +1104,7 @@ export function useChatSend(options: UseChatSendOptions) {
   }
 
   function scheduleAcceptanceRecovery(attempt: SendAttempt) {
-    if ((attempt.acceptanceResolved && !attempt.stopRequested) || !attempt.acceptanceRpc) return
+    if ((attempt.acceptanceResolved && !attempt.stopRequested) || !attempt.acceptanceRequest) return
     const key = acceptanceAttemptKey(attempt)
     if (acceptanceRecoveryWorkers.has(key)) return
 
@@ -888,22 +1123,21 @@ export function useChatSend(options: UseChatSendOptions) {
         if (attempt.acceptanceInFlight) continue
         attempt.acceptanceInFlight = true
         try {
-          const response = await options.rpc.call<ChatSendResponse>(
-            attempt.acceptanceRpc!.method,
-            attempt.acceptanceRpc!.params,
+          const response = await options.turnCommands.send(
+            attempt.acceptanceRequest!.request,
           )
           if (await settleRecoveredAcceptance(attempt, response)) return
         } catch (error: unknown) {
-          const rpcError = error as RpcClientError | null | undefined
+          const commandError = turnCommandFailure(error)
           const accepted = acceptedErrorInfo(error)
-          if (rpcError?.accepted === false || accepted?.terminalWithoutTask) {
+          if (commandError?.accepted === false || accepted?.terminalWithoutTask) {
             attempt.acceptanceResolved = true
             if (attempt.stopRequested) clearAttemptStop(attempt)
             if (
               attempt.hiddenControl
               && (
                 accepted?.terminalWithoutTask
-                || (rpcError?.accepted === false && rpcError.retryable === false)
+                || (commandError?.accepted === false && commandError.retryable === false)
               )
             ) {
               removeHiddenControl(
@@ -948,7 +1182,47 @@ export function useChatSend(options: UseChatSendOptions) {
     return intent === 'new_chat' ? options.initialCollaborationMode.value : null
   }
 
+  function initialRoutingModeForIntent(intent: string | null): GatewayModelRoutingMode | null {
+    return intent === 'new_chat' ? options.initialRoutingMode.value : null
+  }
+
+  function consumeAcceptedComposer(attempt: SendAttempt): void {
+    if (options.sessionKey.value !== attempt.requestSessionKey) {
+      if (attempt.unconsumedComposer && !attempt.hiddenControl) {
+        const snapshot = attempt.unconsumedComposer
+        attempt.unconsumedComposer = undefined
+        void Promise.resolve(options.consumeAcceptedDraft?.(attempt.requestSessionKey, {
+          text: snapshot.inputText,
+          selectedSkills: copySelectedSkills(snapshot.selectedSkills),
+        })).catch(() => {})
+      }
+      return
+    }
+    if (!attempt.hiddenControl && options.selectedSkills && attempt.unconsumedComposer
+      && options.selectedSkills.value === attempt.composerSkillRefs
+      && composerMatchesSnapshot(attempt.unconsumedComposer)) {
+      const sentAttachmentIds = new Set(attempt.attachments.map(attachment => attachment.local_id))
+      options.inputText.value = ''
+      options.selectedSkills.value = []
+      options.pendingAttachments.value = options.pendingAttachments.value.filter(
+        attachment => !sentAttachmentIds.has(attachment.local_id),
+      )
+      if (options.pendingForkBeforeMessageId.value === attempt.forkBeforeMessageId) {
+        options.pendingForkBeforeMessageId.value = null
+      }
+      options.autoResizeTextarea()
+      attempt.unconsumedComposer = undefined
+    }
+  }
+
+  function explicitComposerChanged(attempt: SendAttempt): boolean {
+    return Boolean(attempt.selectedSkills.length && attempt.unconsumedComposer
+      && (options.selectedSkills?.value !== attempt.composerSkillRefs
+        || !composerMatchesSnapshot(attempt.unconsumedComposer)))
+  }
+
   function consumeAcceptedSessionIntent(attempt: SendAttempt): void {
+    consumeAcceptedComposer(attempt)
     if (options.sessionKey.value !== attempt.requestSessionKey) return
     if (attempt.intent === 'new_chat') {
       options.materializeDraftSession?.(attempt.requestSessionKey)
@@ -1417,6 +1691,13 @@ export function useChatSend(options: UseChatSendOptions) {
   function restoreResponseHandoffDraft(record: ResponseHandoffWalRecord): boolean {
     if (options.sessionKey.value !== record.requestSessionKey) return false
     if (record.restoreComposerOnFailure === false) return true
+    if (record.params.selectedSkills?.length && options.inputText.value
+      && options.inputText.value !== record.composerText) return false
+    if (record.params.selectedSkills?.length && options.selectedSkills) {
+      if (options.selectedSkills.value.length
+        && !sameSelectedSkills(options.selectedSkills.value, record.params.selectedSkills)) return false
+      options.selectedSkills.value = copySelectedSkills(record.params.selectedSkills)
+    }
     const restoredText = record.composerText.trim()
     if (restoredText && options.inputText.value !== restoredText) {
       options.inputText.value = [restoredText, options.inputText.value]
@@ -1485,10 +1766,10 @@ export function useChatSend(options: UseChatSendOptions) {
         let refreshedExpiredAttachments = false
         while (true) {
           try {
-            const response = await options.rpc.call<ChatSendResponse>(
-              'chat.send',
-              replayRecord.params,
-            )
+            const response = await options.turnCommands.send({
+              kind: 'new-turn',
+              params: replayRecord.params,
+            })
             const targetSessionKey = response.sessionKey || replayRecord.requestSessionKey
             await finalizeRecoveredHandoff(replayRecord, targetSessionKey)
             break
@@ -1498,9 +1779,9 @@ export function useChatSend(options: UseChatSendOptions) {
               await finalizeRecoveredHandoff(replayRecord, accepted.sessionKey)
               break
             }
-            const rpcError = error as RpcClientError | null | undefined
+            const commandError = turnCommandFailure(error)
             const code = errorCode(error)
-            const definitelyRejected = rpcError?.accepted === false
+            const definitelyRejected = commandError?.accepted === false
             const canRefreshExpiredAttachments = (
               definitelyRejected
               && !refreshedExpiredAttachments
@@ -1539,7 +1820,7 @@ export function useChatSend(options: UseChatSendOptions) {
                 continue
               }
             }
-            if (definitelyRejected && rpcError?.retryable === false) {
+            if (definitelyRejected && commandError?.retryable === false) {
               await wal.putHandoff?.({
                 ...replayRecord,
                 state: 'failed',
@@ -1547,7 +1828,10 @@ export function useChatSend(options: UseChatSendOptions) {
                 updatedAt: Date.now(),
               }).catch(() => {})
               await options.failPendingQueueHandoff?.(replayRecord.ownerRequestId)
-              pushToast(sendFailureMessage(error), { tone: 'danger' })
+              pushToast(
+                sendFailureMessage(error),
+                { tone: 'danger' },
+              )
             }
             // Unknown/retryable acceptance deliberately remains submitting
             // and is replayed byte-for-byte after the next reconnect.
@@ -1573,15 +1857,15 @@ export function useChatSend(options: UseChatSendOptions) {
     )
   }
 
-  function acceptedTaskId(response: ChatSendResponse | null | undefined): string {
-    return response?.task_id || response?.taskId || ''
+  function acceptedTaskId(response: TurnSendResponse | null | undefined): string {
+    return response?.taskId || ''
   }
 
   function bindAcceptedUserMessage(
     clientMessageId: string,
-    response: ChatSendResponse | null | undefined,
+    response: TurnSendResponse | null | undefined,
   ) {
-    const messageId = response?.user_message_id || response?.message_id || ''
+    const messageId = response?.userMessageId || response?.messageId || ''
     bindUserMessageId(clientMessageId, messageId)
     const turnId = acceptedTaskId(response)
     if (!turnId) return
@@ -1637,7 +1921,7 @@ export function useChatSend(options: UseChatSendOptions) {
   }
 
   function handleTerminalResponse(
-    response: ChatSendResponse,
+    response: TurnSendResponse,
     freshSendToken: FreshSendToken | null,
     optionsForResponse: { finishFreshStream: boolean; forceFreshStream?: boolean },
   ): boolean {
@@ -1676,7 +1960,7 @@ export function useChatSend(options: UseChatSendOptions) {
   }
 
   function abortStaleAcceptedTask(
-    response: ChatSendResponse | null | undefined,
+    response: TurnSendResponse | null | undefined,
     requestSessionKey: string,
     force = false,
   ) {
@@ -1684,7 +1968,7 @@ export function useChatSend(options: UseChatSendOptions) {
     const taskId = acceptedTaskId(response)
     if (!taskId && !force) return
     const acceptedSessionKey = response?.sessionKey || requestSessionKey
-    const params: Record<string, string> = {
+    const params: TurnCancelRequest = {
       sessionKey: acceptedSessionKey,
       source: force ? 'webui_stop' : 'webui_stale_send',
     }
@@ -1693,7 +1977,7 @@ export function useChatSend(options: UseChatSendOptions) {
     // instead of falling back to the legacy whole-session abort surface.
     if (force) params.scope = 'task'
     if (taskId) params.taskId = taskId
-    options.rpc.call<{ aborted?: boolean }>('chat.abort', params)
+    options.turnCommands.cancel(params)
       .then((response) => {
         if (force && !taskId) {
           void options.reconcileTaskOwnership?.()
@@ -1724,8 +2008,12 @@ export function useChatSend(options: UseChatSendOptions) {
     const recovered = pendingItem
       ? options.steerDelivery.attemptForItem(pendingItem)
       : null
-    if (!requestSessionKey || !text.trim()) return 'not_sent'
-    if (!options.supportsMethod?.('sessions.steer.v2')) {
+    if (!requestSessionKey || !text.trim()
+      || pendingItem?.selectedSkills?.length
+      || optionsForSteer.composerSnapshot?.selectedSkills.length
+      || (!pendingItem && options.selectedSkills?.value.length)
+      || pendingItem?.pageContext || optionsForSteer.composerSnapshot?.pageContext) return 'not_sent'
+    if (!options.turnCommands.supports('same-turn-steer')) {
       return recovered ? 'retryable_failure' : 'not_sent'
     }
     const durablePending = Boolean(
@@ -1741,7 +2029,7 @@ export function useChatSend(options: UseChatSendOptions) {
     )
     if (
       durablePending
-      && !options.supportsMethod?.('sessions.pending_inputs.steer')
+      && !options.turnCommands.supports('durable-steer')
     ) {
       return recovered ? 'retryable_failure' : 'not_sent'
     }
@@ -1781,12 +2069,12 @@ export function useChatSend(options: UseChatSendOptions) {
     if (durablePending && !pendingIdentity && !recovered?.request.pendingInputId) {
       return recovered ? 'retryable_failure' : 'not_sent'
     }
-    const freshParams: SessionSteerV2Params = {
+    const freshCanonicalParams: TurnSteerRequest = {
       key: requestSessionKey,
       message: text.trim(),
-      expected_turn_id: expectedTurnId,
-      client_request_id: pendingIdentity?.clientRequestId || createClientRequestId(),
-      client_message_id: pendingIdentity?.clientMessageId || createClientMessageId(),
+      expectedTurnId,
+      clientRequestId: pendingIdentity?.clientRequestId || createClientRequestId(),
+      clientMessageId: pendingIdentity?.clientMessageId || createClientMessageId(),
       ...(pendingIdentity
         ? {
             pendingInputId: pendingIdentity.pendingInputId,
@@ -1794,9 +2082,12 @@ export function useChatSend(options: UseChatSendOptions) {
             expectedRevision: pendingIdentity.expectedRevision,
           }
         : {}),
-      surface_id: 'webui',
-      _source: chatSourceMetadata(options),
+      surfaceId: 'webui',
+      source: chatSourceMetadata(options),
     }
+    // The queue/WAL still snapshots the historical v4 shape. Keep that
+    // persistence conversion local until the pending-input lane migrates.
+    const freshParams = toPersistedTurnSteerRequest(freshCanonicalParams)
     if (recovered && recovered.request.key !== requestSessionKey) {
       return 'retryable_failure'
     }
@@ -1833,12 +2124,7 @@ export function useChatSend(options: UseChatSendOptions) {
       pendingItem.steerAttempt = activeAttempt
     }
     try {
-      const response = await options.rpc.call<SessionSteerV2Response>(
-        params.pendingInputId
-          ? 'sessions.pending_inputs.steer'
-          : 'sessions.steer.v2',
-        params as unknown as Record<string, unknown>,
-      )
+      const response = await options.turnCommands.steer(toCanonicalTurnSteerRequest(params))
       const sessionChanged = options.sessionKey.value !== requestSessionKey
       if (sessionChanged && response.accepted === true) {
         options.steerDelivery.acknowledgeAcceptedOffscreen(pendingItem)
@@ -1849,7 +2135,7 @@ export function useChatSend(options: UseChatSendOptions) {
           options.steerDelivery.reject(pendingItem)
           return 'accepted'
         }
-        if (response.fallback_safe === true) {
+        if (response.fallbackSafe === true) {
           options.steerDelivery.fallback(pendingItem)
           return 'deferred'
         }
@@ -1861,7 +2147,7 @@ export function useChatSend(options: UseChatSendOptions) {
           )
         ) {
           options.steerDelivery.markRetryable(pendingItem, 'retryable_rejected', {
-            code: response.failure_code,
+            code: response.failureCode,
           })
           return 'retryable_failure'
         }
@@ -1880,7 +2166,7 @@ export function useChatSend(options: UseChatSendOptions) {
       // or matching history row may independently prove durability.
       if (response.accepted !== true) {
         options.steerDelivery.markRetryable(pendingItem, 'acceptance_unknown', {
-          code: response.failure_code,
+          code: response.failureCode,
         })
         if (!sessionChanged) options.scheduleHistorySync()
         return 'retryable_failure'
@@ -1889,18 +2175,18 @@ export function useChatSend(options: UseChatSendOptions) {
         clientRequestId: params.client_request_id,
         clientMessageId: params.client_message_id,
         expectedTurnId: params.expected_turn_id,
-        userMessageId: String(response.user_message_id || ''),
+        userMessageId: String(response.userMessageId || ''),
         disposition: response.disposition || 'steering',
         revision: response.revision,
-        turnId: response.turn_id,
-        promotedTurnId: response.promoted_turn_id,
-        promotedFromTurnId: response.promoted_from_turn_id,
-        appliedIteration: response.applied_iteration,
-        modelCallId: response.model_call_id,
+        turnId: response.turnId,
+        promotedTurnId: response.promotedTurnId,
+        promotedFromTurnId: response.promotedFromTurnId,
+        appliedIteration: response.appliedIteration,
+        modelCallId: response.modelCallId,
       }, pendingItem)
       return 'accepted'
     } catch (error: unknown) {
-      const accepted = (error as RpcClientError | null | undefined)?.accepted
+      const accepted = turnCommandFailure(error)?.accepted
       const sessionChanged = options.sessionKey.value !== requestSessionKey
       if (accepted === true) {
         if (sessionChanged) {
@@ -1912,12 +2198,12 @@ export function useChatSend(options: UseChatSendOptions) {
           clientMessageId: params.client_message_id,
           expectedTurnId: params.expected_turn_id,
           userMessageId: String(
-          rpcErrorDetail(error, 'user_message_id')
-          || rpcErrorDetail(error, 'message_id')
+          turnFailureDetail(error, 'user_message_id')
+          || turnFailureDetail(error, 'message_id')
           || '',
           ),
-          disposition: (rpcErrorDetail(error, 'disposition') || 'steering') as ChatMessage['inputDisposition'],
-          turnId: String(rpcErrorDetail(error, 'turn_id') || params.expected_turn_id),
+          disposition: (turnFailureDetail(error, 'disposition') || 'steering') as ChatMessage['inputDisposition'],
+          turnId: String(turnFailureDetail(error, 'turn_id') || params.expected_turn_id),
         }, pendingItem)
         return 'accepted'
       }
@@ -1932,15 +2218,15 @@ export function useChatSend(options: UseChatSendOptions) {
       if (accepted !== false) {
         options.steerDelivery.markRetryable(pendingItem, 'acceptance_unknown', {
           code: errorCode(error),
-          retryAfterMs: Number(rpcErrorDetail(error, 'retry_after_ms')) || undefined,
+          retryAfterMs: Number(turnFailureDetail(error, 'retry_after_ms')) || undefined,
         })
         if (!sessionChanged) options.scheduleHistorySync()
         return 'retryable_failure'
       }
-      if (rpcErrorDetail(error, 'retryable') === true) {
+      if (turnFailureDetail(error, 'retryable') === true) {
         options.steerDelivery.markRetryable(pendingItem, 'retryable_rejected', {
           code: errorCode(error),
-          retryAfterMs: Number(rpcErrorDetail(error, 'retry_after_ms')) || undefined,
+          retryAfterMs: Number(turnFailureDetail(error, 'retry_after_ms')) || undefined,
         })
         return 'retryable_failure'
       }
@@ -1953,20 +2239,45 @@ export function useChatSend(options: UseChatSendOptions) {
     }
   }
 
-  async function onSend(invocation: {
+  type SendInvocation = {
     bypassSlashCommand?: boolean
     composerText?: string
     textOverride?: string
     cancelIfComposerChanged?: boolean
-  } = {}) {
+  }
+
+  async function onSend(invocation: SendInvocation = {}) {
+    const key = options.sessionKey.value
+    if ([...composerSubmissions.values()].some(entry => (
+      entry.sessionKey === key && composerMatchesSnapshot(entry.snapshot)
+    ))) return
+    const token = Symbol('composer-send')
+    composerSubmissions.set(token, { sessionKey: key, snapshot: captureComposerSnapshot() })
+    composerSubmissionVersion.value += 1
+    try {
+      await sendComposerInput(invocation)
+    } finally {
+      composerSubmissions.delete(token)
+      composerSubmissionVersion.value += 1
+    }
+  }
+
+  async function sendComposerInput(invocation: SendInvocation) {
     const requestSessionKey = options.sessionKey.value
+    const requestDeliveryIdentity = options.deliveryIdentity?.value
+    const deliveryStillMatches = () => (
+      options.sessionKey.value === requestSessionKey
+      && options.deliveryIdentity?.value === requestDeliveryIdentity
+    )
     const composerSnapshot = captureComposerSnapshot()
     const bypassSlashCommand = invocation.bypassSlashCommand === true
     const composerText = invocation.composerText ?? options.inputText.value
     let text = (invocation.textOverride ?? options.inputText.value).trim()
     let durableText = text
-    let sendableAttachments = options.pendingAttachments.value.filter(isSendableAttachment)
-    let hasPayload = text || sendableAttachments.length > 0
+    let sendableAttachments = composerAttachments().filter(isSendableAttachment)
+    let hasPayload = Boolean(
+      text || sendableAttachments.length > 0 || composerSnapshot.draftIds.length > 0,
+    )
     let isLiteralSlash = false
     const handoffInFlight = responseHandoffBlocksCurrentSession()
 
@@ -1979,8 +2290,68 @@ export function useChatSend(options: UseChatSendOptions) {
       isLiteralSlash = true
       text = text.slice(1)
       durableText = `/${text}`
-      sendableAttachments = options.pendingAttachments.value.filter(isSendableAttachment)
-      hasPayload = text || sendableAttachments.length > 0
+      sendableAttachments = composerAttachments().filter(isSendableAttachment)
+      hasPayload = Boolean(
+        text || sendableAttachments.length > 0 || composerSnapshot.draftIds.length > 0,
+      )
+    }
+
+    // Unknown acceptance is resolved by replaying the immutable prior payload.
+    // In particular, do this before consulting the current annotation drafts:
+    // the first request may already have consumed them and advanced the head.
+    // Only live transport/admission state is allowed to block this exact replay.
+    const exactReplayAttempt = (
+      !handoffInFlight
+      && recoveredAttempt?.requiresIdempotentReplay
+      && recoveredAttempt.requestSessionKey === options.sessionKey.value
+    )
+      ? recoveredAttempt
+      : null
+    if (exactReplayAttempt) {
+      if (exactReplayAttempt.deliveryIdentity !== undefined
+        && exactReplayAttempt.deliveryIdentity !== requestDeliveryIdentity) return
+      const replayBlockedReason = options.idempotentReplayBlockedReason
+        || options.sendBlockedReason
+      if (replayBlockedReason?.value) return
+      if (options.validateActiveProjectBeforeSend) {
+        if (await refreshedActiveProjectBlocksSend()) return
+      }
+      if (!deliveryStillMatches()) return
+      if (replayBlockedReason?.value) return
+      await dispatchSend(exactReplayAttempt.text, {
+        composerText,
+        draftIds: exactReplayAttempt.draftIds,
+        queueMode: exactReplayAttempt.queueMode,
+        retryAttempt: exactReplayAttempt,
+        idempotentReplay: true,
+        preDispatchGuard: deliveryStillMatches,
+      })
+      return
+    }
+
+    const offlineIdentity = options.offlineQueueIdentity?.value
+    if (offlineIdentity && hasPayload) {
+      // This branch has never called the command port. Already-submitted
+      // requests retain the exact receipt-recovery path above.
+      if (
+        recoveredAttempt
+        || handoffInFlight
+        || !requestSessionKey
+        || offlineIdentity !== options.deliveryIdentity?.value
+        || isControlInput(durableText)
+        || invocation.textOverride !== undefined
+        || composerSnapshot.intent
+        || composerSnapshot.forkBeforeMessageId
+        || composerSnapshot.workspaceId
+        || composerSnapshot.draftIds.length > 0
+        || composerSnapshot.pageContext
+        || modelImageSendBlocked(composerSnapshot.payloadAttachments)
+      ) return
+      const queued = await options.enqueuePendingInput(durableText, undefined, {
+        deliveryIdentity: offlineIdentity,
+      })
+      if (!queued) pushToast(i18n.global.t('chat.toast.offlineQueueFailed'), { tone: 'warn' })
+      return
     }
 
     if (hasPayload) {
@@ -1992,32 +2363,19 @@ export function useChatSend(options: UseChatSendOptions) {
       if (options.validateActiveProjectBeforeSend) {
         if (await refreshedActiveProjectBlocksSend()) return
       }
-      if (options.sessionKey.value !== requestSessionKey) return
+      if (!deliveryStillMatches()) return
       if (!queueOwnerMatchesSnapshot(composerSnapshot)) return
       if (options.sendBlockedReason?.value) return
+      if (
+        JSON.stringify(currentAnnotationDraftIds())
+        !== JSON.stringify(composerSnapshot.draftIds)
+      ) return
       if (
         invocation.cancelIfComposerChanged
         && !composerMatchesSnapshot(composerSnapshot)
       ) return
     }
 
-    // An unknown acceptance must be resolved by replaying the exact original
-    // request before any edited draft or mode change can become a new turn.
-    // Otherwise a committed new_chat can be stranded behind a second request
-    // id that conflicts with the already-created session.
-    if (
-      !handoffInFlight
-      && recoveredAttempt?.requiresIdempotentReplay
-      && recoveredAttempt.requestSessionKey === options.sessionKey.value
-    ) {
-      await dispatchSend(recoveredAttempt.text, {
-        composerText,
-        queueMode: recoveredAttempt.queueMode,
-        composerSnapshot,
-        cancelIfComposerChanged: invocation.cancelIfComposerChanged,
-      })
-      return
-    }
 
     // Retry an explicitly rejected prior send with its exact original queue
     // semantics when the visible draft is unchanged.
@@ -2026,20 +2384,26 @@ export function useChatSend(options: UseChatSendOptions) {
       recoveredAttempt &&
       matchesRecoveredDraft(recoveredAttempt, {
         requestSessionKey: options.sessionKey.value,
+        draftIds: composerSnapshot.draftIds,
+        pageContext: composerSnapshot.pageContext,
+        selectedSkills: composerSnapshot.selectedSkills,
         text,
         attachments: sendableAttachments,
         intent: composerSnapshot.intent,
         initialCollaborationMode: composerSnapshot.initialCollaborationMode,
+        initialRoutingMode: composerSnapshot.initialRoutingMode,
         forkBeforeMessageId: composerSnapshot.forkBeforeMessageId,
         workspaceId: composerSnapshot.workspaceId,
       })
     ) {
       await dispatchSend(text, {
         composerText,
+        draftIds: recoveredAttempt.draftIds,
         queueMode: recoveredAttempt.queueMode,
         payload: payloadFromSnapshot(composerSnapshot),
         composerSnapshot,
         cancelIfComposerChanged: invocation.cancelIfComposerChanged,
+        preDispatchGuard: deliveryStillMatches,
       })
       return
     }
@@ -2051,7 +2415,7 @@ export function useChatSend(options: UseChatSendOptions) {
       : null
     if (slashClassification !== null) {
       if (
-        options.sessionKey.value !== requestSessionKey
+        !deliveryStillMatches()
         || !composerMatchesSnapshot(composerSnapshot)
         || !queueOwnerMatchesSnapshot(composerSnapshot)
         || Boolean(options.sendBlockedReason?.value)
@@ -2062,12 +2426,20 @@ export function useChatSend(options: UseChatSendOptions) {
         && await refreshedActiveProjectBlocksSend()
       ) return
       if (
-        options.sessionKey.value !== requestSessionKey
+        !deliveryStillMatches()
         || !composerMatchesSnapshot(composerSnapshot)
         || !queueOwnerMatchesSnapshot(composerSnapshot)
         || Boolean(options.sendBlockedReason?.value)
         || Boolean(options.taskOwnership && !options.taskOwnership.hydrationResolved.value)
       ) return
+    }
+
+    if (composerSnapshot.selectedSkills.length && (
+      slashClassification === 'registered'
+      || (!bypassSlashCommand && !isLiteralSlash && text.startsWith('!'))
+    )) {
+      pushToast(i18n.global.t('chat.skillPalette.commandWithSkills'), { tone: 'info' })
+      return
     }
 
     const compactInFlight = options.isCompactInFlightForCurrentSession()
@@ -2105,6 +2477,9 @@ export function useChatSend(options: UseChatSendOptions) {
         }
         if (
           options.busySendMode.value === 'steer'
+          && !composerSnapshot.pageContext
+          && composerSnapshot.selectedSkills.length === 0
+          && !options.taskOwnership?.stopRequestedTaskId.value
           && !isLiteralSlash
           && canSteerPayload(
             text,
@@ -2120,12 +2495,29 @@ export function useChatSend(options: UseChatSendOptions) {
         // preserved (enqueue returns false before clearing the composer).
         const composerChanged = !composerMatchesSnapshot(composerSnapshot)
         if (invocation.cancelIfComposerChanged && composerChanged) return
+        const queuedAnnotationDraftIds = composerSnapshot.draftIds
+        const queuedEnqueueOptions = {
+          ...(composerSnapshot.selectedSkills.length ? { selectedSkills: composerSnapshot.selectedSkills } : {}),
+          ...(composerSnapshot.pageContext ? {
+            pageContext: composerSnapshot.pageContext,
+            attachments: composerSnapshot.payloadAttachments,
+          } : {}),
+          ...(slashClassification === 'unknown' ? { confirmedPlainText: true } : {}),
+          ...(queuedAnnotationDraftIds.length
+            ? { draftIds: queuedAnnotationDraftIds }
+            : {}),
+        }
         const queued = await Promise.resolve(
           composerChanged || invocation.textOverride !== undefined
             ? options.enqueuePendingPayload?.({
               text: durableText,
+              ...(composerSnapshot.selectedSkills.length ? { selectedSkills: composerSnapshot.selectedSkills } : {}),
+              ...(composerSnapshot.pageContext ? { pageContext: composerSnapshot.pageContext } : {}),
               attachments: composerSnapshot.payloadAttachments,
               intent: composerSnapshot.intent,
+              ...(queuedAnnotationDraftIds.length
+                ? { draftIds: queuedAnnotationDraftIds }
+                : {}),
               ...(slashClassification === 'unknown'
                 ? { confirmedPlainText: true }
                 : {}),
@@ -2134,12 +2526,18 @@ export function useChatSend(options: UseChatSendOptions) {
               ? options.enqueuePendingInput(
                 durableText,
                 queueOwnerFromSnapshot(composerSnapshot),
-                { confirmedPlainText: true },
+                queuedEnqueueOptions,
               )
-              : options.enqueuePendingInput(
-                durableText,
-                queueOwnerFromSnapshot(composerSnapshot),
-              ),
+              : queuedAnnotationDraftIds.length || composerSnapshot.selectedSkills.length
+                ? options.enqueuePendingInput(
+                  durableText,
+                  queueOwnerFromSnapshot(composerSnapshot),
+                  queuedEnqueueOptions,
+                )
+                : options.enqueuePendingInput(
+                  durableText,
+                  queueOwnerFromSnapshot(composerSnapshot),
+                ),
         )
         if (!queued) {
           pushToast(i18n.global.t('chat.toast.queueFull'), { tone: 'info' })
@@ -2153,13 +2551,15 @@ export function useChatSend(options: UseChatSendOptions) {
       if (handled) return
     }
 
-    if (!hasPayload || !options.sessionKey.value) return
+    if (!hasPayload || !deliveryStillMatches()) return
 
     await dispatchSend(text, {
       composerText,
+      draftIds: composerSnapshot.draftIds,
       payload: payloadFromSnapshot(composerSnapshot),
       composerSnapshot,
       cancelIfComposerChanged: invocation.cancelIfComposerChanged,
+      preDispatchGuard: deliveryStillMatches,
     })
   }
 
@@ -2191,6 +2591,10 @@ export function useChatSend(options: UseChatSendOptions) {
     const ownerSessionKey = expectedSessionKey
       || item.ownerSessionKey
       || options.sessionKey.value
+    const identityStillMatches = () => !item.pendingDeliveryIdentity || (
+      item.pendingDeliveryIdentity === options.deliveryIdentity?.value
+      && !options.offlineQueueIdentity?.value
+    )
     const retryAttempt = recoveredQueuedAttempts.get(item) ?? null
     const steerRetryAttempt = options.steerDelivery.attemptForItem(item)
     const preserveRetryState = (outcome: ChatSendOutcome): ChatSendOutcome => (
@@ -2205,7 +2609,7 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!ownerSessionKey || options.sessionKey.value !== ownerSessionKey) {
       return preserveRetryState('not_sent')
     }
-    if (options.sendBlockedReason?.value) {
+    if (!identityStillMatches() || options.sendBlockedReason?.value) {
       return blockedOutcome()
     }
     if (options.validateActiveProjectBeforeSend) {
@@ -2213,7 +2617,7 @@ export function useChatSend(options: UseChatSendOptions) {
       if (options.sessionKey.value !== ownerSessionKey) {
         return preserveRetryState('not_sent')
       }
-      if (options.sendBlockedReason?.value) return blockedOutcome()
+      if (!identityStillMatches() || options.sendBlockedReason?.value) return blockedOutcome()
     }
     if (options.hasPendingAttachmentWork()) {
       if (delivery === 'steer') {
@@ -2290,7 +2694,9 @@ export function useChatSend(options: UseChatSendOptions) {
       if (options.modelRoutingSettingsBusy.value) {
         return preserveRetryState(delivery === 'followup' ? 'deferred' : 'not_sent')
       }
-      if (options.modelRoutingMode.value === 'llm_ensemble') {
+      if (
+        options.imageInputAdmission?.value === 'blocked'
+      ) {
         return preserveRetryState('not_sent')
       }
     }
@@ -2306,19 +2712,25 @@ export function useChatSend(options: UseChatSendOptions) {
     }
 
     if (delivery === 'steer') {
+      if (item.selectedSkills?.length) return preserveRetryState('not_sent')
+      if (item.pendingDeliveryIdentity) return preserveRetryState('not_sent')
       if (text.startsWith('//')) return preserveRetryState('not_sent')
       return dispatchSteerV2(text, { queuedItem: item })
     }
     const outcome = await dispatchSend(dispatchText, {
       composerText: item.text,
+      draftIds: item.draftIds || [],
       payload: {
         attachments: item.attachments,
+        pageContext: item.pageContext,
+        selectedSkills: copySelectedSkills(item.selectedSkills),
         intent: item.intent,
         // A queued follow-up has no fork target. In particular, never inherit
         // the fork target of the unrelated draft currently in the composer.
         forkBeforeMessageId: null,
       },
       preserveComposer: true,
+      preDispatchGuard: identityStillMatches,
       retryAttempt,
       rememberRetryableAttempt: attempt => {
         recoveredQueuedAttempts.set(item, attempt)
@@ -2354,14 +2766,31 @@ export function useChatSend(options: UseChatSendOptions) {
     sendOpts: DispatchSendOptions = {},
   ): Promise<ChatSendOutcome> {
     const requestSessionKey = options.sessionKey.value
+    const requestDeliveryIdentity = options.deliveryIdentity?.value
     if (!requestSessionKey) return 'not_sent'
-    if (options.sendBlockedReason?.value) return 'not_sent'
+    const blockedReason = sendOpts.idempotentReplay
+      ? options.idempotentReplayBlockedReason || options.sendBlockedReason
+      : options.sendBlockedReason
+    if (blockedReason?.value) return 'not_sent'
     const preDispatchAllowed = (
       stage: 'preflight' | 'before_rpc' = 'preflight',
-    ) => sendOpts.preDispatchGuard?.(stage) !== false
+    ) => {
+      if (options.deliveryIdentity?.value !== requestDeliveryIdentity) return false
+      const snapshot = sendOpts.composerSnapshot
+      // A project choice preserves the draft key. An older preparation must
+      // still not send that draft into its previous directory. Unknown
+      // acceptance replays retain their original, immutable request instead.
+      if (
+        !sendOpts.idempotentReplay
+        && snapshot?.intent === 'new_chat'
+        && snapshot.workspaceId !== pendingWorkspaceForIntent(options.pendingSessionIntent.value)
+      ) return false
+      return sendOpts.preDispatchGuard?.(stage) !== false
+    }
     if (!preDispatchAllowed()) return 'not_sent'
     let preserveComposer = sendOpts.preserveComposer === true
-    const sourceAttachments = sendOpts.payload?.attachments ?? options.pendingAttachments.value
+    const sourceAttachments = sendOpts.payload?.attachments
+      ?? composerAttachments(sendOpts.draftIds ? [...sendOpts.draftIds] : undefined)
     const intent = sendOpts.payload
       ? sendOpts.payload.intent
       : options.pendingSessionIntent.value
@@ -2380,11 +2809,30 @@ export function useChatSend(options: UseChatSendOptions) {
     )
       ? sendOpts.payload.initialCollaborationMode ?? null
       : initialModeForIntent(intent)
+    const initialRoutingMode = (
+      sendOpts.payload
+      && 'initialRoutingMode' in sendOpts.payload
+    )
+      ? sendOpts.payload.initialRoutingMode ?? null
+      : initialRoutingModeForIntent(intent)
     const initialSendableAttachments = sourceAttachments.filter(isSendableAttachment)
+    const requestedSelectedSkills = copySelectedSkills(
+      sendOpts.payload ? sendOpts.payload.selectedSkills : options.selectedSkills?.value,
+    )
+    const requestedPageContext = normalizePageContext(sendOpts.payload?.pageContext)
+      || pageContextForAnnotations(options.promptAnnotationSnapshots?.(
+        sendOpts.draftIds ?? currentAnnotationDraftIds(),
+      ) || [])
     // This is deliberately before optimistic rendering, composer clearing,
     // stream state, and chat.send. A blocked draft remains exactly editable.
-    if (modelImageSendBlocked(initialSendableAttachments)) return 'not_sent'
+    if (modelImageSendBlocked(sourceAttachments)) return 'not_sent'
     const retryCandidate = sendOpts.retryAttempt ?? (preserveComposer ? null : recoveredAttempt)
+    const requestedAnnotationDraftIds = sendOpts.draftIds === undefined
+      ? currentAnnotationDraftIds()
+      : [...sendOpts.draftIds]
+          .map(value => String(value || '').trim())
+          .filter((value, index, values) => Boolean(value) && values.indexOf(value) === index)
+          .slice(0, 16)
     const requiresRecoveryReplay = Boolean(
       retryCandidate?.requiresIdempotentReplay
       && retryCandidate.requestSessionKey === requestSessionKey
@@ -2396,10 +2844,14 @@ export function useChatSend(options: UseChatSendOptions) {
         retryCandidate
         && matchesRecoveredDraft(retryCandidate, {
           requestSessionKey,
+          draftIds: requestedAnnotationDraftIds,
+          pageContext: requestedPageContext,
+          selectedSkills: requestedSelectedSkills,
           text,
           attachments: initialSendableAttachments,
           intent,
           initialCollaborationMode,
+          initialRoutingMode,
           forkBeforeMessageId,
           workspaceId,
         })
@@ -2407,11 +2859,40 @@ export function useChatSend(options: UseChatSendOptions) {
       ),
     )
     const retryAttempt = isRecoveredRetry ? retryCandidate : null
+    if (retryAttempt?.deliveryIdentity !== undefined
+      && retryAttempt.deliveryIdentity !== requestDeliveryIdentity) return 'not_sent'
     // The automatic receipt recovery and a user-triggered retry share the
     // immutable SendAttempt. Never put the same idempotency key on the wire
-    // twice concurrently; the later caller can observe/retry after the active
-    // single-flight settles without mutating the optimistic UI again.
+    // twice concurrently.
     if (retryAttempt?.acceptanceInFlight) return 'retryable_failure'
+    const attemptAnnotationDraftIds = retryAttempt?.draftIds
+      ?? requestedAnnotationDraftIds
+    // Finish local overlay edits before taking the immutable send snapshot.
+    // An idempotent replay reuses the original input.
+    if (
+      !retryAttempt
+      && !preserveComposer
+      && attemptAnnotationDraftIds.length > 0
+      && options.preparePromptAnnotationsForSend
+    ) {
+      const ready = await options.preparePromptAnnotationsForSend(
+        attemptAnnotationDraftIds,
+        { isCurrent: () => options.sessionKey.value === requestSessionKey && preDispatchAllowed() },
+      )
+      if (!ready || options.sessionKey.value !== requestSessionKey) return 'not_sent'
+      if (!preDispatchAllowed()) return 'not_sent'
+      if (options.sendBlockedReason?.value) return 'not_sent'
+      if (
+        JSON.stringify(currentAnnotationDraftIds())
+        !== JSON.stringify(attemptAnnotationDraftIds)
+      ) return 'not_sent'
+    }
+    const attemptSelectedSkills = copySelectedSkills(retryAttempt?.selectedSkills ?? requestedSelectedSkills)
+    if (attemptSelectedSkills.length && !options.turnCommands.supports('explicit-skills')) {
+      pushToast(i18n.global.t('chat.skillPalette.unsupported'), { tone: 'warn' })
+      return 'not_sent'
+    }
+    const attemptPageContext = retryAttempt?.pageContext ?? requestedPageContext
     const sendAttachmentIds = new Set(
       (retryAttempt?.attachments || initialSendableAttachments)
         .map(attachment => attachment.local_id),
@@ -2423,8 +2904,8 @@ export function useChatSend(options: UseChatSendOptions) {
       : undefined
     if (!retryAttempt && !serverStagedPendingItem && options.prepareAttachmentsForSend) {
       const ready = await options.prepareAttachmentsForSend({
-        isCurrent: () => options.sessionKey.value === requestSessionKey,
-        ...(sendOpts.payload ? { attachments: sourceAttachments } : {}),
+        isCurrent: () => options.sessionKey.value === requestSessionKey && preDispatchAllowed(),
+        attachments: sourceAttachments,
       })
       if (!ready) return 'not_sent'
       if (options.sessionKey.value !== requestSessionKey) return 'not_sent'
@@ -2435,8 +2916,7 @@ export function useChatSend(options: UseChatSendOptions) {
       : false
     if (sendOpts.cancelIfComposerChanged && composerChanged) return 'not_sent'
     if (composerChanged) preserveComposer = true
-    const currentSourceAttachments = sendOpts.payload?.attachments
-      ?? options.pendingAttachments.value
+    const currentSourceAttachments = sourceAttachments
     if (
       preserveComposer
       && !serverStagedPendingItem
@@ -2451,12 +2931,17 @@ export function useChatSend(options: UseChatSendOptions) {
     )
     // Routing can change while an expiring staged upload is refreshed. Recheck
     // the authoritative live state before any visible or RPC mutation.
-    if (options.sendBlockedReason?.value) return 'not_sent'
+    if (blockedReason?.value) return 'not_sent'
     if (modelImageSendBlocked(attachmentsToSend)) return 'not_sent'
     const attachmentsToKeep = currentSourceAttachments.filter(
       attachment => !sendAttachmentIds.has(attachment.local_id) || !isSendableAttachment(attachment),
     )
-    if (!text && attachmentsToSend.length === 0 && !serverStagedPendingItem) {
+    if (
+      !text
+      && attachmentsToSend.length === 0
+      && attemptAnnotationDraftIds.length === 0
+      && !serverStagedPendingItem
+    ) {
       return 'not_sent'
     }
 
@@ -2480,6 +2965,7 @@ export function useChatSend(options: UseChatSendOptions) {
         text: userText,
         ts: new Date().toISOString(),
         clientId: attempt.clientMessageId,
+        ...(attempt.selectedSkills.length ? { selectedSkills: copySelectedSkills(attempt.selectedSkills) } : {}),
         ...(accepted?.messageId ? { messageId: accepted.messageId } : {}),
         ...(accepted?.turnId ? { turnId: accepted.turnId } : {}),
       })
@@ -2501,39 +2987,59 @@ export function useChatSend(options: UseChatSendOptions) {
       const clientMessageId = durablePendingItem?.pendingClientMessageId
         || sendOpts.replayCoordination?.clientMessageId
         || createClientMessageId()
-      const params: ChatSendParams = {
+      const params: TurnSendParams = {
         clientRequestId: durablePendingItem?.pendingClientRequestId
           || sendOpts.replayCoordination?.clientRequestId
           || createClientRequestId(),
         clientMessageId,
-        message: text || 'Describe these attachments',
+        message: text || (attemptPageContext?.annotations?.length
+          ? (attemptPageContext?.annotations || []).map(annotation => annotation.text).join('\n')
+          : 'Describe these attachments'),
         // The Vue client never uses the legacy cancel-style steer path. Make
         // ordinary sends explicit so a persisted session queue_mode="steer"
         // from an older client cannot silently turn them into interrupts.
-        queueMode: sendOpts?.queueMode ?? 'followup',
+        queueMode: attemptSelectedSkills.length ? 'followup' : sendOpts?.queueMode ?? 'followup',
         sessionKey: requestSessionKey,
       }
-      params._source = chatSourceMetadata(options)
+      if (attemptSelectedSkills.length) params.selectedSkills = copySelectedSkills(attemptSelectedSkills)
+      if (attemptPageContext) params.pageContext = attemptPageContext
+      if (attemptPageContext?.annotations?.length && !userText) params.displayText = ''
+      params.source = chatSourceMetadata(options)
       if (intent) params.intent = intent
       if (intent === 'new_chat' && workspaceId) params.workspaceId = workspaceId
       if (initialCollaborationMode === 'plan') {
         params.collaborationMode = initialCollaborationMode
       }
+      if (initialRoutingMode) params.initialRoutingMode = initialRoutingMode
       if (forkBeforeMessageId) params.forkBeforeMessageId = forkBeforeMessageId
       if (attachmentsToSend.length > 0 || sendOpts.includeEmptyAttachments) {
         params.displayText = userText
         params.attachments = attachmentsToSend.map(serializeSendableAttachment)
       }
+      const localSnapshots = options.promptAnnotationSnapshots?.(attemptAnnotationDraftIds) || []
+      const sentSnapshots = pageAnnotationSnapshots(attemptPageContext).map((input, index) => ({
+        ...localSnapshots[index],
+        ...input,
+        annotationId: attemptAnnotationDraftIds[index] || input.annotationId,
+        documentName: localSnapshots[index]?.documentName || input.documentName,
+        tagName: localSnapshots[index]?.tagName || input.tagName,
+      }))
       attempt = {
         clientRequestId: params.clientRequestId!,
         clientMessageId,
         composerText: sendOpts?.composerText ?? text,
         requestSessionKey,
+        deliveryIdentity: requestDeliveryIdentity,
+        draftIds: [...attemptAnnotationDraftIds],
+        promptAnnotations: sentSnapshots,
+        pageContext: attemptPageContext,
+        selectedSkills: copySelectedSkills(attemptSelectedSkills),
         queueMode: sendOpts?.queueMode,
         text,
         attachments: attachmentsToSend.map(attachment => ({ ...attachment })),
         intent,
         initialCollaborationMode,
+        initialRoutingMode,
         forkBeforeMessageId,
         workspaceId,
         ...(sendOpts.acceptedVisibleReplay
@@ -2563,6 +3069,10 @@ export function useChatSend(options: UseChatSendOptions) {
           ts: now,
           clientId: clientMessageId,
           ...(displayAttachments.length > 0 ? { attachments: displayAttachments } : {}),
+          ...(attempt.selectedSkills.length ? { selectedSkills: copySelectedSkills(attempt.selectedSkills) } : {}),
+          ...(attempt.promptAnnotations.length > 0
+            ? { promptAnnotations: attempt.promptAnnotations }
+            : {}),
         })
         options.autoScroll.value = true
         options.scrollToBottom()
@@ -2579,12 +3089,19 @@ export function useChatSend(options: UseChatSendOptions) {
       if (!preDispatchAllowed()) return rejectBeforeDispatch()
     }
     if (!preDispatchAllowed()) return rejectBeforeDispatch()
+    if (preserveComposer) {
+      attempt.composerSkillRefs = undefined
+      attempt.unconsumedComposer = undefined
+    }
     if (!preserveComposer) options.closeSlashMenu()
     recordSessionNavigationDiag('send.start', {
       requestSession: requestSessionKey,
       current: requestSessionKey,
     })
     if (!preserveComposer) {
+      if (sameSelectedSkills(options.selectedSkills?.value, attempt.selectedSkills)) {
+        attempt.composerSkillRefs = options.selectedSkills?.value
+      }
       recoveredAttempt = null
       const composerTextBeforeSend = options.inputText.value
       const preserveEditedComposer = Boolean(
@@ -2592,13 +3109,21 @@ export function useChatSend(options: UseChatSendOptions) {
         && composerTextBeforeSend
         && composerTextBeforeSend !== retryAttempt.composerText
       )
-      options.inputText.value = preserveEditedComposer ? composerTextBeforeSend : ''
-      options.autoResizeTextarea()
-      options.pendingAttachments.value = attachmentsToKeep
-      if (options.pendingForkBeforeMessageId.value === forkBeforeMessageId) {
-        options.pendingForkBeforeMessageId.value = null
+      if (attempt.selectedSkills.length) {
+        // Keep the complete explicit request in its draft until admission is
+        // known. Navigating away or losing an ACK cannot strand only its tags.
+        attempt.unconsumedComposer = composerTextBeforeSend === attempt.composerText
+          && sameSelectedSkills(options.selectedSkills?.value, attempt.selectedSkills)
+          ? captureComposerSnapshot() : undefined
+      } else {
+        options.inputText.value = preserveEditedComposer ? composerTextBeforeSend : ''
+        options.autoResizeTextarea()
+        options.pendingAttachments.value = attachmentsToKeep
+        if (options.pendingForkBeforeMessageId.value === forkBeforeMessageId) {
+          options.pendingForkBeforeMessageId.value = null
+        }
       }
-    } else if (sendOpts.composerSnapshot) {
+    } else if (sendOpts.composerSnapshot && !attempt.selectedSkills.length) {
       const originalAttachmentRefs = new Set(sendOpts.composerSnapshot.attachmentRefs)
       options.pendingAttachments.value = options.pendingAttachments.value.filter(
         attachment => !originalAttachmentRefs.has(attachment),
@@ -2650,7 +3175,7 @@ export function useChatSend(options: UseChatSendOptions) {
             requestSessionKey,
             attempt.clientRequestId,
             durableHandoffRecord,
-          )
+        )
         : null
     )
     const acceptanceTransaction = beginAcceptanceTransaction(
@@ -2659,32 +3184,41 @@ export function useChatSend(options: UseChatSendOptions) {
       attempt,
     )
 
+    // The pending user row gives immediate feedback for annotation-only sends.
+    // The durable composer drafts remain until the Gateway identifies exactly
+    // which IDs it accepted. A retry reuses this same row and restores its
+    // pending cards without creating a duplicate message.
+    setAttemptPromptAnnotations(attempt, attempt.promptAnnotations)
+
     try {
       const stagedPendingItem = serverStagedPendingItem
-      const acceptanceRpc = attempt.acceptanceRpc || {
-        method: stagedPendingItem
-          ? 'sessions.pending_inputs.dispatch' as const
-          : 'chat.send' as const,
-        params: stagedPendingItem
+      const acceptanceRequest = attempt.acceptanceRequest?.request || (
+        stagedPendingItem
           ? {
-              key: requestSessionKey,
-              pendingInputId: stagedPendingItem.pendingInputId,
-              clientRequestId: stagedPendingItem.pendingClientRequestId,
-              requestFingerprint: stagedPendingItem.pendingRequestFingerprint,
+              kind: 'pending-input' as const,
+              params: {
+                key: requestSessionKey,
+                pendingInputId: stagedPendingItem.pendingInputId!,
+                clientRequestId: stagedPendingItem.pendingClientRequestId!,
+                requestFingerprint: stagedPendingItem.pendingRequestFingerprint!,
+              },
             }
-          : attempt.params as unknown as Record<string, unknown>,
-      }
-      attempt.acceptanceRpc = acceptanceRpc
-      attempt.acceptanceInFlight = true
-      const res = await options.rpc.call<ChatSendResponse>(
-        acceptanceRpc.method,
-        acceptanceRpc.params,
+          : {
+              kind: 'new-turn' as const,
+              params: attempt.params,
+            }
       )
+      attempt.acceptanceRequest = { request: acceptanceRequest }
+      attempt.acceptanceInFlight = true
+      const res = await options.turnCommands.send(acceptanceRequest)
+      consumeAcceptedComposer(attempt)
+      acknowledgeAttemptPromptAnnotations(attempt, res)
+
       attempt.acceptanceResolved = true
       attempt.acceptedTaskId = acceptedTaskId(res)
       attempt.acceptedSessionKey = res?.sessionKey || requestSessionKey
       if (!commitAcceptedVisibleReplay({
-        messageId: res?.user_message_id || res?.message_id || '',
+        messageId: res?.userMessageId || res?.messageId || '',
         turnId: acceptedTaskId(res),
       })) {
         options.scheduleHistorySync()
@@ -2708,6 +3242,14 @@ export function useChatSend(options: UseChatSendOptions) {
       const lostFreshStream = !wasStreaming
         && !freshSendStillOwnsStream(freshSendToken, requestSessionKey)
       if (stoppedByUser || lostFreshStream) {
+        if (options.sessionKey.value !== requestSessionKey) {
+          recordSessionNavigationDiag('send.response.stale', {
+            requestSession: requestSessionKey,
+            responseSession: res?.sessionKey,
+            current: options.sessionKey.value,
+            reason: 'current_session_changed',
+          })
+        }
         const acceptedSessionKey = res?.sessionKey || requestSessionKey
         const stoppedTerminalIsCurrent = Boolean(
           stoppedByUser
@@ -2832,8 +3374,9 @@ export function useChatSend(options: UseChatSendOptions) {
       }
       return 'accepted'
     } catch (err: unknown) {
-      const rpcError = err as RpcClientError | null | undefined
+      const commandError = turnCommandFailure(err)
       const acceptedError = acceptedErrorInfo(err)
+      if (!acceptedError) setAttemptPromptAnnotations(attempt, [])
       if (acceptedError && !commitAcceptedVisibleReplay({
         messageId: acceptedError.messageId,
       })) {
@@ -2849,23 +3392,29 @@ export function useChatSend(options: UseChatSendOptions) {
       const acceptedSessionKey = acceptedError?.sessionKey || requestSessionKey
       const rememberRetryableAttempt = (restoreComposer: boolean) => {
         if (!shouldRestoreSendAttempt(err)) return
-        attempt.requiresIdempotentReplay = hasUnknownAcceptance(err)
+        const acceptanceUnknown = hasUnknownAcceptance(err)
+        attempt.requiresIdempotentReplay = acceptanceUnknown
         if (preserveComposer) {
           if (sendOpts.rememberRetryableAttempt) {
             sendOpts.rememberRetryableAttempt(attempt)
           } else {
             recoveredAttempt = attempt
           }
+        } else if (acceptanceUnknown) {
+          // The optimistic user bubble already owns this payload. Keep its
+          // immutable request identity for exact replay without presenting the
+          // same text as a new editable draft.
+          recoveredAttempt = attempt
         } else if (restoreComposer) {
           restoreSendAttempt(attempt, {
-            requiresIdempotentReplay: hasUnknownAcceptance(err),
+            requiresIdempotentReplay: false,
           })
         }
       }
       const stoppedByUser = acceptanceTransaction.stoppedByUser
         || responseHandoff?.stoppedByUser === true
       if (stoppedByUser) {
-        if (acceptedError?.terminalWithoutTask || rpcError?.accepted === false) {
+        if (acceptedError?.terminalWithoutTask || commandError?.accepted === false) {
           clearAcceptanceStop(acceptanceTransaction)
         } else if (hasUnknownAcceptance(err)) {
           void options.reconcileTaskOwnership?.()
@@ -2876,7 +3425,7 @@ export function useChatSend(options: UseChatSendOptions) {
         if (attempt.stopRequested || attempt.autoRecoverAcceptance) {
           scheduleAcceptanceRecovery(attempt)
         }
-      } else if (rpcError?.accepted === false || acceptedError?.terminalWithoutTask) {
+      } else if (commandError?.accepted === false || acceptedError?.terminalWithoutTask) {
         attempt.acceptanceResolved = true
       }
       if (
@@ -2951,14 +3500,74 @@ export function useChatSend(options: UseChatSendOptions) {
         options.activeStreamSessionKey.value = ''
         options.stream.endStreaming()
       }
-      if (responseHandoff && rpcError?.accepted === false) {
-        if (sendOpts.requirePreparedHandoff && rpcError.retryable !== false) {
+      if (responseHandoff && commandError?.accepted === false) {
+        if (sendOpts.requirePreparedHandoff && commandError.retryable !== false) {
           await resetResponseHandoffForRetry(responseHandoff, attempt)
-        } else if (rpcError.retryable === false) {
+        } else if (commandError.retryable === false) {
           await markResponseHandoffFailed(responseHandoff, err)
         }
       }
       rememberRetryableAttempt(true)
+      if (!preserveComposer && !acceptedError && !sendOpts.suppressRejectedFailureMessage) {
+        const restoredSnapshot = captureComposerSnapshot()
+        const separateSkillDraft = explicitComposerChanged(attempt)
+          || (options.selectedSkills?.value.length
+          && !sameSelectedSkills(options.selectedSkills.value, attempt.selectedSkills))
+          || (attempt.selectedSkills.length && restoredSnapshot.inputText !== attempt.composerText)
+        const originalDraftRestored = restoredSnapshot.inputText === attempt.composerText
+          && matchesRecoveredDraft(attempt, {
+            requestSessionKey,
+            draftIds: restoredSnapshot.draftIds,
+            pageContext: restoredSnapshot.pageContext,
+            selectedSkills: restoredSnapshot.selectedSkills,
+            text: attempt.text,
+            attachments: restoredSnapshot.payloadAttachments.filter(isSendableAttachment),
+            intent: restoredSnapshot.intent,
+            initialCollaborationMode: restoredSnapshot.initialCollaborationMode,
+            initialRoutingMode: restoredSnapshot.initialRoutingMode,
+            forkBeforeMessageId: restoredSnapshot.forkBeforeMessageId,
+            workspaceId: restoredSnapshot.workspaceId,
+          })
+        const canRetry = commandError?.accepted === false
+          && commandError.retryable !== false
+          && Boolean(attempt.deliveryIdentity)
+          && attempt.deliveryIdentity === options.deliveryIdentity?.value
+          && (separateSkillDraft || originalDraftRestored)
+        pushToast(sendFailureMessage(err), {
+          tone: 'danger',
+          duration: 8000,
+          ...(canRetry ? { action: {
+            label: i18n.global.t('chat.retry'),
+            onClick: () => {
+              if (
+                recoveredAttempt !== attempt
+                || options.sessionKey.value !== requestSessionKey
+                || attempt.deliveryIdentity !== options.deliveryIdentity?.value
+                || !composerMatchesSnapshot(restoredSnapshot)
+                || options.sendBlockedReason?.value
+                || options.offlineQueueIdentity?.value
+                || options.stream.isStreaming.value
+                || hasAuthoritativeWork()
+              ) return
+              if (separateSkillDraft) {
+                void dispatchSend(attempt.text, {
+                  retryAttempt: attempt, preserveComposer: true, draftIds: attempt.draftIds,
+                  payload: {
+                    selectedSkills: copySelectedSkills(attempt.selectedSkills),
+                    attachments: attempt.attachments, pageContext: attempt.pageContext,
+                    intent: attempt.intent, forkBeforeMessageId: attempt.forkBeforeMessageId,
+                    workspaceId: attempt.workspaceId,
+                    initialCollaborationMode: attempt.initialCollaborationMode,
+                    initialRoutingMode: attempt.initialRoutingMode,
+                  },
+                })
+              } else {
+                void onSend()
+              }
+            },
+          } } : {}),
+        })
+      }
       if (acceptedError || !sendOpts.suppressRejectedFailureMessage) {
         options.messages.value.push({
           role: 'error',
@@ -3012,6 +3621,7 @@ export function useChatSend(options: UseChatSendOptions) {
       return Boolean(
         anchor
         && anchor.text === text
+        && sameSelectedSkills(anchor.selectedSkills, payload.selectedSkills)
         && (anchor.attachments?.length ?? 0) === 0,
       )
     }
@@ -3039,10 +3649,14 @@ export function useChatSend(options: UseChatSendOptions) {
       usageBarrierReplayAttempt,
       {
         requestSessionKey,
+        draftIds: [],
+        pageContext: null,
+        selectedSkills: copySelectedSkills(payload.selectedSkills),
         text,
         attachments: [],
         intent: null,
         initialCollaborationMode: null,
+        initialRoutingMode: null,
         forkBeforeMessageId,
         workspaceId: null,
       },
@@ -3052,11 +3666,13 @@ export function useChatSend(options: UseChatSendOptions) {
     try {
       const outcome = await dispatchSend(text, {
         payload: {
+          selectedSkills: copySelectedSkills(payload.selectedSkills),
           attachments: [],
           intent: null,
           forkBeforeMessageId,
           workspaceId: null,
           initialCollaborationMode: null,
+          initialRoutingMode: null,
         },
         preserveComposer: true,
         retryAttempt: usageBarrierReplayAttempt,
@@ -3086,6 +3702,18 @@ export function useChatSend(options: UseChatSendOptions) {
     recovery: { requiresIdempotentReplay: boolean },
   ) {
     const currentText = options.inputText.value
+    if (explicitComposerChanged(attempt) || (options.selectedSkills?.value.length
+      && !sameSelectedSkills(options.selectedSkills.value, attempt.selectedSkills))
+      || (attempt.selectedSkills.length && currentText && currentText !== attempt.composerText)) {
+      // A rejected request still owns its bound identities. Do not merge its
+      // text into a newer draft that explicitly selected different instructions.
+      attempt.requiresIdempotentReplay = recovery.requiresIdempotentReplay
+      recoveredAttempt = attempt
+      return
+    }
+    if (attempt.selectedSkills.length && options.selectedSkills?.value.length === 0) {
+      options.selectedSkills.value = copySelectedSkills(attempt.selectedSkills)
+    }
     if (!currentText) {
       options.inputText.value = attempt.composerText
     } else if (
@@ -3191,7 +3819,7 @@ export function useChatSend(options: UseChatSendOptions) {
         message.steerStopRequested = true
       }
     }
-    const abortParams: Record<string, string> = {
+    const abortParams: TurnCancelRequest = {
       sessionKey: abortSessionKey,
       source: 'webui_stop',
     }
@@ -3200,10 +3828,15 @@ export function useChatSend(options: UseChatSendOptions) {
     // intentionally retains legacy session-tree cancellation semantics.
     if (stoppedTurnId || taskAcceptancePending) abortParams.scope = 'task'
     if (stoppedTurnId) abortParams.taskId = stoppedTurnId
-    options.rpc.call<{ aborted?: boolean }>('chat.abort', abortParams)
+    options.turnCommands.cancel(abortParams)
       .then((response) => {
         if (response?.aborted === true) {
           options.scheduleHistorySync()
+          return
+        }
+        if (String(response?.reason || '').toLowerCase() === 'task_cancel_unknown') {
+          options.scheduleHistorySync()
+          void options.reconcileTaskOwnership?.()
           return
         }
         if (acceptanceOwnsStop) return
@@ -3377,7 +4010,7 @@ export function useChatSend(options: UseChatSendOptions) {
       options.scrollToBottom()
     }
 
-    const params: ChatSendParams = {
+    const params: TurnSendParams = {
       clientRequestId: stableClientRequestId,
       clientMessageId,
       message: providerText,
@@ -3386,9 +4019,11 @@ export function useChatSend(options: UseChatSendOptions) {
     const hiddenSessionIntent = requestSessionKey === options.sessionKey.value
       ? options.pendingSessionIntent.value
       : null
+    const hiddenInitialRoutingMode = initialRoutingModeForIntent(hiddenSessionIntent)
     if (hiddenSessionIntent) params.intent = hiddenSessionIntent
+    if (hiddenInitialRoutingMode) params.initialRoutingMode = hiddenInitialRoutingMode
     if (displayText && displayText !== providerText) params.displayText = displayText
-    params._source = chatSourceMetadata(options)
+    params.source = chatSourceMetadata(options)
 
     // Hidden controls preserve the composer and render their own outbox-backed
     // bubble, but their acceptance/Stop identity is otherwise the same as an
@@ -3399,17 +4034,24 @@ export function useChatSend(options: UseChatSendOptions) {
       clientMessageId,
       composerText: displayText,
       requestSessionKey,
+      draftIds: [],
+      promptAnnotations: [],
+      pageContext: null,
+      selectedSkills: [],
       text: providerText,
       attachments: [],
       intent: hiddenSessionIntent,
       initialCollaborationMode: null,
+      initialRoutingMode: hiddenInitialRoutingMode,
       forkBeforeMessageId: null,
       workspaceId: null,
       params,
       hiddenControl: true,
-      acceptanceRpc: {
-        method: 'chat.send',
-        params: params as unknown as Record<string, unknown>,
+      acceptanceRequest: {
+        request: {
+          kind: 'new-turn',
+          params,
+        },
       },
     }
 
@@ -3426,7 +4068,10 @@ export function useChatSend(options: UseChatSendOptions) {
 
     try {
       attempt.acceptanceInFlight = true
-      const res = await options.rpc.call<ChatSendResponse>('chat.send', params)
+      const res = await options.turnCommands.send({
+        kind: 'new-turn',
+        params,
+      })
       attempt.acceptanceResolved = true
       attempt.acceptedTaskId = acceptedTaskId(res)
       attempt.acceptedSessionKey = res?.sessionKey || requestSessionKey
@@ -3566,9 +4211,9 @@ export function useChatSend(options: UseChatSendOptions) {
         requestSessionKey,
       )
     } catch (err: unknown) {
-      const rpcError = err as RpcClientError | null | undefined
+      const commandError = turnCommandFailure(err)
       const acceptedError = acceptedErrorInfo(err)
-      const accepted = rpcError?.accepted
+      const accepted = commandError?.accepted
       if (accepted === true) {
         if (
           hiddenSessionIntent
@@ -3666,7 +4311,7 @@ export function useChatSend(options: UseChatSendOptions) {
           requestSessionKey,
         )
       }
-      if (accepted === false && rpcError?.retryable === false) {
+      if (accepted === false && commandError?.retryable === false) {
         removeHiddenControl(
           requestSessionKey,
           stableClientRequestId,
@@ -3772,8 +4417,9 @@ export function useChatSend(options: UseChatSendOptions) {
     sessionKey: string,
     clientRequestId: string,
   ): Promise<boolean> {
+    if (!options.metaRunCenter) return false
     try {
-      const result = await options.rpc.call<{ discarded?: boolean; accepted?: boolean }>('meta.drafts.discard', {
+      const result = await options.metaRunCenter.discardDraft({
         sessionKey,
         clientRequestId,
       })
@@ -3843,6 +4489,7 @@ export function useChatSend(options: UseChatSendOptions) {
 
   return {
     onSend,
+    sendPending,
     onStop,
     sendQueuedSteer,
     sendQueuedFollowup,

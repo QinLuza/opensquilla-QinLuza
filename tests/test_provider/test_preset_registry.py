@@ -1,9 +1,9 @@
 """Preset registry: packaged data parity, synthesized coverage, and API shape.
 
-The golden fixture (``golden/router_tier_profiles.json``) was captured from
+The golden fixture (``golden/router_tier_profiles.json``) originated from
 ``git show staging/provider-overhaul:src/opensquilla/gateway/config.py``
-(``_router_tier_profile_defaults`` at f884d4c9) and pins the packaged preset
-data byte-identically to the historical hardcoded dict literals.
+(``_router_tier_profile_defaults`` at f884d4c9) and tracks the current packaged
+preset data, including intentional updates to provider defaults.
 """
 
 from __future__ import annotations
@@ -148,16 +148,16 @@ def test_tokenrhythm_curated_ladder() -> None:
     assert preset is not None
     assert preset.synthesized is False
     assert preset.persistable is False
-    assert preset.default_model == "deepseek-v4-flash-0731"
+    assert preset.default_model == "deepseek-v4-pro-0813"
     assert not hasattr(preset, "default_ensemble_selection_mode")
     assert (
         recommended_ensemble_selection_mode_for_provider(preset.provider_id)
         == "static_tokenrhythm_b5"
     )
     expected_models = {
-        "c0": "qwen3.7-flash",
-        "c1": "deepseek-v4-flash-0731",
-        "c2": "glm-5.2",
+        "c0": "deepseek-v4-flash-0731",
+        "c1": "deepseek-v4-pro-0813",
+        "c2": "kimi-k2.7-code",
         "c3": "glm-5.2",
         "image_model": "kimi-k2.6",
     }
@@ -173,6 +173,8 @@ def test_tokenrhythm_curated_ladder() -> None:
         preset.default_model,
         *(entry["model"] for entry in tiers.values()),
     })
+    assert tiers["c0"]["supports_image"] is False
+    assert tiers["c2"]["supports_image"] is False
     assert tiers["image_model"]["supports_image"] is True
     assert tiers["image_model"]["image_only"] is True
     assert tiers["c3"]["ensemble_enabled"] is True
@@ -219,7 +221,10 @@ def test_synthesized_presets_bind_all_text_tiers_to_provider_default() -> None:
             else:
                 assert entry["model"]
             assert entry["description"]
-            assert entry["supports_image"] is False
+            # Synthesized rows do not carry authoritative capability evidence.
+            # Omission remains probeable; only an operator-authored false may
+            # be treated as a definitive negative declaration.
+            assert "supports_image" not in entry
 
 
 def test_curated_synthesized_presets_pin_live_verified_ladders() -> None:

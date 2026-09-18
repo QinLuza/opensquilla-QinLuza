@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GoalConfig
 from opensquilla.gateway.goal_service import GoalService
 from opensquilla.gateway.task_runtime import TaskRuntime
@@ -39,10 +40,13 @@ class _NoGoalStorage:
 
 class _SubscribedConnections:
     def __init__(self, conn_id: str) -> None:
-        self._conn_id = conn_id
+        self._subscribers = {conn_id}
 
     def get_message_subscribers(self, _session_key: str) -> set[str]:
-        return {self._conn_id}
+        return set(self._subscribers)
+
+    def clear(self) -> None:
+        self._subscribers.clear()
 
 
 async def _noop_turn_handler(_run: Any) -> None:
@@ -86,12 +90,13 @@ async def test_goal_registries_reclaim_after_one_thousand_idle_and_fence_operati
     storage = _NoGoalStorage(expected_sessions=len(session_keys))
     runtime = TaskRuntime(storage=storage, turn_handler=_noop_turn_handler)
     conn_id = "goal-registry-owner"
+    subscriptions = _SubscribedConnections(conn_id)
     service = GoalService(
         storage=storage,
         session_manager=SimpleNamespace(),
         task_runtime=runtime,
         event_emitter=None,
-        subscription_manager=_SubscribedConnections(conn_id),
+        subscription_manager=subscriptions,
         config=GoalConfig(),
     )
 
@@ -154,11 +159,12 @@ async def test_goal_registries_reclaim_after_one_thousand_idle_and_fence_operati
     assert service._kick_tasks == {}
     assert service._kick_dirty == set()
 
-    principal = SimpleNamespace(
-        token_public_id="registry-test-owner",
-        guest_owner_id=None,
+    principal = Principal(
+        token_public_id="desktop",
         is_owner=True,
+        authenticated=True,
         role="operator",
+        scopes=frozenset({"operator.admin"}),
     )
     ctx = SimpleNamespace(conn_id=conn_id, principal=principal, agent_id="main")
     for index, session_key in enumerate(session_keys):
@@ -174,6 +180,7 @@ async def test_goal_registries_reclaim_after_one_thousand_idle_and_fence_operati
         )
     assert len(service._leases) == _SESSION_COUNT
 
+    subscriptions.clear()
     await asyncio.gather(
         *(service.on_subscription_lost(conn_id, session_key) for session_key in session_keys)
     )

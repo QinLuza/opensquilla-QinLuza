@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from scripts import live_long_task_case_driver as driver
+from scripts import live_long_task_release_gate as gate
 from scripts.long_task_fault_proxy import (
     DeterministicFaultProxy,
     FaultRequestRecord,
@@ -162,23 +163,103 @@ def test_long_reasoning_is_executed_through_real_browser_path(
     assert calls == ["write_config", "start", "browser", "cleanup"]
 
 
-def test_tool_compaction_reserves_provider_tool_followup_and_summary_legs(
+@pytest.mark.parametrize(
+    ("scenario", "physical_requests"),
+    [("tool_compaction", 2), ("fault_429_retry_after", 1)],
+)
+def test_case_reserves_required_provider_followup_and_summary_legs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    physical_requests: int,
 ) -> None:
     directory = _case_directory(tmp_path)
     path = _write_case(
         directory,
         _case_payload(
-            scenario="tool_compaction",
+            scenario=scenario,
             model="deepseek-v4-pro",
-            physical_requests=2,
+            physical_requests=physical_requests,
         ),
     )
     monkeypatch.setenv("DEEPSEEK_API_KEY", "synthetic-not-a-real-key")
 
     with pytest.raises(driver.DriverBudgetError):
         driver.load_case(path)
+
+
+def test_send_and_observe_waits_for_assistant_history_after_terminal_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_key = "agent:main:webchat:synthetic"
+    marker = "synthetic complete"
+    events = [
+        {
+            "event": "session.event.text_delta",
+            "payload": {"session_key": session_key, "text": marker},
+        },
+        {
+            "event": "session.event.done",
+            "payload": {"session_key": session_key, "reason": "completed"},
+        },
+    ]
+    calls: list[str] = []
+    history_calls = 0
+
+    class Client:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        async def connect(self, _url: str) -> None:
+            calls.append("connect")
+
+        async def call(
+            self,
+            method: str,
+            _params: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            nonlocal history_calls
+            calls.append(method)
+            if method == "chat.history":
+                history_calls += 1
+                if history_calls == 1:
+                    return {"messages": []}
+                return {"messages": [{"role": "assistant", "text": marker}]}
+            return {}
+
+        async def recv_event(self, *, timeout: float) -> dict[str, object]:
+            assert timeout > 0
+            if events:
+                return events.pop(0)
+            raise TimeoutError
+
+        async def close(self) -> None:
+            calls.append("close")
+
+    monkeypatch.setattr(driver, "GatewayRPCClient", Client)
+
+    observation, assistant_bytes, assistant_markers = asyncio.run(
+        driver._send_and_observe(
+            SimpleNamespace(ws_url="ws://synthetic"),
+            prompt="synthetic prompt",
+            marker=marker,
+            session_key=session_key,
+            timeout_seconds=5,
+        )
+    )
+
+    assert observation.completed is True
+    assert assistant_bytes == len(marker.encode("utf-8"))
+    assert assistant_markers == 1
+    assert history_calls == 2
+    assert calls == [
+        "connect",
+        "sessions.messages.subscribe",
+        "sessions.send",
+        "chat.history",
+        "chat.history",
+        "close",
+    ]
 
 
 def test_gateway_config_contains_env_names_but_not_credential_values(
@@ -211,6 +292,141 @@ def test_gateway_config_contains_env_names_but_not_credential_values(
     assert 'api_key_env = "TOKENRHYTHM_API_KEY"' in rendered
     assert "http://127.0.0.1:12345/v1" in rendered
     assert "enabled = true" in rendered
+
+
+@pytest.fixture
+def startup_gateway():
+    case = driver.LiveCase(
+        case_id="deepseek-startup-synthetic-1", provider="deepseek",
+        model="deepseek-v4-flash", scenario="direct", repeat_index=1,
+        fallback_provider=None,
+        remaining_budget=driver.CaseBudget(60_000, 1, 1, 1_000),
+    )
+    gateway = driver.GatewayProcess(case, secret_values=())
+    yield gateway
+    # The failure-path tests use a synthetic process, never an OS PID.
+    gateway.proc = None
+    gateway.cleanup()
+    assert not gateway.root.exists()
+
+
+@pytest.mark.parametrize("exit_code", [17, None])
+@pytest.mark.parametrize("prefix", [
+    "", "2026-09-18T13:00:00+00:00 [INFO] opensquilla.gateway.boot: ",
+])
+def test_gateway_startup_failure_keeps_safe_phase_evidence(
+    startup_gateway, monkeypatch: pytest.MonkeyPatch, exit_code: int | None, prefix: str,
+) -> None:
+    gateway = startup_gateway
+    secret = "synthetic-secret-must-never-appear"
+    phase = {
+        "event": "gateway.startup_phase", "phase": "services", "status": "ready",
+        "duration_ms": 12, "startup_elapsed_ms": 34,
+        "message": secret, "path": str(gateway.root),
+    }
+
+    def launch(*_args, **_kwargs):
+        (gateway.root / "gateway.stdout.log").write_text(prefix + json.dumps(phase) + "\n")
+        return SimpleNamespace(poll=lambda: exit_code)
+
+    now = [0.0]
+
+    def advance(seconds):
+        now[0] += seconds
+
+    def unavailable(*_args, **_kwargs):
+        raise driver.urllib.error.HTTPError(secret, 503, secret, {}, None)
+
+    monkeypatch.setattr(driver.subprocess, "Popen", launch)
+    monkeypatch.setattr(driver, "time", SimpleNamespace(monotonic=lambda: now[0], sleep=advance))
+    monkeypatch.setattr(driver.urllib.request, "urlopen", unavailable)
+    with pytest.raises(driver.DriverConfigurationError) as caught:
+        gateway.start()
+    message = str(caught.value)
+    assert secret not in message
+    assert str(gateway.root) not in message
+    evidence = json.loads(message.split("; startup=", 1)[1])
+    assert evidence == {
+        "elapsed_ms": 0 if exit_code is not None else 45_000,
+        "exit_code": exit_code,
+        "last_health_status": None if exit_code is not None else 503,
+        "phases": {"services": {
+            "status": "ready", "duration_ms": 12, "startup_elapsed_ms": 34,
+        }},
+    }
+
+
+@pytest.mark.parametrize("log_name", ["gateway.stdout.log", "gateway.stderr.log"])
+def test_gateway_startup_failure_excludes_previous_attempt_phases(
+    startup_gateway, monkeypatch: pytest.MonkeyPatch, log_name: str,
+) -> None:
+    gateway = startup_gateway
+    previous = {
+        "event": "gateway.startup_phase", "phase": "gateway_ready", "status": "ready",
+        "duration_ms": 12, "startup_elapsed_ms": 34_000,
+    }
+    current = {
+        **previous, "phase": "config", "duration_ms": 3, "startup_elapsed_ms": 4,
+    }
+    log = gateway.root / log_name
+    log.write_text(json.dumps(previous) + "\n", encoding="utf-8")
+
+    def launch(*_args, **_kwargs):
+        with log.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(current) + "\n")
+        return SimpleNamespace(poll=lambda: 17)
+
+    monkeypatch.setattr(driver.subprocess, "Popen", launch)
+    with pytest.raises(driver.DriverConfigurationError) as caught:
+        gateway.start()
+
+    evidence = json.loads(str(caught.value).split("; startup=", 1)[1])
+    assert evidence["exit_code"] == 17
+    assert evidence["phases"] == {
+        "config": {"status": "ready", "duration_ms": 3, "startup_elapsed_ms": 4},
+    }
+    # Both attempts remain available for the mandatory secret scan in cleanup.
+    assert [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()] == [
+        previous, current,
+    ]
+
+
+def test_gateway_startup_diagnostics_bound_and_filter_raw_logs(startup_gateway) -> None:
+    gateway = startup_gateway
+    valid = {
+        "event": "gateway.startup_phase", "phase": "services", "status": "ready",
+        "duration_ms": 12, "startup_elapsed_ms": 34,
+    }
+    hostile = [
+        {**valid, "phase": "arbitrary-secret-phase"},
+        {**valid, "status": "arbitrary-secret-status"},
+        {**valid, "phase": ["services"]},
+        {**valid, "duration_ms": "secret-duration"},
+        {**valid, "duration_ms": True},
+        {**valid, "duration_ms": -1},
+        {**valid, "startup_elapsed_ms": 3_600_001},
+        {**valid, "event": "arbitrary-secret-event"},
+    ]
+    log = gateway.root / "gateway.stdout.log"
+    log.write_text(
+        json.dumps({**valid, "phase": "config"}) + "\n"
+        + "padding" * driver._STARTUP_LOG_TAIL_BYTES + "\n"
+        + "not-json\n[1,2,3]\n"
+        + "\n".join(json.dumps(record) for record in [valid, *hostile]),
+    )
+    error = gateway._startup_failure("Gateway did not become healthy", driver.time.monotonic(),
+                                     None, None)
+    evidence = json.loads(str(error).split("; startup=", 1)[1])
+    assert evidence["phases"] == {"services": {
+        "status": "ready", "duration_ms": 12, "startup_elapsed_ms": 34,
+    }}
+    assert "secret" not in str(error)
+    assert len(str(error)) < 400
+    log.unlink()
+    # Missing logs must preserve the original startup failure, not replace it.
+    error = gateway._startup_failure("Gateway exited during startup", driver.time.monotonic(),
+                                     1, None)
+    assert json.loads(str(error).split("; startup=", 1)[1])["phases"] == {}
 
 
 def test_gateway_cleanup_retries_transient_windows_file_handle_failure(
@@ -706,6 +922,106 @@ def test_stop_count_requires_durable_webui_stop_outcomes() -> None:
     assert count == 1
 
 
+def test_terminal_history_evidence_waits_for_durable_assistant_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observations = iter(
+        [
+            (0, 0, 0, 0),
+            (18, 1, 0, 0),
+        ]
+    )
+    calls = 0
+
+    async def history_evidence(
+        _client: object,
+        *,
+        session_key: str,
+        assistant_marker: str,
+        user_marker: str = "",
+    ) -> tuple[int, int, int, int]:
+        nonlocal calls
+        calls += 1
+        assert session_key == "agent:main:webchat:synthetic"
+        assert assistant_marker == "synthetic complete"
+        assert user_marker == ""
+        return next(observations)
+
+    monkeypatch.setattr(driver, "_history_evidence", history_evidence)
+
+    class Client:
+        recv_calls = 0
+
+        async def recv_event(self, *, timeout: float) -> dict[str, object]:
+            self.recv_calls += 1
+            assert timeout > 0
+            return {"event": "history-settle"}
+
+    class Observation:
+        frames: list[dict[str, object]] = []
+
+        def consume(self, frame: dict[str, object]) -> None:
+            self.frames.append(frame)
+
+    client = Client()
+    observation = Observation()
+
+    result = asyncio.run(
+        driver._wait_for_assistant_history_evidence(
+            client,
+            observation,
+            session_key="agent:main:webchat:synthetic",
+            assistant_marker="synthetic complete",
+            deadline=driver.time.monotonic() + 1.0,
+        )
+    )
+
+    assert result == (18, 1, 0, 0)
+    assert calls == 2
+    assert client.recv_calls == 1
+    assert observation.frames == [{"event": "history-settle"}]
+
+
+def test_terminal_history_evidence_does_not_extend_case_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def history_evidence(
+        _client: object,
+        *,
+        session_key: str,
+        assistant_marker: str,
+        user_marker: str = "",
+    ) -> tuple[int, int, int, int]:
+        nonlocal calls
+        calls += 1
+        return (0, 0, 0, 0)
+
+    monkeypatch.setattr(driver, "_history_evidence", history_evidence)
+
+    class Client:
+        async def recv_event(self, *, timeout: float) -> dict[str, object]:
+            raise AssertionError(f"expired deadline waited for {timeout}")
+
+    class Observation:
+        def consume(self, frame: dict[str, object]) -> None:
+            raise AssertionError(f"expired deadline consumed {frame}")
+
+    result = asyncio.run(
+        driver._wait_for_assistant_history_evidence(
+            Client(),
+            Observation(),
+            session_key="agent:main:webchat:synthetic",
+            assistant_marker="synthetic complete",
+            deadline=driver.time.monotonic(),
+        )
+    )
+
+    assert result == (0, 0, 0, 0)
+    assert calls == 1
+
+
 def test_runtime_failure_preserves_physical_usage_and_cost_budget_evidence(
     tmp_path: Path,
 ) -> None:
@@ -758,6 +1074,7 @@ def test_runtime_failure_preserves_physical_usage_and_cost_budget_evidence(
     assert result["cost"]["billed_cost_usd"] == pytest.approx(0.01)
 
 
+@pytest.mark.ci_serial
 def test_fault_case_executes_through_isolated_gateway_without_real_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -789,10 +1106,19 @@ def test_fault_case_executes_through_isolated_gateway_without_real_provider(
     assert result["cost"]["billed_cost_usd"] == 0
 
 
+@pytest.mark.ci_serial
 def test_fault_429_case_proves_retry_after_was_not_violated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("DEEPSEEK_API_KEY", "synthetic-not-a-real-key")
+    request_records: list[FaultRequestRecord] = []
+
+    class ObservedFaultProxy(DeterministicFaultProxy):
+        def close(self) -> None:
+            request_records.extend(self.records)
+            super().close()
+
+    monkeypatch.setattr(driver, "DeterministicFaultProxy", ObservedFaultProxy)
     case = driver.LiveCase(
         case_id="deepseek-fault-429-retry-after-synthetic-1",
         provider="deepseek",
@@ -810,12 +1136,35 @@ def test_fault_429_case_proves_retry_after_was_not_violated(
 
     result, exit_code = driver.execute_case(case)
 
-    assert exit_code == driver.EXIT_PASSED
-    assert result["metrics"]["retry_wait_ms"] >= 8_000
-    assert result["counts"]["retry_after_honored"] == 1
+    assert exit_code == driver.EXIT_PASSED, json.dumps(result, sort_keys=True)
+    assert result["status"] == "passed"
+    assert result["physical_requests"] == 2
+    assert result["counts"]["retry_legs"] >= 1
     assert result["counts"]["accounted_provider_legs"] == 2
+    assert [record.scenario for record in request_records] == [
+        FaultScenario.RATE_LIMITED.value,
+        FaultScenario.OK.value,
+    ]
+    # The synthetic server emits Retry-After: 8. Prove spacing at the real
+    # HTTP boundary, without replacing sleep or trusting activity labels.
+    assert (
+        request_records[1].received_monotonic_ns - request_records[0].received_monotonic_ns
+    ) >= 8_000_000_000
+    assert result["counts"]["retry_after_honored"] == 1
+    assert result["metrics"]["retry_wait_ms"] >= 8_000
+    gate.validate_scenario_evidence(
+        gate.CaseSpec(
+            case_id=case.case_id,
+            provider=case.provider,
+            model=case.model,
+            scenario=case.scenario,
+            repeat_index=case.repeat_index,
+        ),
+        gate.parse_driver_result(result, driver_exit_code=exit_code),
+    )
 
 
+@pytest.mark.ci_serial
 def test_fallback_case_proves_activity_precedes_backup_request_without_real_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

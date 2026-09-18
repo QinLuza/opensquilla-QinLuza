@@ -1,19 +1,24 @@
-"""Fail-closed model admission for turns carrying large material context."""
+"""Fail-closed model admission for turns carrying attachment context."""
 
 from __future__ import annotations
 
-from opensquilla.context_budget import CHARS_PER_TOKEN, ContextBudgetGovernor
+from opensquilla.context_budget import ContextBudgetGovernor
 from opensquilla.provider.model_catalog import (
     resolve_effective_context_window,
     shared_catalog,
 )
+from opensquilla.provider.request_proof import effective_proof_token_budget
 
 NON_MATERIAL_INPUT_HEADROOM_TOKENS = 8_192
 MAX_THINKING_BUDGET_TOKENS = 50_000
+CAPACITY_CONFIGURATION_HINT = (
+    "For a custom or catalog-unknown model, set llm.context_window_tokens "
+    "to the deployment's verified context limit."
+)
 
 
 class LargeContextCapacityError(RuntimeError):
-    """A large-material turn has no deployment with proven request capacity."""
+    """An attachment turn has no deployment with proven request capacity."""
 
 
 def model_has_request_capacity(
@@ -22,6 +27,7 @@ def model_has_request_capacity(
     model: str,
     material_tokens: int,
     thinking_budget_tokens: int,
+    request_input_tokens: int = 0,
     context_window_override_tokens: int = 0,
     max_output_override_tokens: int = 0,
     provider_request_proof_max_chars: int = 0,
@@ -29,11 +35,21 @@ def model_has_request_capacity(
     base_url: str = "",
     proxy: str = "",
 ) -> bool:
-    """Return whether definite catalog limits prove a conservative request fits."""
+    """Return whether definite catalog limits prove a conservative request fits.
+
+    ``request_input_tokens`` is the preferred path: callers that can measure the
+    assembled request pass the complete input estimate. ``material_tokens`` plus
+    the historical fixed reserve remains only for compatibility with older
+    internal callers that have not reached an assembled-request boundary.
+    """
 
     provider_id = str(provider or "").strip()
     model_id = str(model or "").strip()
-    if not provider_id or not model_id or material_tokens <= 0:
+    resolved_request_tokens = max(0, int(request_input_tokens))
+    resolved_material_tokens = max(0, int(material_tokens))
+    if not provider_id or not model_id or (
+        resolved_request_tokens <= 0 and resolved_material_tokens <= 0
+    ):
         return False
     catalog = shared_catalog()
     try:
@@ -76,20 +92,22 @@ def model_has_request_capacity(
         max_output_tokens=max_output,
         thinking_budget_tokens=max(0, int(thinking_budget_tokens)),
         context_overflow_threshold=0.85,
+        provider_request_proof_max_chars=provider_request_proof_max_chars,
     ).snapshot()
-    safe_input_tokens = budget.provider_request_max_chars // CHARS_PER_TOKEN
-    if provider_request_proof_max_chars > 0:
-        safe_input_tokens = min(
-            safe_input_tokens,
-            int(provider_request_proof_max_chars) // CHARS_PER_TOKEN,
-        )
-    return (
-        material_tokens + NON_MATERIAL_INPUT_HEADROOM_TOKENS
-        <= safe_input_tokens
+    safe_input_tokens, _headroom = effective_proof_token_budget(budget.usable_tokens)
+    # This prefilter receives token estimates, not the serialized request.
+    # Its character cap is enforced separately by the final adapter proof;
+    # converting that cap to tokens would conflate two independent limits.
+    required_input_tokens = (
+        resolved_request_tokens
+        if resolved_request_tokens > 0
+        else resolved_material_tokens + NON_MATERIAL_INPUT_HEADROOM_TOKENS
     )
+    return required_input_tokens <= safe_input_tokens
 
 
 __all__ = [
+    "CAPACITY_CONFIGURATION_HINT",
     "LargeContextCapacityError",
     "MAX_THINKING_BUDGET_TOKENS",
     "NON_MATERIAL_INPUT_HEADROOM_TOKENS",

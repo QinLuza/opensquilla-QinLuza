@@ -27,10 +27,11 @@ No ``TurnHook`` is fired from inside the stream loop today.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, runtime_checkable
 
 import structlog
 
@@ -70,6 +71,12 @@ log = structlog.get_logger(__name__)
 # downstream" (CompactionEvent + ErrorEvent take this path -- the
 # loop continues instead of yielding).
 _SUPPRESS: Final = object()
+_RESTRICTED_TOOL_PRESENTATION: Final = {
+    "category": "generic",
+    "primaryArguments": [],
+    "argumentDisplay": "primary",
+    "lifecycleDisplay": "boundary",
+}
 _CURRENT_SILENT_REPLY_TEXT_MARKER: Final = (
     "_opensquilla_current_silent_reply_text"
 )
@@ -192,8 +199,11 @@ class CompactionPersistPort(Protocol):
         removed_count: int = 0,
         source_entries: tuple[Any, ...] | None = None,
         source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+        source_context_fingerprint: str | None = None,
         source_boundary_message_id: str | None = None,
         source_boundary_entry_id: int | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> bool | None: ...
 
 @runtime_checkable
@@ -287,6 +297,11 @@ class _StreamState:
 
     # Moved INTO stage scope (declared inline before the stage extraction).
     current_text_parts: list[str] = field(default_factory=list)
+    # Presentation for ``current_text_parts``. Persisted text segments carry
+    # this additive field so history reloads can distinguish user-visible work
+    # narration from the terminal answer. ``answer`` is the compatibility
+    # default for legacy producers and rows that predate the field.
+    current_text_presentation: Literal["intermediate", "answer"] = "answer"
     error_message: str | None = None
     pending_error_event: ErrorEvent | None = None
     done_event: DoneEvent | None = None
@@ -361,15 +376,15 @@ class StreamConsumerStageInput:
     input_provenance: dict[str, Any] | None = None
     # In-process pending submitted-line provider for mid-turn injection.
     pending_input_provider: PendingInputProvider | None = None
-    # Live delivery-ready authorization resolved on the event loop before the
-    # blocking omitted-artifact publish enters its worker thread.
-    attached_plan_run_ready: bool | None = None
     # Frozen durable prefix used by in-turn compaction persistence. The storage
     # adapter compares it atomically and preserves later append-only queue rows.
     compaction_source_entries: tuple[Any, ...] | None = None
     compaction_source_preimage: tuple[tuple[Any, ...], ...] | None = None
+    compaction_source_context_fingerprint: str | None = None
     compaction_source_boundary_message_id: str | None = None
     compaction_source_boundary_entry_id: int | None = None
+    expected_session_id: str | None = None
+    expected_session_epoch: int | None = None
     # Original ingress mode.  Internal Goal continuations and heartbeats use
     # ``system_event``; their text is held until the terminal snapshot can be
     # canonicalized so silent-reply protocol markers never flash on a client.
@@ -401,26 +416,6 @@ def _supports_generation_reset(inp: StreamConsumerStageInput) -> bool:
         return True
     return bool(context.surface.supports_generation_reset)
 
-
-def _control_reason_for_error_code(code: Any) -> Any | None:
-    """Map only typed control/error codes; provider failures stay recoverable."""
-
-    from opensquilla.engine.types import ControlTerminalReason
-
-    normalized = str(code or "").strip().lower().replace("-", "_")
-    return {
-        "agent_runtime_timeout": ControlTerminalReason.HARD_DEADLINE,
-        "hard_deadline": ControlTerminalReason.HARD_DEADLINE,
-        "hard_deadline_exceeded": ControlTerminalReason.HARD_DEADLINE,
-        "shutdown": ControlTerminalReason.SHUTDOWN,
-        "gateway_shutdown": ControlTerminalReason.SHUTDOWN,
-        "cancel": ControlTerminalReason.CANCEL,
-        "cancelled": ControlTerminalReason.CANCEL,
-        "canceled": ControlTerminalReason.CANCEL,
-        "platform_validation": ControlTerminalReason.PLATFORM_VALIDATION,
-        "platform_safety": ControlTerminalReason.PLATFORM_SAFETY,
-        "safety_control": ControlTerminalReason.PLATFORM_SAFETY,
-    }.get(normalized)
 
 # ---------------------------------------------------------------------------
 # Per-event handler classes
@@ -480,6 +475,44 @@ def _normalize_cumulative_text_delta(text: str, state: _StreamState) -> str:
     return text
 
 
+def _normalize_text_presentation(value: object) -> Literal["intermediate", "answer"]:
+    """Normalize optional or legacy presentation values to the answer default."""
+
+    return "intermediate" if value == "intermediate" else "answer"
+
+
+def _flush_current_text_segment(state: _StreamState) -> None:
+    """Persist the current text run without losing its presentation metadata."""
+
+    if not state.current_text_parts:
+        return
+    state.turn_segments.append(
+        {
+            "type": "text",
+            "text": "".join(state.current_text_parts),
+            "presentation": state.current_text_presentation,
+        }
+    )
+    state.current_text_parts[:] = []
+
+
+def _append_current_text(
+    state: _StreamState,
+    text: str,
+    *,
+    presentation: object,
+) -> None:
+    """Append text while keeping unlike presentation runs as separate segments."""
+
+    if not text:
+        return
+    normalized = _normalize_text_presentation(presentation)
+    if state.current_text_parts and state.current_text_presentation != normalized:
+        _flush_current_text_segment(state)
+    state.current_text_presentation = normalized
+    state.current_text_parts.append(text)
+
+
 class _TextDeltaHandler:
     """Accumulate streamed text deltas into the final-text and current-text buffers."""
 
@@ -491,7 +524,11 @@ class _TextDeltaHandler:
         canonical_delta = _normalize_cumulative_text_delta(event.text, state)
         if canonical_delta:
             state.final_text_parts.append(canonical_delta)
-            state.current_text_parts.append(canonical_delta)
+            _append_current_text(
+                state,
+                canonical_delta,
+                presentation=event.presentation,
+            )
         return replace(event, text=canonical_delta)
 
 class _ToolUseStartHandler:
@@ -502,20 +539,48 @@ class _ToolUseStartHandler:
         event: ToolUseStartEvent,
         state: _StreamState,
     ) -> ToolUseStartEvent:
-        if state.current_text_parts:
-            state.turn_segments.append(
-                {"type": "text", "text": "".join(state.current_text_parts)}
-            )
-            state.current_text_parts[:] = []
-        state.turn_segments.append(
-            {
-                "type": "tool_use",
-                "tool_use_id": event.tool_use_id,
-                "name": event.tool_name,
-                "input": "",
-            }
-        )
+        # Agent text is streamed optimistically as ``answer`` until the provider
+        # reveals a tool call.  Once that boundary is known, the preceding run is
+        # work narration, not the terminal answer.  The live surface has already
+        # received the deltas, but correcting the durable segment here keeps the
+        # settled UI, history reloads, copy, and export on the semantic contract.
+        if state.current_text_parts and state.current_text_presentation == "answer":
+            state.current_text_presentation = "intermediate"
+        _flush_current_text_segment(state)
+        segment: dict[str, Any] = {
+            "type": "tool_use",
+            "tool_use_id": event.tool_use_id,
+            "name": event.tool_name,
+            "input": "",
+        }
+        if event.tool_presentation is not None:
+            segment["tool_presentation"] = dict(event.tool_presentation)
+        state.turn_segments.append(segment)
         return event
+
+
+def _update_tool_use_segment(event: Any, state: _StreamState) -> None:
+    """Persist the authoritative input as soon as the declaration commits."""
+
+    if event.arguments is None:
+        return
+    from opensquilla.engine.runtime import _persisted_tool_use_input
+
+    for segment in reversed(state.turn_segments):
+        if (
+            segment.get("type") == "tool_use"
+            and segment.get("tool_use_id") == event.tool_use_id
+        ):
+            segment["name"] = event.tool_name
+            segment["input"] = _persisted_tool_use_input(
+                event.tool_name,
+                event.tool_use_id,
+                event.arguments,
+            )
+            if event.tool_presentation is not None:
+                segment["tool_presentation"] = dict(event.tool_presentation)
+            return
+
 
 def _clear_artifact_delivery_failure(state: _StreamState, target_key: str) -> None:
     failure_summary = state.artifact_delivery_failures_by_target.pop(target_key, None)
@@ -573,7 +638,6 @@ class _ToolResultHandler:
             _artifact_delivery_failure_summary,
             _artifact_delivery_target_keys,
             _persisted_tool_result_segment,
-            _persisted_tool_use_input,
         )
 
         failure_summary = _artifact_delivery_failure_summary(event)
@@ -592,19 +656,7 @@ class _ToolResultHandler:
                 _clear_artifact_delivery_failure(state, target_key)
         if _is_completed_meta_invoke(event):
             state.completed_meta_skill_without_text = _meta_invoke_skill_name(event)
-        if event.arguments is not None:
-            for segment in reversed(state.turn_segments):
-                if (
-                    segment.get("type") == "tool_use"
-                    and segment.get("tool_use_id") == event.tool_use_id
-                ):
-                    segment["name"] = event.tool_name
-                    segment["input"] = _persisted_tool_use_input(
-                        event.tool_name,
-                        event.tool_use_id,
-                        event.arguments,
-                    )
-                    break
+        _update_tool_use_segment(event, state)
         result_segment = _persisted_tool_result_segment(event)
         for index in range(len(state.turn_segments) - 1, -1, -1):
             segment = state.turn_segments[index]
@@ -627,6 +679,83 @@ class _ToolResultHandler:
         else:
             state.turn_segments.append(result_segment)
         return event
+
+def _cancel_pending_user_input_results(
+    state: _StreamState,
+    *,
+    task_id: str,
+    assistant_replay: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Close this cancelled turn's questions in both durable history views.
+
+    This synchronous projection runs before cancellation persistence. It never
+    yields from a closing Agent generator, and preserves the original question
+    through the ordinary terminal tool-result handler.
+    """
+    from opensquilla.engine.types import ToolResultEvent
+
+    if not task_id:
+        return assistant_replay
+    question_ids = {
+        segment.get("tool_use_id") for segment in state.turn_segments
+        if segment.get("type") == "tool_use" and segment.get("name") == "request_user_input"
+    }
+    cancelled: dict[str, str] = {}
+    handler = _ToolResultHandler()
+    for segment in tuple(state.turn_segments):
+        tool_use_id = segment.get("tool_use_id")
+        if (
+            segment.get("type") != "tool_result"
+            or segment.get("name") != "request_user_input"
+            or not isinstance(tool_use_id, str) or not tool_use_id
+            or tool_use_id not in question_ids
+        ):
+            continue
+        pending = _pending_user_input_request(segment.get("result"))
+        if pending is None or pending.get("run_id") != task_id:
+            continue
+        request_id = pending.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            continue
+        content = json.dumps(
+            {
+                "status": "cancelled", "kind": "user_input", "paused": False,
+                "request_id": request_id, "reason": "turn_cancelled",
+            },
+            ensure_ascii=False,
+        )
+        handler.handle(
+            ToolResultEvent(
+                tool_use_id=tool_use_id, tool_name="request_user_input", result=content,
+            ),
+            state,
+        )
+        cancelled[tool_use_id] = content
+    if not cancelled or assistant_replay is None:
+        return assistant_replay
+    replay = copy.deepcopy(assistant_replay)
+    messages = replay.get("messages")
+    if not isinstance(messages, list):
+        return replay
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        replay_content = message.get("content")
+        if not isinstance(replay_content, list):
+            continue
+        for block in replay_content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            tool_use_id = block.get("tool_use_id")
+            if not isinstance(tool_use_id, str):
+                continue
+            replacement = cancelled.get(tool_use_id)
+            pending = _pending_user_input_request(block.get("content"))
+            if replacement is not None and pending is not None and pending.get("run_id") == task_id:
+                block["content"] = replacement
+                block["is_error"] = False
+    return replay
+
 
 class _ArtifactHandler:
     """Append an artifact payload to the per-turn artifact list."""
@@ -658,10 +787,9 @@ class _ErrorHandler:
             _LLM_TIMEOUT_ENVELOPE,
             _drop_unpaired_tool_use_segments,
         )
-        from opensquilla.engine.types import ErrorEvent as _ErrorEvent
-
         if event.code == "timeout":
-            event = _ErrorEvent(
+            event = replace(
+                event,
                 message=_LLM_TIMEOUT_ENVELOPE["user_message"],
                 code=_LLM_TIMEOUT_ENVELOPE["error_class"],
             )
@@ -702,6 +830,7 @@ class _WarningHandler:
         if accumulated_text.endswith(current_text):
             state.final_text_parts[:] = [accumulated_text[: -len(current_text)]]
         state.current_text_parts[:] = []
+        state.current_text_presentation = "answer"
 
 @dataclass
 class _DonePrePublish:
@@ -1009,7 +1138,6 @@ class _DoneHandler:
         return auto_publish_omitted_workspace_artifacts(
             inp.tool_context,
             final_text=accumulated_text,
-            attached_plan_run_ready=inp.attached_plan_run_ready,
         )
 
     def record_publish_result(
@@ -1165,22 +1293,29 @@ def _reconcile_done_text_snapshot(
 
         suffix = done_text[len(accumulated_text) :]
         state.final_text_parts.append(suffix)
-        state.current_text_parts.append(suffix)
-        return done_text, _TextDeltaEvent(text=suffix)
+        _append_current_text(state, suffix, presentation="answer")
+        return done_text, _TextDeltaEvent(text=suffix, presentation="answer")
 
     # The terminal aggregate is a complete Agent-owned snapshot. A mismatch means
     # streamed text was intentionally superseded (retry, recovery, or a producer
     # that emitted a cumulative final value). Keep non-text segments so tool
     # execution history is never erased, but collapse text to one canonical value.
+    if state.current_text_parts and state.current_text_presentation == "intermediate":
+        _flush_current_text_segment(state)
     state.final_text_parts[:] = [done_text] if done_text else []
     state.turn_segments[:] = [
         segment
         for segment in state.turn_segments
-        if not (isinstance(segment, dict) and segment.get("type") == "text")
+        if not (
+            isinstance(segment, dict)
+            and segment.get("type") == "text"
+            and _normalize_text_presentation(segment.get("presentation")) == "answer"
+        )
     ]
     state.current_text_parts[:] = (
         [done_text] if done_text and state.turn_segments else []
     )
+    state.current_text_presentation = "answer"
     return done_text, None
 
 
@@ -1202,6 +1337,7 @@ def _silent_reply_state_projection(
             {
                 "type": "text",
                 "text": current_text,
+                "presentation": state.current_text_presentation,
                 _CURRENT_SILENT_REPLY_TEXT_MARKER: True,
             }
         )
@@ -1236,14 +1372,19 @@ def _apply_silent_reply_normalization_to_state(
 
     turn_segments: list[dict[str, Any]] = []
     normalized_current = ""
+    normalized_current_presentation: Literal["intermediate", "answer"] = "answer"
     for raw_segment in projection.normalization.segments:
         segment = dict(raw_segment)
         if segment.pop(_CURRENT_SILENT_REPLY_TEXT_MARKER, False):
             normalized_current += str(segment.get("text") or "")
+            normalized_current_presentation = _normalize_text_presentation(
+                segment.get("presentation")
+            )
             continue
         turn_segments.append(segment)
     state.turn_segments[:] = turn_segments
     state.current_text_parts[:] = [normalized_current] if normalized_current else []
+    state.current_text_presentation = normalized_current_presentation
     state.final_text_parts[:] = (
         [projection.canonical_text] if projection.canonical_text else []
     )
@@ -1276,7 +1417,7 @@ def _append_done_notice_delta(
     separator = "\n\n" if accumulated_text.strip() else ""
     notice_delta = separator + notice
     state.final_text_parts.append(notice_delta)
-    state.current_text_parts.append(notice_delta)
+    _append_current_text(state, notice_delta, presentation="answer")
     final_text = "".join(state.final_text_parts)
     event = replace(
         event,
@@ -1286,7 +1427,7 @@ def _append_done_notice_delta(
         suppression_reason=None,
     )
     state.done_event = event
-    return event, _TextDeltaEvent(text=notice_delta)
+    return event, _TextDeltaEvent(text=notice_delta, presentation="answer")
 
 
 def _is_completed_meta_invoke(event: ToolResultEvent) -> bool:
@@ -1444,6 +1585,7 @@ class _CompactionHandler:
                     "removed_count": event.removed_count,
                     "source_entries": inp.compaction_source_entries,
                     "source_preimage": inp.compaction_source_preimage,
+                    "source_context_fingerprint": inp.compaction_source_context_fingerprint,
                     "source_boundary_message_id": (
                         inp.compaction_source_boundary_message_id
                     ),
@@ -1458,6 +1600,14 @@ class _CompactionHandler:
                 if event.compaction_timeout_seconds is not None:
                     persist_kwargs["compaction_timeout_seconds"] = (
                         event.compaction_timeout_seconds
+                    )
+                if (
+                    inp.expected_session_id is not None
+                    or inp.expected_session_epoch is not None
+                ):
+                    persist_kwargs["expected_session_id"] = inp.expected_session_id
+                    persist_kwargs["expected_session_epoch"] = (
+                        inp.expected_session_epoch
                     )
                 installed = await self._persist.persist_and_notify(**persist_kwargs)
                 if installed is False:
@@ -1668,6 +1818,54 @@ class StreamConsumerStage:
             compaction_hooks=compaction_hooks,
         )
 
+    @staticmethod
+    def _with_tool_presentation(event: Any, agent: Any) -> Any:
+        if getattr(event, "tool_presentation", None) is not None:
+            return event
+        resolver = getattr(agent, "tool_presentation_payload", None)
+        tool_name = getattr(event, "tool_name", "")
+        if not callable(resolver) or not isinstance(tool_name, str) or not tool_name:
+            return event
+        try:
+            return replace(event, tool_presentation=resolver(tool_name))
+        except Exception:
+            log.warning(
+                "tool_presentation_resolution_failed",
+                tool_name=tool_name,
+                exc_info=True,
+            )
+            return replace(
+                event,
+                tool_presentation=dict(_RESTRICTED_TOOL_PRESENTATION),
+            )
+
+    async def _adopt_generated_artifact(
+        self,
+        event: ArtifactEvent,
+        tool_context: Any | None,
+    ) -> None:
+        """Best-effort canonicalization before an artifact becomes public.
+
+        The artifact has already been recorded in the shared turn state before
+        this hook runs, so cancellation or adoption failure can never orphan a
+        successfully published deliverable from transcript persistence.
+        """
+
+        adopter = getattr(tool_context, "generated_artifact_adopter", None)
+        if not callable(adopter):
+            return
+        try:
+            await adopter(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - artifact delivery must survive adoption
+            log.warning(
+                "generated_artifact_adoption_failed",
+                artifact_id=str(getattr(event, "id", "") or ""),
+                mime=str(getattr(event, "mime", "") or ""),
+                error_type=type(exc).__name__,
+            )
+
     async def run(
         self,
         inp: StreamConsumerStageInput,
@@ -1833,12 +2031,16 @@ class StreamConsumerStage:
                         human_silent_reply_prefix_open = False
                         human_prefix_crossed_public_boundary = False
             elif isinstance(event, ToolUseStartEvent):
+                event = self._with_tool_presentation(event, inp.agent)
                 transformed = self._tool_use_start_handler.handle(event, state)
             elif isinstance(event, ToolUseDeltaEvent):
                 transformed = event
             elif isinstance(event, ToolUseEndEvent):
+                event = self._with_tool_presentation(event, inp.agent)
+                _update_tool_use_segment(event, state)
                 transformed = event
             elif isinstance(event, ToolResultEvent):
+                event = self._with_tool_presentation(event, inp.agent)
                 transformed = self._tool_result_handler.handle(
                     event,
                     state,
@@ -1846,6 +2048,7 @@ class StreamConsumerStage:
                 )
             elif isinstance(event, ArtifactEvent):
                 transformed = self._artifact_handler.handle(event, state)
+                await self._adopt_generated_artifact(event, inp.tool_context)
             elif isinstance(event, ErrorEvent):
                 transformed = self._error_handler.handle(event, state)
                 if (
@@ -2013,20 +2216,10 @@ class StreamConsumerStage:
                 # the ArtifactStore -- yielding a torn transcript or an
                 # artifact persisted without a transcript record.
                 pre = self._done_handler.pre_publish(event, inp, state)
-                from opensquilla.engine.artifact_delivery import (
-                    attached_plan_run_ready_for_auto_publish,
-                )
-
-                publish_inp = replace(
-                    inp,
-                    attached_plan_run_ready=(
-                        await attached_plan_run_ready_for_auto_publish(inp.tool_context)
-                    ),
-                )
                 publish_task = asyncio.ensure_future(
                     asyncio.to_thread(
                         self._done_handler.run_publish,
-                        publish_inp,
+                        inp,
                         pre.accumulated_text,
                     )
                 )
@@ -2063,6 +2256,12 @@ class StreamConsumerStage:
                 transformed, extra_yields = self._done_handler.post_publish(
                     pre, publish_result, inp, state
                 )
+                for extra_event in extra_yields:
+                    if isinstance(extra_event, ArtifactEvent):
+                        await self._adopt_generated_artifact(
+                            extra_event,
+                            inp.tool_context,
+                        )
                 if buffer_system_event_text:
                     # Text deltas generated by reconciliation/notices are
                     # replaced with one canonical terminal answer.  Non-text

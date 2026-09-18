@@ -24,6 +24,7 @@ from opensquilla.skills.manifest import (
     _string_list,
     _validated_skill_name,
     compile_skill_manifest,
+    normalize_skill_triggers,
     skill_instance_id,
 )
 from opensquilla.skills.meta.sop_compiler import (
@@ -34,9 +35,11 @@ from opensquilla.skills.meta.sop_compiler import (
 )
 from opensquilla.skills.tree import compute_tree_sha256, compute_tree_state
 from opensquilla.skills.types import (
+    SkillInvocation,
     SkillLayer,
     SkillProvenance,
     SkillSpec,
+    SkillVisibility,
 )
 
 log = structlog.get_logger(__name__)
@@ -49,7 +52,8 @@ MAX_SKILLS_PER_SOURCE = 200  # per layer cap
 # v14 adds stable instance identities, full-tree digests, and the complete
 # candidate/shadow view. v15 records the managed lock profile so Community
 # instruction projection can never be restored from a stale trusted snapshot.
-_SNAPSHOT_SCHEMA_VERSION = 15
+# v16 persists public/internal/meta visibility and invocation ownership.
+_SNAPSHOT_SCHEMA_VERSION = 16
 _SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS = frozenset({_SNAPSHOT_SCHEMA_VERSION})
 _COMPAT_PROBE_INTERVAL_SECONDS = 0.250
 
@@ -119,10 +123,12 @@ class SkillCatalogSnapshot:
 
     def list_meta_specs(self) -> list[SkillSpec]:
         """Return invokable compiled meta skills from this generation only."""
+        from opensquilla.skills.catalog_policy import is_invokable_meta
+
         return [
             skill
             for skill in self.skills
-            if skill.kind == "meta" and not skill.disable_model_invocation
+            if is_invokable_meta(skill) and not skill.disable_model_invocation
         ]
 
 
@@ -148,10 +154,12 @@ class PinnedSkillLoader:
         return next((skill for skill in self.load_all() if skill.name == name), None)
 
     def list_meta_specs(self) -> list[SkillSpec]:
+        from opensquilla.skills.catalog_policy import is_invokable_meta
+
         return [
             skill
             for skill in self.load_all()
-            if skill.kind == "meta" and not skill.disable_model_invocation
+            if is_invokable_meta(skill) and not skill.disable_model_invocation
         ]
 
     def find_by_trigger(self, text: str) -> list[SkillSpec]:
@@ -343,6 +351,9 @@ def _skill_to_snapshot(skill: SkillSpec) -> dict[str, object]:
         "preference_keys": skill.preference_keys,
         "policy_tags": skill.policy_tags,
         "entrypoint": skill.entrypoint,
+        "visibility": skill.visibility.value,
+        "invocation": skill.invocation.value,
+        "owner_meta_skills": skill.owner_meta_skills,
     }
 
 
@@ -449,6 +460,47 @@ class SkillLoader:
         with self._refresh_lock:
             return self._publication_barrier_snapshot or self._catalog
 
+    def snapshot_for_turn(self, reason: str = "turn") -> SkillCatalogSnapshot:
+        """Return the catalog visible to one turn, probing only when needed.
+
+        A published, clean generation is immutable, so ordinary turns can pin
+        it without touching Skill roots. Initial loads and known invalidations
+        retain the existing full manifest/tree verification path.
+        """
+        started = time.monotonic()
+        with self._refresh_lock:
+            visible = self._publication_barrier_snapshot or self._catalog
+            if self._publication_barrier_depth or self._mutation_depth:
+                self._log_turn_resolution(visible, started, "barrier")
+                return visible
+            if self._initialized and not self._dirty:
+                self._log_turn_resolution(visible, started, "snapshot")
+                return visible
+        result = self.refresh_if_changed(reason=reason)
+        visible = self.snapshot()
+        self._log_turn_resolution(
+            visible,
+            started,
+            "rebuild" if result.changed else "probe",
+        )
+        return visible
+
+    @staticmethod
+    def _log_turn_resolution(
+        snapshot: SkillCatalogSnapshot,
+        started: float,
+        phase: str,
+    ) -> None:
+        if structlog.is_configured():
+            log.debug(
+                "skill_catalog.turn_resolved",
+                catalog_resolve_ms=round((time.monotonic() - started) * 1000, 3),
+                phase=phase,
+                generation=snapshot.generation,
+                skills=len(snapshot.skills),
+                entries=len(snapshot.manifest),
+            )
+
     def freeze_catalog_for_recovery(self, *, reason: str = "recovery-required") -> None:
         """Quarantine managed bytes while retaining their published LKG.
 
@@ -540,6 +592,21 @@ class SkillLoader:
         with self._refresh_lock:
             self._dirty = True
             self._dirty_reason = reason
+        if structlog.is_configured():
+            log.debug("skill_catalog.invalidated", reason=reason)
+
+    def watch_roots(self) -> tuple[Path, ...]:
+        """Return configured Skill roots without probing their contents."""
+        with self._refresh_lock:
+            roots: list[Path] = []
+            seen: set[str] = set()
+            for root, _layer in self._get_layer_dirs():
+                key = os.path.normcase(os.path.abspath(os.fspath(root)))
+                if key in seen:
+                    continue
+                seen.add(key)
+                roots.append(root)
+            return tuple(roots)
 
     @contextmanager
     def mutation_guard(self, reason: str = "mutation") -> Iterator[None]:
@@ -603,10 +670,7 @@ class SkillLoader:
                             "size": stat.st_size,
                             "tree_state": compute_tree_state(skill_dir),
                         }
-        if (
-            self._managed_dir is not None
-            and self._managed_recovery_candidates is None
-        ):
+        if self._managed_dir is not None and self._managed_recovery_candidates is None:
             try:
                 lock_bytes = self._lockfile_path.read_bytes()
             except FileNotFoundError:
@@ -785,7 +849,7 @@ class SkillLoader:
                     description_zh=s.get("description_zh", "") or "",
                     layer=layer,
                     always=s.get("always", False),
-                    triggers=s.get("triggers", []),
+                    triggers=normalize_skill_triggers(s.get("triggers", [])),
                     content=s.get("content", ""),
                     path=Path(base_dir),
                     file_path=file_path,
@@ -821,6 +885,9 @@ class SkillLoader:
                     preference_keys=_string_list(s.get("preference_keys", [])),
                     policy_tags=_string_list(s.get("policy_tags", [])),
                     entrypoint=(s["entrypoint"] if isinstance(s.get("entrypoint"), dict) else None),
+                    visibility=SkillVisibility(str(s.get("visibility", "public"))),
+                    invocation=SkillInvocation(str(s.get("invocation", "direct"))),
+                    owner_meta_skills=_string_list(s.get("owner_meta_skills", [])),
                 )
             )
         return skills
@@ -928,7 +995,6 @@ class SkillLoader:
         started = time.monotonic()
         observed_generation = self._catalog.generation
         with self._refresh_lock:
-            self._last_probe_at = time.monotonic()
             old = self._catalog
             if self._initialized and observed_generation != old.generation and not self._dirty:
                 return self._last_refresh_result
@@ -945,6 +1011,7 @@ class SkillLoader:
             dirty = self._dirty
             effective_reason = self._dirty_reason or reason
             if self._initialized and not force and not dirty and manifest == old.manifest:
+                self._last_probe_at = time.monotonic()
                 return self._unchanged_result(old)
 
             if (
@@ -1035,6 +1102,7 @@ class SkillLoader:
             if not catalog_changed:
                 self._dirty = False
                 self._dirty_reason = ""
+                self._last_probe_at = time.monotonic()
                 return self._unchanged_result(old)
 
             candidate = SkillCatalogSnapshot(
@@ -1124,22 +1192,16 @@ class SkillLoader:
             ):
                 target = root / relative_path
             else:
-                path_errors.append(
-                    f"Tracked Skill {lock_name!r} has no usable managed path"
-                )
+                path_errors.append(f"Tracked Skill {lock_name!r} has no usable managed path")
             if target is None:
                 continue
             try:
                 resolved_target = target.resolve(strict=False)
             except (OSError, ValueError):
-                path_errors.append(
-                    f"Tracked Skill {lock_name!r} path could not be resolved safely"
-                )
+                path_errors.append(f"Tracked Skill {lock_name!r} path could not be resolved safely")
                 continue
             if resolved_target.parent != root:
-                path_errors.append(
-                    f"Tracked Skill {lock_name!r} escapes the managed root"
-                )
+                path_errors.append(f"Tracked Skill {lock_name!r} escapes the managed root")
                 continue
             # A lock entry is itself the Community trust marker. Parser
             # versions describe how it was produced; unknown, future, or empty
@@ -1424,6 +1486,7 @@ class SkillLoader:
         self._initialized = True
         self._dirty = False
         self._dirty_reason = ""
+        self._last_probe_at = time.monotonic()
         try:
             self._write_snapshot(catalog)
         except (OSError, TypeError, ValueError):
@@ -1444,6 +1507,8 @@ class SkillLoader:
                 removed=len(removed),
                 modified=len(modified),
                 errors=len(catalog.errors),
+                skills=len(catalog.skills),
+                entries=len(catalog.manifest),
                 elapsed_ms=elapsed_ms,
                 initial=initial,
             )
@@ -1613,8 +1678,10 @@ class SkillLoader:
         :meth:`get_by_name` for persisted-run recovery, but are not part of
         fresh-run discovery.
         """
+        from opensquilla.skills.catalog_policy import is_invokable_meta
+
         return [
             spec
             for spec in self.load_all()
-            if spec.kind == "meta" and not spec.disable_model_invocation
+            if is_invokable_meta(spec) and not spec.disable_model_invocation
         ]

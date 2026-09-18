@@ -1,27 +1,51 @@
-import { computed, onScopeDispose, reactive, ref } from 'vue'
+import { computed, inject, onScopeDispose, reactive, ref } from 'vue'
 
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
-import type { RpcClientError } from '@/lib/rpc'
 import { usePlatform } from '@/platform'
-import { useRpcStore } from '@/stores/rpc'
 import {
-  ensureSandboxReady,
-  normalizeSandboxSetupStatus,
+  SANDBOX_RUNTIME_KEY,
+  SandboxError,
+  type SandboxRuntimeActionReceipt,
+  type SandboxSettingsRuntime,
   type SandboxSetupOutcome,
-} from '@/composables/sandboxSetupCoordinator'
+} from '@/modules/sandboxRuntime'
 import type {
   SandboxCapabilityReport,
   SandboxPolicy,
   SandboxPolicyDefaults,
   SandboxRunMode,
+  SandboxRuntimeComponentId,
+  SandboxRuntimeOperation,
+  SandboxRuntimeOperationState,
+  SandboxRuntimePackStatus,
   SandboxSetupStatusPayload,
 } from '@/types/sandbox'
 
 export type SandboxPolicySection = 'files' | 'commands' | 'network' | 'runtimes'
-export type { SandboxSetupOutcome } from '@/composables/sandboxSetupCoordinator'
+export type { SandboxSetupOutcome } from '@/modules/sandboxRuntime'
 
 const SECTION_SAVE_DELAY_MS = 500
+const SANDBOX_STARTUP_POLL_MS = 1_000
+const RUNTIME_STATUS_POLL_MS = 750
+const RUNTIME_STATUS_RETRY_MS = 5_000
+const ACTIVE_RUNTIME_OPERATION_STATES = new Set<SandboxRuntimeOperationState>([
+  'queued',
+  'downloading',
+  'verifying',
+  'extracting',
+  'probing',
+  'activating',
+  'cancelling',
+  'removing',
+])
+
+function hasActiveRuntimeOperation(status: SandboxRuntimePackStatus | null): boolean {
+  return status?.components.some(component => (
+    component.operation !== null
+    && ACTIVE_RUNTIME_OPERATION_STATES.has(component.operation.state)
+  )) === true
+}
 
 function clonePolicy(policy: SandboxPolicy): SandboxPolicy {
   return JSON.parse(JSON.stringify(policy)) as SandboxPolicy
@@ -31,17 +55,10 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-function currentPolicyFromConflict(error: unknown): SandboxPolicy | null {
-  const rpcError = error as RpcClientError | null | undefined
-  if (rpcError?.code !== 'POLICY_VERSION_CONFLICT') return null
-  if (!rpcError.details || typeof rpcError.details !== 'object') return null
-  const currentPolicy = (rpcError.details as { currentPolicy?: unknown }).currentPolicy
-  if (!currentPolicy || typeof currentPolicy !== 'object') return null
-  return clonePolicy(currentPolicy as SandboxPolicy)
-}
-
 export function useSandboxSettings() {
-  const rpc = useRpcStore()
+  const injectedSandbox = inject(SANDBOX_RUNTIME_KEY)
+  if (!injectedSandbox) throw new Error('SandboxRuntime was not provided')
+  const sandbox: SandboxSettingsRuntime = injectedSandbox
   const platform = usePlatform()
   const { pushToast } = useToasts()
   const loading = ref(false)
@@ -57,13 +74,24 @@ export function useSandboxSettings() {
   const builtinDenyWritePaths = ref<string[]>([])
   const runtimeTarget = ref<string | null>(null)
   const runtimeVersions = ref<SandboxPolicyDefaults['runtimeVersions']>({})
+  const runtimeStatus = ref<SandboxRuntimePackStatus | null>(null)
+  const runtimeStatusLoading = ref(false)
+  const runtimeStatusSupported = ref<boolean | null>(null)
+  const runtimeStatusError = ref('')
+  const runtimeActionPending = reactive<Record<SandboxRuntimeComponentId, boolean>>({
+    python: false,
+    node: false,
+    gitBash: false,
+  })
+  const runtimeActionError = reactive<Record<SandboxRuntimeComponentId, string>>({
+    python: '',
+    node: '',
+    gitBash: '',
+  })
   const defaultRunModeBaseline = ref<SandboxRunMode>('full')
   const defaultRunMode = ref<SandboxRunMode>('full')
   const defaultRunModePending = ref(false)
   const defaultRunModeError = ref('')
-  const sandboxWarningSuppressed = ref(false)
-  const desktopWarningPreferenceAvailable = ref(false)
-  const desktopPreferencePending = ref(false)
   const sectionPending = reactive<Record<SandboxPolicySection, boolean>>({
     files: false,
     commands: false,
@@ -81,15 +109,17 @@ export function useSandboxSettings() {
   const sectionSaveTimers: Partial<Record<SandboxPolicySection, ReturnType<typeof setTimeout>>> = {}
   let disposed = false
   let capabilityRequestGeneration = 0
+  let runtimeStatusRequestGeneration = 0
+  let runtimeViewActive = false
+  let runtimePollTimer: ReturnType<typeof setTimeout> | null = null
+  let sandboxStartupPollTimer: ReturnType<typeof setTimeout> | null = null
+  let sandboxStartupPending = false
 
   const ready = computed(() => Boolean(baseline.value && draft.value))
   const canRequestSandboxSetup = computed(() => (
     platform.capabilities.isDesktop
     && capability.value?.setupSupported !== false
-    && (
-      sandboxSetupStatus.value?.state === 'not_setup'
-      || sandboxSetupStatus.value?.state === 'failed'
-    )
+    && sandboxSetupStatus.value?.state === 'not_setup'
   ))
 
   function sectionDirty(section: SandboxPolicySection): boolean {
@@ -101,26 +131,21 @@ export function useSandboxSettings() {
     loading.value = true
     loadError.value = ''
     try {
-      await rpc.waitForConnection()
-      const [policyPayload, defaultsPayload, runModePayload] = await Promise.all([
-        rpc.call<SandboxPolicy>('sandbox.policy.get'),
-        rpc.call<Partial<SandboxPolicyDefaults>>('sandbox.policy.defaults'),
-        rpc.call<{ runMode?: unknown }>('sandbox.run_mode.preference.get'),
-      ])
-      baseline.value = clonePolicy(policyPayload)
-      draft.value = clonePolicy(policyPayload)
-      builtinDenyWritePaths.value = Array.isArray(defaultsPayload.builtinDenyWritePaths)
-        ? defaultsPayload.builtinDenyWritePaths.map(String)
+      const snapshot = await sandbox.loadSettings()
+      baseline.value = clonePolicy(snapshot.policy)
+      draft.value = clonePolicy(snapshot.policy)
+      builtinDenyWritePaths.value = Array.isArray(snapshot.defaults.builtinDenyWritePaths)
+        ? snapshot.defaults.builtinDenyWritePaths.map(String)
         : []
-      runtimeTarget.value = typeof defaultsPayload.runtimeTarget === 'string'
-        ? defaultsPayload.runtimeTarget
+      runtimeTarget.value = typeof snapshot.defaults.runtimeTarget === 'string'
+        ? snapshot.defaults.runtimeTarget
         : null
-      runtimeVersions.value = defaultsPayload.runtimeVersions ?? {}
-      const loadedRunMode: SandboxRunMode = runModePayload.runMode === 'full' ? 'full' : 'safe'
+      runtimeVersions.value = snapshot.defaults.runtimeVersions ?? {}
+      const loadedRunMode: SandboxRunMode = snapshot.preference.runMode
       defaultRunModeBaseline.value = loadedRunMode
       defaultRunMode.value = loadedRunMode
+      void loadRuntimeStatus()
       void loadSandboxReadiness()
-      void loadDesktopPreference()
     } catch (error) {
       loadError.value = errorMessage(error)
     } finally {
@@ -134,12 +159,12 @@ export function useSandboxSettings() {
     capabilityLoading.value = true
     capabilityCheckFailed.value = false
     try {
-      await rpc.waitForConnection()
-      const report = await rpc.call<SandboxCapabilityReport>(
-        'sandbox.capability.status',
-        forceRefresh ? { refresh: true } : undefined,
-      )
+      const readiness = await sandbox.readiness({ refreshCapability: forceRefresh })
       if (disposed || requestGeneration !== capabilityRequestGeneration) return null
+      if (platform.capabilities.isDesktop && readiness.status) {
+        sandboxSetupStatus.value = readiness.status
+      }
+      const report = readiness.capability
       capability.value = report
       return report
     } catch {
@@ -157,9 +182,10 @@ export function useSandboxSettings() {
   async function loadSetupStatus(): Promise<SandboxSetupStatusPayload | null> {
     if (!platform.capabilities.isDesktop || disposed) return null
     try {
-      await rpc.waitForConnection()
-      const status = normalizeSandboxSetupStatus(await rpc.call('sandbox.setup.status'))
+      const readiness = await sandbox.readiness()
+      const status = readiness.status
       if (!disposed && status) sandboxSetupStatus.value = status
+      if (!disposed && readiness.capability) capability.value = readiness.capability
       return status
     } catch {
       // Capability status remains the visible fallback for old Gateways.
@@ -168,12 +194,28 @@ export function useSandboxSettings() {
   }
 
   async function loadSandboxReadiness(): Promise<void> {
-    if (!platform.capabilities.isDesktop) {
-      await loadCapability()
-      return
+    if (disposed) return
+    if (sandboxStartupPollTimer) {
+      clearTimeout(sandboxStartupPollTimer)
+      sandboxStartupPollTimer = null
     }
-    const status = await loadSetupStatus()
-    if (status === null || status.state === 'ready') await loadCapability()
+    // The domain readiness call already combines setup state and capability.
+    // Reusing its projection avoids a second capability probe for ready hosts.
+    const report = await loadCapability()
+    if (disposed) return
+    const status = sandboxSetupStatus.value
+    if (status && status.state !== 'ready') capability.value = null
+    if (status !== null) sandboxStartupPending = status.state === 'setting_up'
+    else if (report !== null) sandboxStartupPending = report.code === 'setting_up'
+    // These reads only follow an initialization already in progress. Failed or
+    // unavailable states stop polling; transport errors retain the last known
+    // pending state. Reads never trigger setup or another initialization attempt.
+    if (sandboxStartupPending) {
+      sandboxStartupPollTimer = setTimeout(() => {
+        sandboxStartupPollTimer = null
+        void loadSandboxReadiness()
+      }, SANDBOX_STARTUP_POLL_MS)
+    }
   }
 
   async function ensureSandboxSetupForSafeMode(): Promise<boolean> {
@@ -181,12 +223,9 @@ export function useSandboxSettings() {
     sandboxSetupPending.value = true
     sandboxSetupOutcome.value = 'idle'
     try {
-      const result = await ensureSandboxReady(
-        (method, params) => rpc.call(method, params),
-        () => loadCapability(true),
-        () => rpc.waitForConnection(10_000),
-      )
+      const result = await sandbox.ensureReady()
       if (result.status) sandboxSetupStatus.value = result.status
+      capability.value = result.capability
       sandboxSetupOutcome.value = result.outcome
       return result.ready
     } finally {
@@ -197,23 +236,186 @@ export function useSandboxSettings() {
   onScopeDispose(() => {
     disposed = true
     capabilityRequestGeneration += 1
+    runtimeStatusRequestGeneration += 1
+    if (runtimePollTimer) clearTimeout(runtimePollTimer)
+    if (sandboxStartupPollTimer) clearTimeout(sandboxStartupPollTimer)
     for (const timer of Object.values(sectionSaveTimers)) {
       if (timer) clearTimeout(timer)
     }
   })
 
-  async function loadDesktopPreference(): Promise<void> {
-    const desktop = platform.settings
-    if (typeof desktop.getDesktopPreferences !== 'function') return
-    desktopWarningPreferenceAvailable.value = true
+  function clearRuntimePoll(): void {
+    if (runtimePollTimer) clearTimeout(runtimePollTimer)
+    runtimePollTimer = null
+  }
+
+  function scheduleRuntimePoll(): void {
+    clearRuntimePoll()
+    const activeOperation = hasActiveRuntimeOperation(runtimeStatus.value)
+    const retryStatus = Boolean(
+      runtimeStatusError.value && runtimeStatusSupported.value !== false,
+    )
+    if (
+      disposed
+      || !runtimeViewActive
+      || (!activeOperation && !retryStatus)
+    ) return
+    runtimePollTimer = setTimeout(() => {
+      runtimePollTimer = null
+      void loadRuntimeStatus()
+    }, activeOperation ? RUNTIME_STATUS_POLL_MS : RUNTIME_STATUS_RETRY_MS)
+  }
+
+  async function loadRuntimeStatus(): Promise<SandboxRuntimePackStatus | null> {
+    if (disposed || runtimeStatusSupported.value === false) return null
+    clearRuntimePoll()
+    const requestGeneration = ++runtimeStatusRequestGeneration
+    runtimeStatusLoading.value = true
+    runtimeStatusError.value = ''
     try {
-      const preferences = await desktop.getDesktopPreferences()
-      sandboxWarningSuppressed.value = Boolean(
-        preferences.sandboxUnavailableWarningSuppressed,
-      )
-    } catch {
-      desktopWarningPreferenceAvailable.value = false
+      const status = await sandbox.runtimeStatus()
+      if (disposed || requestGeneration !== runtimeStatusRequestGeneration) return null
+      if (!status) {
+        runtimeStatus.value = null
+        runtimeStatusSupported.value = false
+        return null
+      }
+      runtimeStatus.value = status
+      runtimeStatusSupported.value = true
+      return status
+    } catch (error) {
+      if (disposed || requestGeneration !== runtimeStatusRequestGeneration) return null
+      runtimeStatusError.value = errorMessage(error)
+      return null
+    } finally {
+      if (!disposed && requestGeneration === runtimeStatusRequestGeneration) {
+        runtimeStatusLoading.value = false
+        scheduleRuntimePoll()
+      }
     }
+  }
+
+  function setRuntimeViewActive(active: boolean): void {
+    runtimeViewActive = active
+    clearRuntimePoll()
+    if (active) void loadRuntimeStatus()
+  }
+
+  function applyRuntimeOperation(operation: SandboxRuntimeOperation): boolean {
+    const status = runtimeStatus.value
+    if (!status) return false
+    const componentIndex = status.components.findIndex(
+      component => component.componentId === operation.componentId,
+    )
+    if (componentIndex < 0) return false
+    const components = [...status.components]
+    const current = components[componentIndex]
+    if (!current) return false
+    components[componentIndex] = {
+      ...current,
+      operation,
+    }
+    runtimeStatus.value = { ...status, components }
+    return true
+  }
+
+  async function runRuntimeAction(
+    action: () => Promise<SandboxRuntimeActionReceipt>,
+    componentId: SandboxRuntimeComponentId,
+    actionKind: 'install' | 'cancel' | 'discard' | 'remove',
+    prepare?: () => Promise<boolean>,
+  ): Promise<boolean> {
+    if (runtimeActionPending[componentId] || runtimeStatusSupported.value === false) return false
+    runtimeActionPending[componentId] = true
+    runtimeActionError[componentId] = ''
+    try {
+      if (prepare && !(await prepare())) {
+        runtimeActionError[componentId] = i18n.global.t('errors.saveFailed')
+        return false
+      }
+      const receipt = await action()
+      clearRuntimePoll()
+      runtimeStatusRequestGeneration += 1
+      runtimeStatusLoading.value = false
+      if (receipt.kind === 'status') {
+        runtimeStatus.value = receipt.status
+        runtimeStatusSupported.value = true
+      } else if (!applyRuntimeOperation(receipt.operation)) {
+        await loadRuntimeStatus()
+      }
+      scheduleRuntimePoll()
+      return true
+    } catch (error) {
+      runtimeActionError[componentId] = errorMessage(error)
+      if (actionKind === 'discard') void loadRuntimeStatus()
+      return false
+    } finally {
+      runtimeActionPending[componentId] = false
+    }
+  }
+
+  function ensureRuntimeEnabled(componentId: SandboxRuntimeComponentId): Promise<boolean> {
+    if (!draft.value) return Promise.resolve(false)
+    if (!draft.value.runtimes.enabled) {
+      draft.value.runtimes.python = false
+      draft.value.runtimes.node = false
+      draft.value.runtimes.gitBash = false
+    }
+    draft.value.runtimes.enabled = true
+    draft.value.runtimes[componentId] = true
+    return flushSectionSave('runtimes')
+  }
+
+  async function enableRuntime(componentId: SandboxRuntimeComponentId): Promise<boolean> {
+    if (runtimeActionPending[componentId]) return false
+    runtimeActionPending[componentId] = true
+    runtimeActionError[componentId] = ''
+    try {
+      const enabled = await ensureRuntimeEnabled(componentId)
+      if (!enabled) runtimeActionError[componentId] = i18n.global.t('errors.saveFailed')
+      return enabled
+    } finally {
+      runtimeActionPending[componentId] = false
+    }
+  }
+
+  function installRuntime(componentId: SandboxRuntimeComponentId): Promise<boolean> {
+    return runRuntimeAction(
+      () => sandbox.installRuntime(componentId),
+      componentId,
+      'install',
+      () => ensureRuntimeEnabled(componentId),
+    )
+  }
+
+  function cancelRuntime(
+    componentId: SandboxRuntimeComponentId,
+    operationId: string,
+  ): Promise<boolean> {
+    if (!operationId) return Promise.resolve(false)
+    return runRuntimeAction(
+      () => sandbox.cancelRuntime(componentId, operationId),
+      componentId,
+      'cancel',
+    )
+  }
+
+  function removeRuntime(componentId: SandboxRuntimeComponentId): Promise<boolean> {
+    return runRuntimeAction(
+      () => sandbox.removeRuntime(componentId),
+      componentId,
+      'remove',
+    )
+  }
+
+  function discardRuntimeDownload(
+    componentId: SandboxRuntimeComponentId,
+  ): Promise<boolean> {
+    return runRuntimeAction(
+      () => sandbox.discardRuntimeDownload(componentId),
+      componentId,
+      'discard',
+    )
   }
 
   function queueSave<T>(operation: () => Promise<T>): Promise<T> {
@@ -235,10 +437,7 @@ export function useSandboxSettings() {
     defaultRunModePending.value = true
     return queueSave(async () => {
       try {
-        const payload = await rpc.call<{ runMode?: unknown }>(
-        'sandbox.run_mode.preference.set',
-          { runMode: mode },
-        )
+        const payload = await sandbox.selectMode(mode)
         if (sequence === defaultRunModeSequence) {
           const savedMode: SandboxRunMode = payload.runMode === 'full' ? 'full' : 'safe'
           defaultRunModeBaseline.value = savedMode
@@ -276,22 +475,6 @@ export function useSandboxSettings() {
     defaultRunModeError.value = ''
   }
 
-  async function resetSandboxUnavailableWarning(): Promise<void> {
-    const desktop = platform.settings
-    if (typeof desktop.saveDesktopPreferences !== 'function') return
-    desktopPreferencePending.value = true
-    try {
-      const preferences = await desktop.saveDesktopPreferences({
-        sandboxUnavailableWarningSuppressed: false,
-      })
-      sandboxWarningSuppressed.value = Boolean(
-        preferences.sandboxUnavailableWarningSuppressed,
-      )
-    } finally {
-      desktopPreferencePending.value = false
-    }
-  }
-
   async function performSectionSave(section: SandboxPolicySection): Promise<boolean> {
     if (!baseline.value || !draft.value || !sectionDirty(section)) return true
     sectionPending[section] = true
@@ -301,10 +484,7 @@ export function useSandboxSettings() {
     try {
       const candidate = clonePolicy(submittedBaseline)
       Object.assign(candidate, { [section]: submittedSection })
-      const saved = await rpc.call<SandboxPolicy>('sandbox.policy.update', {
-        basePolicyVersion: submittedBaseline.policyVersion,
-        policy: candidate,
-      })
+      const saved = await sandbox.updatePolicy(submittedBaseline.policyVersion, candidate)
       const currentDraft = clonePolicy(draft.value)
       const sectionChangedWhileSaving = (
         JSON.stringify(currentDraft[section]) !== JSON.stringify(submittedSection)
@@ -325,7 +505,9 @@ export function useSandboxSettings() {
       const sectionChangedWhileSaving = currentDraft !== null && (
         JSON.stringify(currentDraft[section]) !== JSON.stringify(submittedSection)
       )
-      const currentPolicy = currentPolicyFromConflict(error)
+      const currentPolicy = error instanceof SandboxError && error.code === 'conflict'
+        ? error.currentPolicy ?? null
+        : null
       if (currentPolicy) {
         baseline.value = clonePolicy(currentPolicy)
         draft.value = clonePolicy(currentPolicy)
@@ -402,17 +584,27 @@ export function useSandboxSettings() {
     builtinDenyWritePaths,
     runtimeTarget,
     runtimeVersions,
+    runtimeStatus,
+    runtimeStatusLoading,
+    runtimeStatusSupported,
+    runtimeStatusError,
+    runtimeActionPending,
+    runtimeActionError,
     defaultRunMode,
     defaultRunModeBaseline,
     defaultRunModePending,
     defaultRunModeError,
-    sandboxWarningSuppressed,
-    desktopWarningPreferenceAvailable,
-    desktopPreferencePending,
     sectionPending,
     sectionError,
     sectionDirty,
     load,
+    loadRuntimeStatus,
+    setRuntimeViewActive,
+    enableRuntime,
+    installRuntime,
+    cancelRuntime,
+    discardRuntimeDownload,
+    removeRuntime,
     loadCapability,
     loadSetupStatus,
     ensureSandboxSetupForSafeMode,
@@ -420,7 +612,6 @@ export function useSandboxSettings() {
     adoptSavedDefaultRunMode,
     saveDefaultRunMode,
     discardDefaultRunMode,
-    resetSandboxUnavailableWarning,
     scheduleSectionSave,
     flushSectionSave,
     saveSection,

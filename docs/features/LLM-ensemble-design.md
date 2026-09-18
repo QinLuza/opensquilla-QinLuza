@@ -95,15 +95,16 @@ Source: `_build_static_b5_members`, `STATIC_B5_PROFILES`
 Each preset is a `StaticB5Profile` — four fixed proposers plus one aggregator,
 all bound to a single provider:
 
-| Profile | Provider | Proposers | Aggregator |
-|---------|----------|-----------|------------|
-| `static_openrouter_b5` | `openrouter` | `deepseek/deepseek-v4-pro`, `z-ai/glm-5.2`, `moonshotai/kimi-k2.7-code`, `qwen/qwen3.7-max` | `z-ai/glm-5.2` |
-| `static_tokenrhythm_b5` | `tokenrhythm` | `deepseek-v4-pro`, `glm-5.2`, `kimi-k2.7-code`, `qwen3.7-max` | `glm-5.2` |
+| Profile | Provider | Proposers | Aggregator | Thinking |
+|---------|----------|-----------|------------|----------|
+| `static_openrouter_b5` | `openrouter` | `deepseek/deepseek-v4.1-flash`, `z-ai/glm-5.3-flash`, `qwen/qwen3.8-flash`, `qwen/qwen3.8-max-0902` | `deepseek/deepseek-v4.1-flash` | `high` for every member |
+| `static_tokenrhythm_b5` | `tokenrhythm` | `deepseek-flash`, `glm-5.3-flash`, `qwen3.8-flash`, `qwen3.8-max` | `deepseek-flash` | `high` for every member |
 
-The TokenRhythm profile is a mirror of the OpenRouter one: same aggregation
-shape and defaults, the same four models, only the provider and the model-id
-naming differ (OpenRouter-style `vendor/model` slugs vs. TokenRhythm's bare
-names).
+The OpenRouter profile uses the C5 lineup selected by the full DRACO evaluation.
+The TokenRhythm profile maps the same C5 model families to model IDs published
+by TokenRhythm. Both profiles explicitly set `high` thinking on all four
+proposers and the aggregator and use the same aggregation runtime defaults,
+while their model-ID conventions remain provider-specific.
 
 `_build_static_b5_members` simply materializes the profile: each proposer model
 becomes an `EnsembleMemberConfig` labeled `proposer_1..N`, the aggregator model
@@ -132,19 +133,16 @@ Source: `_build_custom_b5_members`, `_custom_b5_candidates`
 `llm_ensemble.candidates`. Each candidate row carries:
 
 - **`provider`** / **`model`** — required, non-empty; provider is lower-cased.
-- **`role`** — `aggregator` is the only structural value; an empty or omitted
-  role means proposer. The Web UI therefore presents only **Proposer** and
-  **Aggregator**. Released values `primary`, `contrast`, `fast_check`, and
-  `critic` remain accepted and preserved as advisory decision-trace labels,
-  but all execute and appear in settings as proposers. Unknown values coerce
-  to `""` instead of failing, so a hand-edited config never blocks boot.
+- **`role`** — exactly `proposer` or `aggregator`. Older advisory proposer
+  aliases and unknown non-aggregator values normalize to `proposer`, so an old
+  or hand-edited config never blocks boot or leaks internal labels into traces.
 - **`enabled`** — disabled rows are kept for read compatibility but never
   counted or run.
 
 Lineup assembly (`_build_custom_b5_members`):
 
-1. Every enabled row whose role is **not** `aggregator` runs as a proposer,
-   labeled by its role (or `proposer_N` when unassigned).
+1. Every enabled row whose role is `proposer` runs as a proposer. Internal
+   request identity uses `proposer_N`; public traces display only `Proposer`.
 2. The single row with role `aggregator` fuses the drafts. Proposer rows dedupe
    on `(provider, model)`; the aggregator row may legitimately reuse a
    proposer's model (a model both drafts and fuses).

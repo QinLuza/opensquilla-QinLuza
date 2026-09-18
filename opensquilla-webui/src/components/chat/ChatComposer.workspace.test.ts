@@ -25,8 +25,8 @@ describe('ChatComposer project draft', () => {
       allowedRunModes: ['safe', 'full'],
       runModeLocked: false,
       runModeLockMessage: '',
-      modelRoutingMode: 'off',
-      modelRoutingSettingsBusy: false,
+      sessionRoutingMode: 'off',
+      sessionRoutingBusy: false,
       routerVisualEffectsEnabled: true,
       codingModeEnabled: false,
       codingModeSettingsBusy: false,
@@ -116,6 +116,32 @@ describe('ChatComposer project draft', () => {
 
     expect(host.querySelector('.chat-project-chip')).toBeNull()
 
+    app.unmount()
+  })
+
+  it.each([false, true])('disables project changes during a pending binding (selected=%s)', async selected => {
+    const chooseProject = vi.fn()
+    const closeProject = vi.fn()
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp(ChatComposer, composerProps({
+      ...(!selected ? { projectWorkspace: null } : {}),
+      canCloseProject: selected,
+      projectBindingBusy: true,
+      onChooseProject: chooseProject,
+      onCloseProject: closeProject,
+    }))
+    app.use(i18n)
+    app.mount(host)
+    await nextTick()
+
+    const action = host.querySelector<HTMLButtonElement>(selected
+      ? '.chat-project-chip button'
+      : '.chat-project-choose')!
+    expect(action.disabled).toBe(true)
+    action.click()
+    expect(chooseProject).not.toHaveBeenCalled()
+    expect(closeProject).not.toHaveBeenCalled()
     app.unmount()
   })
 

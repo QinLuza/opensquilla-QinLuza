@@ -4,7 +4,10 @@ import type {
   ChatToolCallRenderItem,
 } from '@/types/chat'
 import type { ChatPart, StatusPart } from '@/types/parts'
-import { compactionSkippedLabelCode } from '@/utils/chat/compactionStatus'
+import {
+  compactionCompletedLabelCode,
+  compactionSkippedLabelCode,
+} from '@/utils/chat/compactionStatus'
 
 type TextPart = Extract<ChatPart, { type: 'text' }>
 
@@ -116,9 +119,12 @@ export type AssistantActivityStatusCode =
   | 'chat.activity.provider.rateLimited'
   | 'chat.activity.provider.retryWait'
   | 'chat.activity.provider.retrying'
+  | 'chat.activity.provider.retryingWithoutLimit'
   | 'chat.activity.provider.fallback'
   | 'chat.compact.compacting'
   | 'chat.compact.compacted'
+  | 'chat.compact.summarySaved'
+  | 'chat.compact.temporarilyReduced'
   | 'chat.compact.withinBudget'
   | 'chat.compact.skipped'
   | 'chat.compact.cancelled'
@@ -128,6 +134,8 @@ export interface AssistantActivityStatusStep {
   key: string
   label: AssistantActivityCodeDescriptor<AssistantActivityStatusCode>
   at: number
+  activityOrder?: number
+  endedAt?: number
   isCurrent: boolean
   id?: string
   category?: 'phase' | 'maintenance'
@@ -194,6 +202,7 @@ export type AssistantAnswerSource =
   | 'canonical'
   | 'terminal-timeline-boundary'
   | 'terminal-control-boundary'
+  | 'explicit-no-answer'
   | 'none'
 
 export interface AssistantAnswerResolution {
@@ -205,6 +214,19 @@ export interface AssistantAnswerResolution {
 interface ActivitySemantic {
   purpose: AssistantActivityPurposeBaseCode
   footprintKind: 'web' | 'file' | 'command' | 'artifact' | 'memory' | 'tool'
+}
+
+const INTERNAL_MUTATION_PRESENTATION_MARKERS = [
+  'theuserinstructions',
+  'userinstructions',
+  'documentmutationoutcome',
+  'responseinstruction',
+  'responselocale',
+]
+
+function containsInternalMutationPresentation(text: string): boolean {
+  const compact = text.toLowerCase().replace(/[^a-z0-9]+/g, '')
+  return INTERNAL_MUTATION_PRESENTATION_MARKERS.some(marker => compact.includes(marker))
 }
 
 const LIFECYCLE_CODES: Record<AssistantActivityLifecycle, AssistantActivityLifecycleCode> = {
@@ -504,22 +526,56 @@ function terminalTimelineAnswerCandidate(
     break
   }
 
-  if (index < 0 || timeline[index]?.type !== 'text') return null
+  const terminalItem = timeline[index]
+  if (
+    index < 0
+    || !terminalItem
+    || terminalItem.type !== 'text'
+    || terminalItem.presentation === 'intermediate'
+  ) return null
 
   const indexes = new Set<number>()
   const chunks: string[] = []
   while (index >= 0) {
     const item = timeline[index]
-    if (!item || item.type !== 'text') break
+    if (!item || item.type !== 'text' || item.presentation === 'intermediate') break
     if (typeof item.rawText !== 'string') return null
     indexes.add(index)
     chunks.unshift(item.rawText)
     index -= 1
   }
+  // A gateway-owned intermediate marker is an explicit semantic boundary.
+  // It is stronger than the legacy adjacency heuristic and keeps immediately
+  // preceding work narration inside Activity even when no tool separates it
+  // from the final answer span.
+  const boundaryItem = timeline[index]
+  let semanticBoundaryIndex = index
+  let crossedPrecedingControl = false
+  while (
+    semanticBoundaryIndex >= 0
+    && isSuccessfulAnswerTransparentControlGroup(timeline[semanticBoundaryIndex]!)
+  ) {
+    crossedPrecedingControl = true
+    semanticBoundaryIndex -= 1
+  }
+  const semanticBoundaryItem = timeline[semanticBoundaryIndex]
+  const crossedPresentationBoundary = semanticBoundaryIndex >= 0
+    && semanticBoundaryItem?.type === 'text'
+    && semanticBoundaryItem.presentation === 'intermediate'
+  const crossedConfirmedControlBoundary = crossedPrecedingControl
+    && crossedPresentationBoundary
+  const crossedImmediatePresentationBoundary = index >= 0
+    && boundaryItem?.type === 'text'
+    && boundaryItem.presentation === 'intermediate'
   const crossedOrdinaryToolBoundary = index >= 0
     && timeline[index]?.type === 'tool-group'
     && !isSuccessfulAnswerTransparentControlGroup(timeline[index])
-  if (!crossedControlBoundary && !crossedOrdinaryToolBoundary) return null
+  if (
+    !crossedControlBoundary
+    && !crossedOrdinaryToolBoundary
+    && !crossedImmediatePresentationBoundary
+    && !crossedConfirmedControlBoundary
+  ) return null
 
   const compact = chunks.join('')
   if (!compact.trim()) return null
@@ -527,7 +583,7 @@ function terminalTimelineAnswerCandidate(
     compact,
     readable: readableTextAggregate(chunks),
     indexes,
-    source: crossedControlBoundary
+    source: crossedControlBoundary || crossedConfirmedControlBoundary
       ? 'terminal-control-boundary'
       : 'terminal-timeline-boundary',
   }
@@ -573,6 +629,30 @@ export function resolveAssistantAnswer(
         ? 'readable'
         : null
     : null
+  const textItems = timeline.filter(
+    (item): item is Extract<ChatStreamTimelineItem, { type: 'text' }> =>
+      item.type === 'text',
+  )
+  const hasExplicitIntermediateOnly = textItems.length > 0
+    && textItems.every(item => item.presentation === 'intermediate')
+  const hasSemanticActivityBoundary = timeline.some(item => item.type === 'tool-group')
+    || Boolean(message.planRevisions?.length)
+  const allToolsSettledSuccessfully = timeline.every(item =>
+    item.type !== 'tool-group' || isSettledSuccessfulToolGroup(item),
+  )
+  const canUseExplicitNoAnswer = completedAnswerLifecycle(message, lifecycle)
+    && hasSemanticActivityBoundary
+    && hasExplicitIntermediateOnly
+    && allToolsSettledSuccessfully
+    && (matchedAggregate !== null || !canonical.trim())
+
+  if (canUseExplicitNoAnswer) {
+    return {
+      text: '',
+      source: 'explicit-no-answer',
+      activityItems: visibleTimeline,
+    }
+  }
   const canUseTerminalBoundary = completedAnswerLifecycle(message, lifecycle)
     && matchedAggregate !== null
     && candidate !== null
@@ -779,7 +859,7 @@ function statusLabelFor(
       return codeDescriptor('chat.compact.cancelled')
     }
     if (entry.state === 'running') return codeDescriptor('chat.compact.compacting')
-    return codeDescriptor('chat.compact.compacted')
+    return codeDescriptor(compactionCompletedLabelCode(entry.durability))
   }
   const action = String(entry.action || '').trim()
   const normalized = action.toLowerCase()
@@ -804,10 +884,11 @@ function statusLabelFor(
       })
     }
     if (phase === 'retrying') {
-      return codeDescriptor('chat.activity.provider.retrying', {
-        attempt: Math.max(0, Number.parseInt(first, 10) || 0),
-        limit: Math.max(0, Number.parseInt(second, 10) || 0),
-      })
+      const attempt = Math.max(0, Number.parseInt(first, 10) || 0)
+      const limit = Math.max(0, Number.parseInt(second, 10) || 0)
+      return limit > 0
+        ? codeDescriptor('chat.activity.provider.retrying', { attempt, limit })
+        : codeDescriptor('chat.activity.provider.retryingWithoutLimit', { attempt })
     }
     if (phase === 'fallback') return codeDescriptor('chat.activity.provider.fallback')
     return codeDescriptor('chat.activity.lifecycle.working')
@@ -923,10 +1004,9 @@ function isAutomaticCompletedMaintenance(step: AssistantActivityStatusStep): boo
 }
 
 /**
- * One automatic compaction may be observed through both a transient request
- * lifecycle and the durable history rewrite. When the backend uses different
- * ids for those adjacent terminal observations, present them as one maintenance
- * result. A failure or any intervening phase is a hard boundary.
+ * Adjacent automatic completions with the same durability can share one row.
+ * Temporary request reductions and saved summaries remain distinct outcomes.
+ * A failure or any intervening phase is a hard boundary.
  */
 function mergeAdjacentAutomaticCompletedMaintenance(
   steps: AssistantActivityStatusStep[],
@@ -939,17 +1019,8 @@ function mergeAdjacentAutomaticCompletedMaintenance(
       && isAutomaticCompletedMaintenance(previous)
       && isAutomaticCompletedMaintenance(step)
       && previous.id !== step.id
+      && previous.label.code === step.label.code
     ) {
-      const preferred = step.durability === 'durable' && previous.durability !== 'durable'
-        ? step
-        : previous
-      merged[merged.length - 1] = {
-        ...preferred,
-        // Preserve the first visual position and keyed DOM row while allowing
-        // durable metadata (including its id) to become authoritative.
-        key: previous.key,
-        at: previous.at,
-      }
       continue
     }
     merged.push(step)
@@ -973,6 +1044,8 @@ function projectStatusSteps(
         key: `activity-maintenance:${entry.id || stableHash(`${entry.at}`)}`,
         label,
         at: entry.at,
+        activityOrder: entry.activityOrder,
+        endedAt: entry.endedAt,
         isCurrent: entry.state === 'running',
         id: entry.id,
         category: 'maintenance',
@@ -991,11 +1064,20 @@ function projectStatusSteps(
       continue
     }
     const previous = steps[steps.length - 1]
-    if (previous?.label.code === label.code) continue
+    // Legacy history has no authoritative order and keeps the old consecutive
+    // label de-duplication. Ordered live/v2 records keep distinct occurrences:
+    // a tool or narration can sit between equal phase labels even though it is
+    // not represented in this status-only projection.
+    if (
+      previous?.label.code === label.code
+      && previous.activityOrder === entry.activityOrder
+    ) continue
     steps.push({
       key: `activity-status:${stableHash(`${entry.action}\u001f${entry.at}`)}`,
       label,
       at: entry.at,
+      activityOrder: entry.activityOrder,
+      endedAt: entry.endedAt,
       isCurrent: false,
       category: 'phase',
     })
@@ -1012,7 +1094,10 @@ function projectStatusSteps(
   const phaseSteps = mergedSteps.filter(step => step.category !== 'maintenance')
   for (const [index, step] of phaseSteps.entries()) {
     const nextAt = phaseSteps[index + 1]?.at
-    const boundary = nextAt && nextAt >= step.at ? nextAt : endedAt
+    const derivedBoundary = nextAt && nextAt >= step.at ? nextAt : endedAt
+    const boundary = Number.isFinite(step.endedAt) && Number(step.endedAt) >= step.at
+      ? Number(step.endedAt)
+      : derivedBoundary
     if (!Number.isFinite(boundary) || boundary < step.at) continue
     step.durationSeconds = Math.max(0, Math.floor((boundary - step.at) / 1000))
   }
@@ -1102,14 +1187,32 @@ export function projectAssistantActivity(
   fallbackToolItems: ChatStreamTimelineItem[] = [],
   options: ProjectAssistantActivityOptions = {},
 ): AssistantActivityProjection {
-  const timeline = message.timelineItems?.length
+  const sourceTimeline = message.timelineItems?.length
     ? message.timelineItems
     : fallbackToolItems
+  const mutationPresentationText = [
+    String(message.text || ''),
+    ...sourceTimeline.flatMap(item =>
+      item.type === 'text' && typeof item.rawText === 'string' ? [item.rawText] : [],
+    ),
+  ].join('\n')
+  const hideInternalMutationPresentation = Boolean(
+    message.turnOutcome?.documentMutationOutcome
+    && containsInternalMutationPresentation(mutationPresentationText),
+  )
+  const timeline = hideInternalMutationPresentation
+    ? sourceTimeline.filter(item => item.type !== 'text')
+    : sourceTimeline
+  const presentationMessage = hideInternalMutationPresentation
+    ? { ...message, text: '' }
+    : message
   const lifecycle = options.lifecycle ?? 'settled'
-  const answerResolution = resolveAssistantAnswer(message, timeline, lifecycle)
+  const answerResolution = resolveAssistantAnswer(presentationMessage, timeline, lifecycle)
   const hasTimelineText = timeline.some(item => item.type === 'text')
   const hasCanonicalAnswer = Boolean(answerResolution.text.trim())
-  const canSeparateActivity = hasCanonicalAnswer || !hasTimelineText
+  const canSeparateActivity = hasCanonicalAnswer
+    || answerResolution.source === 'explicit-no-answer'
+    || !hasTimelineText
   const hasStructuralAnswerBoundary =
     answerResolution.source === 'terminal-control-boundary'
     || answerResolution.source === 'terminal-timeline-boundary'
