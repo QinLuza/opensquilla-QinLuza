@@ -1713,12 +1713,6 @@ def _ensemble_selection_modes() -> tuple[str, ...]:
     return _LLM_ENSEMBLE_SELECTION_MODES
 
 
-def _ensemble_all_failed_policies() -> tuple[str, ...]:
-    from opensquilla.onboarding.mutations import _LLM_ENSEMBLE_ALL_FAILED_POLICIES
-
-    return _LLM_ENSEMBLE_ALL_FAILED_POLICIES
-
-
 def _ask_ensemble_fields(questionary, cfg) -> dict[str, Any]:
     """Collect [llm_ensemble] settings, seeding every default from the config.
 
@@ -1782,16 +1776,6 @@ def _ask_ensemble_fields(questionary, cfg) -> dict[str, Any]:
     )
     answers["min_successful_proposers"] = str(min_raw or "").strip() or None
 
-    policies = list(_ensemble_all_failed_policies())
-    current_policy = str(getattr(ensemble, "all_failed_policy", "") or "")
-    answers["all_failed_policy"] = _ask_or_cancel(
-        questionary.select(
-            "Policy when all proposers fail",
-            choices=policies,
-            default=current_policy if current_policy in policies else policies[0],
-        ),
-        section="ensemble",
-    )
     return answers
 
 
@@ -1835,6 +1819,8 @@ def run_interactive_ensemble_configure(
         min_successful_proposers=answers.get("min_successful_proposers"),
         all_failed_policy=answers.get("all_failed_policy"),
     )
+    for warning in result.warnings:
+        console.print(warning_panel(warning))
     persisted = persist_config(result.config, path=config_path, restart_required=False)
     _print_ensemble_saved(result.config)
     return persisted
@@ -2047,7 +2033,7 @@ def _installed_reinstall_command_lines() -> str:
 
     if _RELEASE_VERSION_RE.match(__version__):
         wheel_url = (
-            "https://github.com/opensquilla/opensquilla/releases/download/"
+            "https://github.com/TokenRhythm/opensquilla/releases/download/"
             f"v{__version__}/opensquilla-{__version__}-py3-none-any.whl"
         )
         return (
@@ -2058,7 +2044,7 @@ def _installed_reinstall_command_lines() -> str:
         "  uv tool install --python 3.12 --force "
         "\"opensquilla[recommended] @ <wheel-url>\"\n"
         "  (use the wheel from the latest release: "
-        "https://github.com/opensquilla/opensquilla/releases/latest)\n"
+        "https://github.com/TokenRhythm/opensquilla/releases/latest)\n"
     )
 
 

@@ -7,10 +7,15 @@ import json
 import os
 import signal
 import socket
+import sys
+import threading
 import time
 from collections.abc import Callable
+from typing import NoReturn
 
+import structlog
 import typer
+from pydantic import ValidationError
 
 from opensquilla.cli.gateway_lifecycle import (
     DESKTOP_CONFIG_OUTSIDE_PROFILE,
@@ -19,6 +24,11 @@ from opensquilla.cli.gateway_lifecycle import (
     desktop_config_path_is_profile_local,
     desktop_profile_lifecycle_active,
     remote_gateway_status,
+)
+from opensquilla.cli.port_validation import (
+    GATEWAY_PORT_MESSAGE,
+    has_gateway_port_error,
+    validate_gateway_port,
 )
 from opensquilla.cli.ui import ACCENT_MARKUP, console
 from opensquilla.gateway.boot import (
@@ -29,11 +39,59 @@ from opensquilla.gateway.config import GatewayConfig, is_public_bind, resolve_li
 from opensquilla.gateway.config_migration import ConfigParseError
 from opensquilla.paths import default_opensquilla_home
 
+log = structlog.get_logger(__name__)
+
 _SHUTDOWN_SIGNALS: tuple[signal.Signals, ...] = tuple(
     sig
     for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None))
     if sig is not None
 )
+
+
+def _flush_shutdown_streams() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except (OSError, ValueError):
+            # A closed or failed stream must not prevent the watchdog exit.
+            continue
+
+
+def _force_process_exit(exit_code: int) -> None:
+    """End the real Gateway process without running cancellation cleanup again."""
+
+    os._exit(exit_code)
+
+
+class _GatewayShutdownWatchdog:
+    """Process boundary for a close path that cannot cooperatively finish."""
+
+    def __init__(self, *, timeout: float, exit_code: int) -> None:
+        self._timeout = max(0.0, timeout)
+        self._exit_code = exit_code
+        self._disarmed = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="opensquilla-gateway-shutdown-watchdog",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def disarm(self) -> None:
+        self._disarmed.set()
+
+    def _run(self) -> None:
+        if self._disarmed.wait(self._timeout):
+            return
+        log.error(
+            "gateway.shutdown_watchdog_expired",
+            timeout=self._timeout,
+            exit_code=self._exit_code,
+        )
+        _flush_shutdown_streams()
+        _force_process_exit(self._exit_code)
 
 
 def _install_shutdown_handlers(
@@ -109,9 +167,41 @@ def _gateway_bind_available(host: str, port: int) -> bool:
     return False if last_error is not None else True
 
 
-def _load_gateway_config(config_path: str | None, *, read_only: bool = False) -> GatewayConfig:
+def _invalid_gateway_port(*, action: str, json_output: bool) -> NoReturn:
+    if json_output:
+        typer.echo(json.dumps({
+            "ok": False,
+            "action": action,
+            "state": f"{action}_failed",
+            "code": "INVALID_PORT",
+            "message": GATEWAY_PORT_MESSAGE,
+        }))
+    else:
+        typer.echo(f"Error: {GATEWAY_PORT_MESSAGE}", err=True)
+    raise typer.Exit(code=2)
+
+
+def _check_gateway_port(port: int | None, *, action: str, json_output: bool) -> None:
+    if port is not None:
+        try:
+            validate_gateway_port(port)
+        except ValidationError:
+            _invalid_gateway_port(action=action, json_output=json_output)
+
+
+def _load_gateway_config(
+    config_path: str | None,
+    *,
+    read_only: bool = False,
+    action: str = "run",
+    json_output: bool = False,
+) -> GatewayConfig:
     try:
         return GatewayConfig.load(config_path, read_only=read_only)
+    except ValidationError as exc:
+        if not has_gateway_port_error(exc):
+            raise
+        _invalid_gateway_port(action=action, json_output=json_output)
     except ConfigParseError as exc:
         console.print(f"[red]Invalid gateway config:[/red] {exc}")
         console.print(
@@ -119,6 +209,69 @@ def _load_gateway_config(config_path: str | None, *, read_only: bool = False) ->
             "[bold]opensquilla recovery recover-config --home <profile>[/bold]."
         )
         raise typer.Exit(code=1) from None
+
+
+async def _record_gateway_start_failure(
+    config: GatewayConfig,
+    *,
+    started_at: float,
+    failure: BaseException,
+    existing_sink: object | None = None,
+) -> None:
+    """Report failures only after valid configuration provides the privacy policy."""
+
+    if desktop_profile_lifecycle_active():
+        return
+    from opensquilla.telemetry.contracts.common import ResultOutcome
+    from opensquilla.telemetry.contracts.reliability import (
+        GatewayStartErrorCode,
+        GatewayStartFailureStage,
+    )
+    from opensquilla.telemetry.reliability_sink import ReliabilityEventSink
+    from opensquilla.telemetry.runtime import (
+        SHUTDOWN_UPLOAD_TIMEOUT_SECONDS,
+        ScopedTelemetryRuntime,
+    )
+
+    outcome = ResultOutcome.FAIL
+    stage = GatewayStartFailureStage.SPAWN
+    code = GatewayStartErrorCode.INTERNAL_ERROR
+    if isinstance(failure, TimeoutError):
+        outcome = ResultOutcome.TIMEOUT
+        stage = GatewayStartFailureStage.HEALTH
+        code = GatewayStartErrorCode.HEALTH_TIMEOUT
+    elif isinstance(failure, (asyncio.CancelledError, KeyboardInterrupt)):
+        outcome = ResultOutcome.CANCEL
+        code = GatewayStartErrorCode.STARTUP_CANCELLED
+    elif isinstance(failure, (OSError, SystemExit)):
+        code = GatewayStartErrorCode.SPAWN_FAILED
+
+    try:
+        observe = getattr(existing_sink, "observe_gateway_start", None)
+        duration_ms = max(0, round((time.monotonic() - started_at) * 1_000))
+        if callable(observe):
+            observe(
+                outcome=outcome,
+                error_code=code,
+                failure_stage=stage,
+                duration_ms=duration_ms,
+            )
+            return
+        runtime = ScopedTelemetryRuntime(config=config)
+        try:
+            sink = ReliabilityEventSink(runtime)
+            async with asyncio.timeout(SHUTDOWN_UPLOAD_TIMEOUT_SECONDS):
+                await sink.record_gateway_start(
+                    outcome=outcome,
+                    error_code=code,
+                    failure_stage=stage,
+                    duration_ms=duration_ms,
+                )
+                await runtime.close()
+        finally:
+            await runtime.close(flush=False)
+    except Exception:
+        log.debug("gateway.startup_telemetry_unavailable")
 
 
 def run_gateway(
@@ -140,6 +293,7 @@ def run_gateway(
     matching what the field name promises.
     """
     gateway_startup_started_at = time.monotonic()
+    _check_gateway_port(port, action="run", json_output=False)
     requested_config = config_path or os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH")
     if not desktop_config_path_is_profile_local(requested_config):
         console.print("DESKTOP_CONFIG_OUTSIDE_PROFILE")
@@ -150,9 +304,7 @@ def run_gateway(
         raise typer.Exit(code=1)
     # Load config FIRST so its ``host`` field can act as the final
     # fallback below ``OPENSQUILLA_GATEWAY_HOST``.
-    config = _load_gateway_config(
-        config_path or os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH")
-    )
+    config = _load_gateway_config(config_path or os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"))
     if config_path and not config.config_path:
         config.config_path = str(config_path)
     # Treat the CLI ``--bind`` default as "not explicitly supplied" so the
@@ -179,6 +331,13 @@ def run_gateway(
             config.record_runtime_override(field_path, stored, applied)
 
     if not _gateway_bind_available(host, resolved_port):
+        asyncio.run(
+            _record_gateway_start_failure(
+                config,
+                started_at=gateway_startup_started_at,
+                failure=OSError(),
+            )
+        )
         console.print("OPENSQUILLA_GATEWAY_PORT_IN_USE")
         console.print(
             f"[red]Gateway could not start:[/red] {host}:{resolved_port} is already in use."
@@ -217,7 +376,7 @@ def run_gateway(
             "self-disable that pill.[/yellow]"
         )
 
-    async def _run() -> None:
+    async def _run() -> bool:
         # Subscription manager is gateway-specific (WS event routing)
         from opensquilla.gateway.websocket import SubscriptionManager
 
@@ -226,13 +385,40 @@ def run_gateway(
         # build_services() inside start_gateway_server handles:
         # session_manager, provider_selector, tool_registry, usage_tracker,
         # memory, skills, scheduler, search, MCP discovery.
-        server = await start_gateway_server(
-            config=config,
-            subscription_manager=subscription_mgr,
-            run=True,
-            _startup_started_at=gateway_startup_started_at,
-        )
+        try:
+            server = await start_gateway_server(
+                config=config,
+                subscription_manager=subscription_mgr,
+                run=True,
+                _startup_started_at=gateway_startup_started_at,
+            )
+        except (Exception, asyncio.CancelledError) as exc:
+            await _record_gateway_start_failure(
+                config,
+                started_at=gateway_startup_started_at,
+                failure=exc,
+            )
+            raise
         assert server._task is not None
+
+        from opensquilla.telemetry.contracts.common import (
+            ClientEntrypoint,
+            ClientSurface,
+            ExecutionMode,
+        )
+
+        growth_sink = getattr(getattr(server, "_services", None), "growth_event_sink", None)
+        record_launch = getattr(growth_sink, "record_client_launch", None)
+        if callable(record_launch):
+            await record_launch(
+                surface=(
+                    ClientSurface.DESKTOP
+                    if desktop_profile_lifecycle_active()
+                    else ClientSurface.CLI
+                ),
+                entrypoint=ClientEntrypoint.GATEWAY_RUN,
+                execution_mode=ExecutionMode.GATEWAY,
+            )
 
         # Trigger OpenSquilla's graceful drain on SIGINT/SIGTERM. uvicorn's own
         # handlers are suppressed in start_gateway_server, so server.close() —
@@ -255,33 +441,90 @@ def run_gateway(
         # Windows, where SIGTERM maps to an immediate TerminateProcess.
         app = getattr(server, "app", None)
         if app is not None and hasattr(app, "state"):
-            install_shutdown_handler = getattr(
-                app.state, "install_shutdown_handler", None
-            )
+            install_shutdown_handler = getattr(app.state, "install_shutdown_handler", None)
             if callable(install_shutdown_handler):
                 install_shutdown_handler(_request_shutdown)
             else:
                 app.state.request_shutdown = _request_shutdown
         server_task = server._task
         waiter = asyncio.ensure_future(shutdown.wait())
+        explicit_shutdown = False
         try:
-            await asyncio.wait(
-                {server_task, waiter}, return_when=asyncio.FIRST_COMPLETED
-            )
-            await server.close(shutdown_reason)
+            await asyncio.wait({server_task, waiter}, return_when=asyncio.FIRST_COMPLETED)
+            close_reason = shutdown_reason
+            explicit_shutdown = shutdown.is_set()
         except (KeyboardInterrupt, asyncio.CancelledError):
             # Fallback for platforms where add_signal_handler is unavailable
             # (Windows / non-main-thread): SIGINT arrives as KeyboardInterrupt.
             shutdown.set()
-            await server.close("keyboard_interrupt")
+            close_reason = "keyboard_interrupt"
+            explicit_shutdown = True
         finally:
             waiter.cancel()
             _remove_shutdown_handlers(loop, installed_signals)
-        if shutdown.is_set():
+
+        # The serve task binds the listener after start_gateway_server returns.
+        # Startup can still fail here (including uvicorn's SystemExit on a bind
+        # race), before the combined listener/runtime readiness checkpoint.
+        if (
+            getattr(getattr(app, "state", None), "gateway_start_ready", None) is False
+            and server_task.done()
+            and not server_task.cancelled()
+        ):
+            startup_failure = server_task.exception()
+            if startup_failure is not None or not explicit_shutdown:
+                await _record_gateway_start_failure(
+                    config,
+                    started_at=gateway_startup_started_at,
+                    failure=startup_failure or RuntimeError(),
+                    existing_sink=getattr(
+                        getattr(server, "_services", None), "reliability_event_sink", None
+                    ),
+                )
+                explicit_shutdown = False
+
+        exit_code = 0 if explicit_shutdown else 1
+        watchdog = _GatewayShutdownWatchdog(
+            timeout=gateway_shutdown_deadline(),
+            exit_code=exit_code,
+        )
+        watchdog.start()
+        close_result = await server.close(close_reason)
+        clean = close_result is None or bool(getattr(close_result, "clean", False))
+        if not clean:
+            log.error(
+                "gateway.shutdown_incomplete_force_exit",
+                reason=close_reason,
+                exit_code=exit_code,
+                remaining_drivers=getattr(
+                    close_result,
+                    "remaining_driver_count",
+                    None,
+                ),
+                remaining_reservations=getattr(
+                    close_result,
+                    "remaining_reservation_count",
+                    None,
+                ),
+                remaining_auxiliary=getattr(
+                    close_result,
+                    "remaining_auxiliary_count",
+                    None,
+                ),
+            )
+            watchdog.disarm()
+            _flush_shutdown_streams()
+            _force_process_exit(exit_code)
+            return explicit_shutdown
+        watchdog.disarm()
+        if explicit_shutdown:
             console.print("\n[yellow]Gateway stopped.[/yellow]")
+        return explicit_shutdown
 
     try:
-        asyncio.run(_run())
+        explicit_shutdown = asyncio.run(_run())
+        if not explicit_shutdown:
+            raise typer.Exit(code=1)
     except ValueError as exc:
         from opensquilla.onboarding.next_steps import env_recovery_commands
         from opensquilla.onboarding.status import get_onboarding_status
@@ -341,10 +584,15 @@ def _lifecycle_manager(
     config_path: str | None = None,
     health_timeout: float = 60.0,
     shutdown_timeout: float = 10.0,
+    action: str = "start",
+    json_output: bool = False,
 ) -> GatewayLifecycleManager:
+    _check_gateway_port(port, action=action, json_output=json_output)
     config = _load_gateway_config(
         config_path or os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"),
         read_only=desktop_profile_lifecycle_active(),
+        action=action,
+        json_output=json_output,
     )
     host = _resolve_lifecycle_host(bind=bind or "127.0.0.1", listen=listen)
     if not listen and (bind is None or bind == "127.0.0.1"):
@@ -387,6 +635,8 @@ def start_gateway(
         listen=listen,
         config_path=config_path,
         health_timeout=health_timeout,
+        action="start",
+        json_output=json_output,
     )
     _emit_lifecycle_result(manager.start(), json_output=json_output)
 
@@ -401,11 +651,15 @@ def status_gateway(
 ) -> None:
     """Inspect the managed gateway process without mutating state."""
 
+    _check_gateway_port(port, action="status", json_output=json_output)
     if gateway_url:
         _emit_lifecycle_result(remote_gateway_status(gateway_url), json_output=json_output)
         return
 
-    manager = _lifecycle_manager(port=port, bind=bind, listen=listen, config_path=config_path)
+    manager = _lifecycle_manager(
+        port=port, bind=bind, listen=listen, config_path=config_path,
+        action="status", json_output=json_output,
+    )
     _emit_lifecycle_result(manager.status(), json_output=json_output)
 
 
@@ -431,6 +685,8 @@ def stop_gateway(
         shutdown_timeout=(
             shutdown_timeout if shutdown_timeout is not None else gateway_shutdown_deadline()
         ),
+        action="stop",
+        json_output=json_output,
     )
     _emit_lifecycle_result(manager.stop(), json_output=json_output)
 
@@ -459,15 +715,15 @@ def restart_gateway(
         shutdown_timeout=(
             shutdown_timeout if shutdown_timeout is not None else gateway_shutdown_deadline()
         ),
+        action="restart",
+        json_output=json_output,
     )
     _emit_lifecycle_result(manager.restart(), json_output=json_output)
 
 
 def reload_gateway(
     config_path: str | None = typer.Option(None, "--config", help="Override config path"),
-    gateway_url: str | None = typer.Option(
-        None, "--gateway", help="Gateway WebSocket URL to call"
-    ),
+    gateway_url: str | None = typer.Option(None, "--gateway", help="Gateway WebSocket URL to call"),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ) -> None:
     """Re-read the on-disk config into the running gateway (hot-apply).
@@ -508,9 +764,7 @@ def reload_gateway(
     if payload.get("path"):
         typer.echo(f"Reloaded config from {payload['path']}")
     live_applied = payload.get("liveApplied") or []
-    typer.echo(
-        "Applied live: " + (", ".join(live_applied) if live_applied else "(no changes)")
-    )
+    typer.echo("Applied live: " + (", ".join(live_applied) if live_applied else "(no changes)"))
     if payload.get("restartRequired"):
         sections = payload.get("restartSections") or []
         suffix = f" ({', '.join(sections)})" if sections else ""

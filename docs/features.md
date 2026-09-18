@@ -75,6 +75,15 @@ Durable agents provide named identities and defaults for recurring workstreams.
 
 Read: [`sessions.md`](sessions.md) and [`agents.md`](agents.md)
 
+### Goal Mode
+
+Goal mode keeps one durable objective and a structured progress checklist on a
+session. It can continue through ordinary agent turns while a subscribed Web UI
+or CLI owner remains connected, pauses safely on disconnect or restart, and
+defers automatic work while Plan mode is active.
+
+Read: [`goal-mode.md`](goal-mode.md)
+
 ### Usage, Diagnostics, and Permissions
 
 Usage reports explain recent model spend. Diagnostics and replay help inspect a
@@ -186,4 +195,4 @@ Read: [`../MIGRATION.md`](../MIGRATION.md).
 
 ---
 
-[Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/opensquilla/opensquilla/issues/new?template=docs_report.yml)
+[Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/TokenRhythm/opensquilla/issues/new?template=docs_report.yml)

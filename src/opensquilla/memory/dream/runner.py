@@ -79,6 +79,10 @@ async def _run_complete(
     config = ChatConfig(
         max_tokens=budget.max_output_tokens,
         provider_request_max_chars=budget.provider_request_max_chars,
+        provider_context_window_tokens=budget.context_window_tokens,
+        provider_request_max_chars_explicit_cap=(
+            budget.provider_request_max_chars_explicit_cap
+        ),
     )
     scope = current_usage_accounting_scope()
     close_stream = None
@@ -91,7 +95,7 @@ async def _run_complete(
         metadata = provider_metadata(provider)
         stream = account_provider_stream(
             lambda: chat(messages, config=config),
-            provider=metadata.provider_name or metadata.provider_kind,
+            provider=metadata.provider_id or metadata.provider_name or metadata.provider_kind,
             model=metadata.model,
         )
         close_stream = stream

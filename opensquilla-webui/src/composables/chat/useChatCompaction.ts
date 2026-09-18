@@ -1,5 +1,10 @@
 import { ref, type Ref } from 'vue'
 import i18n from '@/i18n'
+import {
+  compactionCompletedLabelCode,
+  compactionSkippedLabelCode,
+  compactionSkipIsInformational,
+} from '@/utils/chat/compactionStatus'
 
 export type ChatCompactStatusTone = 'info' | 'ok' | 'warn' | 'err' | string
 export type ChatCompactionPlacement = 'activity' | 'standalone'
@@ -14,6 +19,7 @@ export interface ChatCompactStatus {
   source: string
   compactionId: string
   durability: string
+  reason: string
 }
 
 export interface ShowCompactStatusOptions {
@@ -23,6 +29,7 @@ export interface ShowCompactStatusOptions {
   source?: string
   compactionId?: string
   durability?: string
+  reason?: string
 }
 
 export interface UseChatCompactionOptions {
@@ -40,6 +47,7 @@ interface ChatCompactPayload extends Record<string, unknown> {
   safe_to_send?: boolean
   safeToSend?: boolean
   reason?: string
+  skip_reason?: string
   error_reason?: string
   errorClass?: string
   error_class?: string
@@ -96,6 +104,7 @@ const EMPTY_COMPACT_STATUS: ChatCompactStatus = {
   source: '',
   compactionId: '',
   durability: '',
+  reason: '',
 }
 
 function createEmptyCompactStatus(): ChatCompactStatus {
@@ -159,6 +168,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
       source: statusOptions.source ?? (carryMetadata ? previous.source : ''),
       compactionId: statusOptions.compactionId ?? (carryMetadata ? previous.compactionId : ''),
       durability: statusOptions.durability ?? (carryMetadata ? previous.durability : ''),
+      reason: statusOptions.reason ?? (carryMetadata ? previous.reason : ''),
     }
     if (statusOptions.dismissMs && statusOptions.dismissMs > 0) {
       dismissTimer = setTimeout(() => {
@@ -172,7 +182,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     if (!payload) return false
     if (payload.refused === true || payload.safe_to_send === false || payload.safeToSend === false) return true
     const reason = String(payload.reason || payload.error_reason || payload.errorClass || payload.error_class || payload.error?.reason || payload.error?.code || '').toLowerCase()
-    return ['compaction_insufficient', 'compaction_flush_failed', 'context_overflow', 'unsafe_flush_receipt'].includes(reason)
+    return ['compaction_insufficient', 'context_overflow'].includes(reason)
   }
 
   function settleCompactInFlight(payload: ChatCompactPayload = {}, settleOptions: SettleCompactOptions = {}) {
@@ -373,10 +383,12 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     if (status === 'skipped') {
       settleCompactInFlight(payload || {})
       if (inActivity) return placement
-      showCompactStatus('skipped', i18n.global.t('chat.compact.withinBudget'), {
-        tone: 'info',
+      const skipReason = payload.reason || payload.skip_reason || payload.error_reason || ''
+      showCompactStatus('skipped', i18n.global.t(compactionSkippedLabelCode(skipReason)), {
+        tone: compactionSkipIsInformational(skipReason) ? 'info' : 'warn',
         source,
         compactionId,
+        reason: skipReason,
       })
       return placement
     }
@@ -430,7 +442,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     if (status === 'emergency_ephemeral') {
       settleCompactInFlight(payload || {})
       if (inActivity) return placement
-      showCompactStatus('emergency_ephemeral', i18n.global.t('chat.compact.compacted'), {
+      showCompactStatus('emergency_ephemeral', i18n.global.t('chat.compact.temporarilyReduced'), {
         tone: 'warn',
         detail: typeof payload.detail === 'string'
           ? payload.detail
@@ -444,7 +456,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     if (status === 'completed') {
       settleCompactInFlight(payload || {})
       if (inActivity) return placement
-      showCompactStatus('completed', i18n.global.t('chat.compact.compacted'), {
+      showCompactStatus('completed', i18n.global.t(compactionCompletedLabelCode(payload.durability)), {
         tone: 'ok',
         source,
         compactionId,

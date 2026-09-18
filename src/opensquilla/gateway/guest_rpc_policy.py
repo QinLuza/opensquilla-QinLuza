@@ -6,6 +6,15 @@ import re
 import secrets
 from typing import Any
 
+from opensquilla.contracts.generated.v4.sessions_delete_metadata import (
+    SESSIONS_DELETE_METHOD,
+)
+from opensquilla.contracts.generated.v4.sessions_list_metadata import (
+    SESSIONS_LIST_METHOD,
+)
+from opensquilla.contracts.generated.v4.sessions_rename_metadata import (
+    SESSIONS_RENAME_METHOD,
+)
 from opensquilla.session.keys import canonicalize_session_key, parse_agent_id
 
 _OWNER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -19,12 +28,23 @@ GUEST_RPC_ALLOWLIST = frozenset(
         "chat.clarify_submit",
         "artifacts.list",
         "artifacts.get",
-        "sessions.list",
+        SESSIONS_LIST_METHOD,
+        SESSIONS_RENAME_METHOD,
+        SESSIONS_DELETE_METHOD,
         "sessions.bootstrap",
+        "sessions.executionLog.read",
         "sessions.messages.subscribe",
         "sessions.messages.hydrate",
         "sessions.messages.snapshot",
+        "sessions.messages.snapshot.read",
+        "transport.flow.update",
         "sessions.messages.unsubscribe",
+        "sessions.pending_inputs.enqueue",
+        "sessions.pending_inputs.list",
+        "sessions.pending_inputs.update",
+        "sessions.pending_inputs.reorder",
+        "sessions.pending_inputs.cancel",
+        "sessions.pending_inputs.dispatch",
     }
 )
 
@@ -35,15 +55,33 @@ _SESSION_KEY_FIELDS = {
     "chat.abort": ("sessionKey", "key"),
     "chat.clarify_submit": ("sessionKey", "key"),
     "sessions.bootstrap": ("key", "sessionKey"),
+    "sessions.executionLog.read": ("sessionKey",),
+    SESSIONS_RENAME_METHOD: ("key", "sessionKey"),
     "sessions.messages.subscribe": ("key", "sessionKey"),
     "sessions.messages.hydrate": ("key", "sessionKey"),
     "sessions.messages.snapshot": ("key", "sessionKey"),
+    "sessions.messages.snapshot.read": ("key",),
     "sessions.messages.unsubscribe": ("key", "sessionKey"),
+    "sessions.pending_inputs.enqueue": ("key", "sessionKey"),
+    "sessions.pending_inputs.list": ("key", "sessionKey"),
+    "sessions.pending_inputs.update": ("key", "sessionKey"),
+    "sessions.pending_inputs.reorder": ("key", "sessionKey"),
+    "sessions.pending_inputs.cancel": ("key", "sessionKey"),
+    "sessions.pending_inputs.dispatch": ("key", "sessionKey"),
 }
 
 
 class GuestRpcPolicyError(PermissionError):
     """Raised when an anonymous guest crosses the RPC ownership boundary."""
+
+
+def is_guest_rpc_method_allowed(method: str) -> bool:
+    """Return the legacy allowlist decision used for Contract drift checks.
+
+    Ownership and sanitization stay in ``GuestRpcPolicy`` until contracted.
+    """
+
+    return method in GUEST_RPC_ALLOWLIST
 
 
 def _guest_namespace_parts(session_key: object) -> tuple[str, str] | None:
@@ -119,14 +157,30 @@ class GuestRpcPolicy:
 
         if not cls.is_guest(ctx):
             return params
-        if method not in GUEST_RPC_ALLOWLIST:
+        if not is_guest_rpc_method_allowed(method):
             raise GuestRpcPolicyError("Anonymous guest RPC method is not allowed")
 
         owner_id = getattr(ctx.principal, "guest_owner_id", None)
         if not owner_id or not _OWNER_ID_RE.fullmatch(str(owner_id)):
             raise GuestRpcPolicyError("Anonymous guest identity is unavailable")
 
-        if method == "sessions.list":
+        # Guests may send their first message but cannot choose a cost or
+        # capability profile that their principal is not allowed to mutate.
+        # Keep the global routing default for both immediate and staged sends.
+        if method in {"chat.send", "sessions.pending_inputs.enqueue"} and isinstance(
+            params, dict
+        ):
+            params = dict(params)
+            params.pop("initialRoutingMode", None)
+            params.pop("initial_routing_mode", None)
+
+        if method == SESSIONS_LIST_METHOD:
+            return params
+
+        if method == "transport.flow.update":
+            # The handler operates on ctx.conn_id only and checks every key
+            # against that connection's existing subscriptions. No authority
+            # or subscription can be acquired through consumption feedback.
             return params
 
         if method == "chat.send":
@@ -147,6 +201,21 @@ class GuestRpcPolicy:
             normalized["_source"] = normalized_source
             return normalized
 
+        if method == SESSIONS_DELETE_METHOD:
+            if not isinstance(params, dict):
+                raise GuestRpcPolicyError("Guest session key is required")
+            raw_keys = params.get("keys")
+            if raw_keys is None:
+                raw_keys = [params.get("key")]
+            if not isinstance(raw_keys, list) or not raw_keys:
+                raise GuestRpcPolicyError("Guest session key is required")
+            if not all(guest_owns_session_key(owner_id, key) for key in raw_keys):
+                raise GuestRpcPolicyError("Guest session is not owned by this browser")
+            normalized = dict(params)
+            normalized["keys"] = raw_keys
+            normalized.pop("key", None)
+            return normalized
+
         if not isinstance(params, dict):
             raise GuestRpcPolicyError("Guest session key is required")
         fields = _SESSION_KEY_FIELDS[method]
@@ -157,9 +226,10 @@ class GuestRpcPolicy:
         normalized[fields[0]] = key
         for alias in fields[1:]:
             normalized.pop(alias, None)
-        if method == "chat.abort":
-            normalized.pop("taskId", None)
-            normalized.pop("task_id", None)
+        # Keep a guest WebUI's task id only after proving ownership of the
+        # session key. chat.abort binds that id back to this same session in
+        # TaskRuntime; stripping it here would widen a precise Stop into the
+        # legacy whole-session cancellation path.
         return normalized
 
 
@@ -169,4 +239,5 @@ __all__ = [
     "GuestRpcPolicyError",
     "guest_owned_session_key",
     "guest_owns_session_key",
+    "is_guest_rpc_method_allowed",
 ]

@@ -177,6 +177,7 @@ async def test_start_busy_retry_exhaustion_has_specific_error_code() -> None:
 
     assert len(storage.start_attempts) == 2
     assert caught.value.code == "usage_accounting_busy"
+    assert caught.value.retry_after_ms == 100
     assert isinstance(caught.value.__cause__, StorageBusyError)
     assert storage.started == []
 
@@ -230,6 +231,43 @@ async def test_start_retries_real_sqlite_write_lock(tmp_path) -> None:
         blocker.close()
         await sink.close()
         await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_ledger_writers_fail_closed_under_real_sqlite_lock(tmp_path) -> None:
+    database = tmp_path / "sessions-concurrent.db"
+    first = await SessionStorage.open(str(database))
+    second = await SessionStorage.open(str(database))
+    first._busy_budget_seconds = 0.01
+    second._busy_budget_seconds = 0.01
+    blocker = sqlite3.connect(database, isolation_level=None)
+    blocker.execute("BEGIN IMMEDIATE")
+    sinks = [
+        SessionUsageEventSink(first, start_retry_delays=(0.0,)),
+        SessionUsageEventSink(second, start_retry_delays=(0.0,)),
+    ]
+    try:
+        results = await asyncio.gather(
+            sinks[0].start(_call(event_id="event-concurrent-1", execution_id="turn-1")),
+            sinks[1].start(_call(event_id="event-concurrent-2", execution_id="turn-2")),
+            return_exceptions=True,
+        )
+
+        assert all(isinstance(result, UsageAccountingBusyError) for result in results)
+        assert all(getattr(result, "retry_after_ms", None) == 100 for result in results)
+        blocker.rollback()
+        async with first.conn.execute("SELECT COUNT(*) AS n FROM usage_events") as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        assert row["n"] == 0
+    finally:
+        if blocker.in_transaction:
+            blocker.rollback()
+        blocker.close()
+        for sink in sinks:
+            await sink.close()
+        await second.close()
+        await first.close()
 
 
 @pytest.mark.asyncio
@@ -582,3 +620,130 @@ async def test_unknown_provider_receipt_is_explicitly_closed(
     assert storage.unknown[0][0] == "event-1"
     assert storage.unknown[0][1] >= 1_000
     assert storage.unknown[0][2] == expected
+
+
+@pytest.mark.parametrize("observer_error", [RuntimeError, asyncio.CancelledError])
+async def test_goal_usage_observer_failure_does_not_retry_committed_accounting(
+    observer_error: type[BaseException],
+) -> None:
+    from types import SimpleNamespace
+
+    calls = []
+
+    class Storage:
+        async def finalize_usage_event(self, event_id, completion, **kwargs):
+            calls.append(event_id)
+            return SimpleNamespace(
+                goal_id="synthetic-goal", transition_applied=True, event_id=event_id
+            )
+
+    async def observer(goal_id: str) -> None:
+        assert goal_id == "synthetic-goal"
+        raise observer_error("Synthetic disconnected observer")
+
+    sink = SessionUsageEventSink(Storage(), on_goal_usage=observer, retry_delays=(0,))
+    await sink.finalize(_call(), _result())
+    assert calls == ["event-1"]
+    assert sink._tasks == set()
+
+
+@pytest.mark.parametrize("unknown_write_fails", [False, True])
+@pytest.mark.parametrize("historical", [False, True])
+async def test_failed_finalize_marks_goal_usage_unknown_without_losing_late_receipt(
+    monkeypatch, unknown_write_fails, historical,
+):
+    from opensquilla.session.models import AgentTaskStatus, SessionNode
+    from tests.test_session.test_goal_storage import (
+        SESSION_ID,
+        SESSION_KEY,
+        _command,
+        _expected,
+        _set_goal,
+    )
+
+    storage = await SessionStorage.open(":memory:")
+    sink = SessionUsageEventSink(storage, retry_delays=())
+    try:
+        await storage.upsert_session(SessionNode(session_key=SESSION_KEY, session_id=SESSION_ID))
+        accepted = await _set_goal(storage)
+        assert accepted.goal is not None and accepted.goal_context is not None
+        await storage.update_agent_task(
+            "task-1", status=AgentTaskStatus.RUNNING, started_at=1000,
+        )
+        if historical:
+            await storage.conn.execute(
+                "UPDATE session_goals SET usage_accounting_version = 0, "
+                "usage_coverage = 'partial_history', usage_accounting_started_at_ms = NULL"
+            )
+            await storage.conn.commit()
+        await storage.edit_goal(
+            session_key=SESSION_KEY, expected=_expected(accepted.goal),
+            objective=accepted.goal.objective, settings={"tokenBudget": 100},
+            command=_command("edit"),
+        )
+        call = _call(
+            session_id=SESSION_ID, session_epoch=0, turn_id="task-1",
+            root_turn_id="task-1", execution_id="task-1",
+        )
+        await sink.start(call)
+        original = storage.finalize_usage_event
+        original_unknown = storage.mark_usage_event_unknown
+
+        async def fail_write(*args, **kwargs):
+            raise RuntimeError("synthetic receipt write failure")
+
+        monkeypatch.setattr(storage, "finalize_usage_event", fail_write)
+        if unknown_write_fails:
+            monkeypatch.setattr(storage, "mark_usage_event_unknown", fail_write)
+        with pytest.raises(RuntimeError, match="synthetic receipt write failure"):
+            await sink.finalize(call, _result())
+        await sink.close()
+        monkeypatch.setattr(storage, "mark_usage_event_unknown", original_unknown)
+        await storage.update_agent_task(
+            "task-1", status=AgentTaskStatus.SUCCEEDED, finished_at=2000,
+        )
+        await storage.settle_goal_task(
+            accepted.goal_context, max_turns=50, runtime_budget_seconds=3600, now_ms=2000,
+        )
+        goal = await storage.get_goal(SESSION_KEY)
+        assert goal is not None
+        assert (goal.status, goal.pause_reason, goal.usage_coverage) == (
+            "paused", "usage_unknown", "partial_usage",
+        )
+        monkeypatch.setattr(storage, "finalize_usage_event", original)
+        await sink.finalize(call, _result())
+        settled = await storage.get_goal(SESSION_KEY)
+        assert settled is not None
+        assert settled.usage_coverage == ("partial_history" if historical else "complete")
+        assert settled.budget_tokens_used == 16
+        assert settled.status == "paused"
+    finally:
+        await sink.close()
+        await storage.close()
+
+
+async def test_goal_usage_observer_preserves_actual_task_cancellation() -> None:
+    from types import SimpleNamespace
+
+    notified = asyncio.Event()
+    calls = []
+
+    class Storage:
+        async def finalize_usage_event(self, event_id, completion, **kwargs):
+            calls.append(event_id)
+            return SimpleNamespace(
+                goal_id="synthetic-goal", transition_applied=True, event_id=event_id
+            )
+
+    async def observer(goal_id: str) -> None:
+        notified.set()
+        await asyncio.Future()
+
+    sink = SessionUsageEventSink(Storage(), on_goal_usage=observer, retry_delays=(0,))
+    finalizing = asyncio.create_task(sink.finalize(_call(), _result()))
+    await asyncio.wait_for(notified.wait(), 1)
+    finalizing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await finalizing
+    assert calls == ["event-1"]
+    assert sink._tasks == set()

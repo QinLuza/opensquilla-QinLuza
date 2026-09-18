@@ -519,11 +519,16 @@ describe('PlanRunRibbon', () => {
     const sessionKey = ref('agent:main:webchat:ribbon-order')
     const handlers = new Map<string, (...args: unknown[]) => void>()
     const plans = useChatPlans({
-      rpc: {
-        call: vi.fn(),
-        on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
-          handlers.set(event, handler)
-          return vi.fn()
+      planCenter: {
+        available: () => true,
+        setMode: vi.fn(), revise: vi.fn(), implement: vi.fn(), cancelRun: vi.fn(), setPresentation: vi.fn(),
+        subscribe: vi.fn((listener: (event: any) => void) => {
+          const names = ['session.event.collaboration_mode', 'session.event.plan_revision', 'session.event.plan_run']
+          names.forEach(name => handlers.set(name, (payload: unknown) => {
+            const source = payload as Record<string, unknown>
+            listener({ kind: name.endsWith('run') ? 'run' : name.endsWith('revision') ? 'revision' : 'collaboration', sessionKey: source.session_key, collaboration: source.collaboration, plan: source.plan_revision, run: source.plan_run })
+          }))
+          return { close: () => undefined }
         }),
       },
       sessionKey,
@@ -668,19 +673,39 @@ describe('PlanRunRibbon', () => {
     expect(host.querySelector('.plan-run__summary')?.hasAttribute('aria-expanded')).toBe(false)
   })
 
-  it('keeps the composer as the single cancellation action while running', async () => {
+  it.each<PlanRunStatus>(['queued', 'running'])('exposes cancellation for a %s plan before opening progress', async status => {
     const cancel = vi.fn()
-    const host = mountRibbon(run(), false, { onCancel: cancel })
+    const host = mountRibbon(run({ status }), false, { onCancel: cancel })
     await nextTick()
+    const button = host.querySelector<HTMLButtonElement>('.plan-run__cancel')
+    expect(button?.textContent.trim()).toBe('Cancel')
+    expect(host.querySelector('.plan-run__popover')).toBeNull()
+    button?.click()
+    expect(cancel).toHaveBeenCalledOnce()
+    await tapSummary(host.querySelector<HTMLButtonElement>('.plan-run__summary'))
+    expect(host.querySelectorAll('.plan-run__end')).toHaveLength(1)
+  })
 
-    const summary = host.querySelector<HTMLButtonElement>('.plan-run__summary')
-    expect(host.querySelector('.plan-run__cancel')).toBeNull()
+  it.each<PlanRunStatus>(['paused', 'blocked'])('keeps End plan reachable for %s runs without optional progress', async status => {
+    const cancel = vi.fn()
+    const host = mountRibbon(run({ status, steps: [] }), false, { onCancel: cancel })
+    const button = host.querySelector<HTMLButtonElement>('.plan-run__cancel')
+    expect(button?.textContent?.trim()).toBe('End plan')
+    button?.click()
+    await nextTick()
+    expect(cancel).toHaveBeenCalledOnce()
+    expect(host.querySelector('.plan-run__popover')).toBeNull()
+  })
 
-    await tapSummary(summary)
-
+  it('disables the visible cancellation while pending, including a queued plan without steps', async () => {
+    const cancel = vi.fn()
+    const host = mountRibbon(run({ status: 'queued', steps: [] }), false, { onCancel: cancel, cancelBusy: true })
+    await nextTick()
+    const button = host.querySelector<HTMLButtonElement>('.plan-run__cancel')
+    expect(button?.disabled).toBe(true)
+    expect(button?.textContent.trim()).toBe('Cancelling…')
+    button?.click()
     expect(cancel).not.toHaveBeenCalled()
-    expect(summary?.getAttribute('aria-expanded')).toBe('true')
-    expect(host.querySelector('.plan-run__end')).toBeNull()
   })
 
   it.each<PlanRunStatus>([

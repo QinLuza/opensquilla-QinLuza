@@ -6,6 +6,8 @@ import asyncio
 import hashlib
 import json
 import os
+import secrets
+from dataclasses import replace
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -22,6 +24,7 @@ from opensquilla.artifacts import (
     ArtifactBundleManifest,
     ArtifactIntegrityError,
     ArtifactPathError,
+    ArtifactSource,
     ArtifactStore,
     artifact_bundle_manifest,
     artifact_mime_for_name,
@@ -29,6 +32,7 @@ from opensquilla.artifacts import (
     artifact_publish_max_bytes_for_name,
     collect_artifact_bundle,
 )
+from opensquilla.html_format import is_html
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
 from opensquilla.tools.path_aliases import resolve_workspace_alias
 from opensquilla.tools.path_policy import reject_foreign_host_path
@@ -39,6 +43,7 @@ from opensquilla.tools.types import (
     ToolContext,
     ToolError,
     current_tool_context,
+    is_goal_owned_main_default_turn,
 )
 
 _MAX_MISSING_FILE_CANDIDATES = 5
@@ -131,10 +136,20 @@ def _llm_artifact_payload(
 
 
 def _publish_note(ctx: ToolContext, *, already_published: bool = False) -> str:
-    final_response = (
-        "Do not run more tools for this deliverable unless the user explicitly "
-        "asked for another file or a specific verification step. Send the final response now."
-    )
+    if is_goal_owned_main_default_turn(ctx):
+        final_response = (
+            "Do not call publish_artifact again for this unchanged file. Follow the "
+            "Active Goal instructions: re-evaluate the entire objective and continue "
+            "any remaining work with the ordinary tools available for this turn. "
+            "update_goal_progress remains optional; use it only when a concise current-state "
+            "view helps, and replace that view when reality changes rather than treating it "
+            "as fixed phases or turn boundaries. Call "
+            "update_goal only when the entire objective is complete or genuinely blocked. "
+            "If a terminal Goal update already succeeded in this tool batch, run no more "
+            "tools and give one concise final summary."
+        )
+    else:
+        final_response = "An unchanged file does not need to be published again."
     if _should_expose_local_path(ctx):
         prefix = (
             "This file is already registered for the current surface in this turn. "
@@ -148,9 +163,13 @@ def _publish_note(ctx: ToolContext, *, already_published: bool = False) -> str:
             + f"the generated file on this machine. {final_response}"
         )
     if already_published:
+        if is_goal_owned_main_default_turn(ctx):
+            return (
+                "This file is already registered for the current surface in this turn. "
+                + final_response
+            )
         return (
             "This file is already registered for the current surface in this turn. "
-            "Do not call publish_artifact again for the same file; just confirm it is ready. "
             + final_response
         )
     return (
@@ -182,66 +201,17 @@ def _publish_artifact_metadata(
     return artifact_name, artifact_mime
 
 
-def _plan_run_steps_ready_for_delivery(run: Any) -> bool:
-    current_step_id = str(getattr(run, "current_step_id", "") or "")
-    step_states = list(getattr(run, "step_states", []) or [])
-    return (
-        not current_step_id
-        and bool(step_states)
-        and all(
-            isinstance(state, dict)
-            and str(state.get("status") or "") in {"completed", "skipped"}
-            for state in step_states
-        )
-    )
-
-
-async def _require_plan_run_ready_for_publish(ctx: ToolContext) -> None:
-    """Keep artifact delivery behind the authoritative final checkpoint."""
-
-    run_id = str(getattr(ctx, "plan_run_id", "") or "").strip()
-    if not run_id:
+def _record_publication_source(
+    ctx: ToolContext, payload: dict[str, Any], source: ArtifactSource, *, source_is_html: bool,
+) -> None:
+    publication_id = secrets.token_hex(24)
+    ctx.artifact_source_paths[publication_id] = replace(source, artifact_id=payload["id"])
+    if (
+        not source_is_html
+        and any(item.get("id") == payload["id"] for item in ctx.published_artifacts)
+    ):
         return
-    storage = getattr(ctx, "plan_storage", None)
-    get_plan_run = getattr(storage, "get_plan_run", None)
-    if not callable(get_plan_run):
-        raise ToolError("PlanRun storage is unavailable for artifact publication")
-    run = await get_plan_run(run_id)
-    if run is None:
-        raise ToolError("The active PlanRun no longer exists")
-    status = str(getattr(run, "status", "") or "")
-    task_id = str(getattr(ctx, "task_id", "") or "").strip()
-    active_task_id = str(getattr(run, "active_task_id", "") or "").strip()
-    if status == "completed":
-        return
-    if status == "running":
-        if not task_id or active_task_id != task_id:
-            raise ToolError(
-                "Artifact publication is unavailable because this task no longer "
-                "owns the attached PlanRun."
-            )
-        if _plan_run_steps_ready_for_delivery(run):
-            return
-    current_step_id = str(getattr(run, "current_step_id", "") or "")
-    current_detail = (
-        f" The current step is {current_step_id}."
-        if current_step_id
-        else ""
-    )
-    message = (
-        "publish_artifact was not executed because the attached PlanRun is "
-        f"{status or 'unavailable'}.{current_detail}"
-    )
-    if status == "running":
-        raise RetryableToolInputError(
-            f"{message} Record truthful checkpoints for the current step in plan "
-            "order, then retry publish_artifact only after the final checkpoint "
-            "returns no current step."
-        )
-    raise ToolError(
-        f"{message} Artifact publication is unavailable for this terminal or "
-        "unowned PlanRun state."
-    )
+    ctx.published_artifacts.append({**payload, "publication_id": publication_id})
 
 
 @tool(
@@ -249,6 +219,8 @@ async def _require_plan_run_ready_for_publish(ctx: ToolContext) -> None:
     description=(
         "Register an existing workspace file as a generated artifact for the current surface. "
         "Only files inside the active workspace are allowed. "
+        "For exactly one file, including self-contained HTML, set bundle='none' and omit "
+        "bundle_root. bundle_root is valid only with bundle='directory'. "
         "The active surface handles download chips or native channel delivery; do not include "
         "any URL in your reply — just confirm the file is ready."
     ),
@@ -269,15 +241,18 @@ async def _require_plan_run_ready_for_publish(ctx: ToolContext) -> None:
             "type": "string",
             "enum": ["auto", "directory", "none"],
             "description": (
-                "Static webpage packaging mode. auto follows literal local dependencies "
-                "for HTML, directory snapshots bundle_root, and none publishes one file. "
-                "Defaults to auto."
+                "Static webpage packaging mode. Use none for exactly one file, including "
+                "self-contained HTML, and omit bundle_root. Use auto to follow statically "
+                "discoverable local dependencies for an HTML entrypoint, also without "
+                "bundle_root. Use directory to snapshot a dedicated workspace subdirectory; "
+                "directory requires bundle_root. Defaults to auto."
             ),
         },
         "bundle_root": {
             "type": "string",
             "description": (
-                "Dedicated workspace subdirectory to snapshot when bundle=directory."
+                "Required only when bundle=directory: a dedicated workspace subdirectory "
+                "containing path. Invalid when bundle is auto or none; omit it in those modes."
             ),
         },
     },
@@ -291,10 +266,14 @@ async def publish_artifact(
     bundle: str = "auto",
     bundle_root: str | None = None,
 ) -> str:
+    # Some provider adapters materialize omitted optional strings as blank values.
+    # Treat those wire-equivalent values as absent without accepting a real root in
+    # modes where it is forbidden.
+    if bundle_root is not None and not bundle_root.strip():
+        bundle_root = None
     ctx = current_tool_context.get()
     if ctx is None:
         raise ToolError("publish_artifact requires tool context")
-    await _require_plan_run_ready_for_publish(ctx)
     if not ctx.workspace_dir:
         raise ToolError("publish_artifact requires an active workspace")
     if not ctx.artifact_media_root:
@@ -399,6 +378,11 @@ async def publish_artifact(
         if bundle_snapshot is not None
         else None
     )
+    source = ArtifactSource(
+        path=str(target),
+        bundle_mode=bundle,
+        bundle_root=str(bundle_root_candidate.resolve()) if bundle_root_candidate else None,
+    )
     if bundle_manifest is not None:
         target_sha256 = next(
             item.sha256
@@ -406,11 +390,24 @@ async def publish_artifact(
             if item.path == bundle_manifest.entrypoint
         )
     store = ArtifactStore(ctx.artifact_media_root)
+    with target.open("rb") as stream:
+        source_is_html = is_html(artifact_name, artifact_mime, stream.read(4096))
+    source_artifact_ids: set[str] | None = None
+    if source_is_html:
+        source_artifact_ids = {
+            item.artifact_id for item in ctx.artifact_source_paths.values()
+            if item.path == source.path
+        }
+        lookup = getattr(ctx.generated_artifact_adopter, "artifact_ids_for_source", None)
+        if callable(lookup):
+            source_artifact_ids.update(await lookup(source))
     for published in reversed(ctx.published_artifacts):
         if published.get("sha256") != target_sha256:
             continue
         artifact_id = published.get("id")
         if not isinstance(artifact_id, str):
+            continue
+        if source_artifact_ids is not None and artifact_id not in source_artifact_ids:
             continue
         try:
             published_manifest = store.describe_preview_bundle(
@@ -427,6 +424,9 @@ async def publish_artifact(
             or published_manifest.bundle_digest != bundle_manifest.bundle_digest
         ):
             continue
+        _record_publication_source(
+            ctx, artifact_payload(published), source, source_is_html=source_is_html,
+        )
         llm_artifact = _llm_artifact_payload(
             published,
             ctx=ctx,
@@ -452,11 +452,30 @@ async def publish_artifact(
             bundle_manifest.bundle_digest if bundle_manifest is not None else None
         ),
         require_single_file=bundle_manifest is None,
-    )
+    ) if source_artifact_ids is None else None
+    if source_artifact_ids is not None:
+        for source_artifact_id in sorted(source_artifact_ids):
+            try:
+                candidate = store.get_ref(
+                    session_id=ctx.artifact_session_id, artifact_id=source_artifact_id,
+                )
+                candidate_manifest = store.describe_preview_bundle(
+                    source_artifact_id, session_id=ctx.artifact_session_id,
+                )
+            except (ArtifactIntegrityError, ArtifactPathError, ValueError):
+                continue
+            if (
+                candidate.session_key == ctx.session_key
+                and (candidate.sha256, candidate.name, candidate.mime)
+                == (target_sha256, artifact_name, artifact_mime)
+                and (candidate_manifest.bundle_digest if candidate_manifest else None)
+                == (bundle_manifest.bundle_digest if bundle_manifest else None)
+            ):
+                existing = candidate
+                break
     if existing is not None:
         payload = artifact_payload(existing)
-        if not any(item.get("id") == payload.get("id") for item in ctx.published_artifacts):
-            ctx.published_artifacts.append(payload)
+        _record_publication_source(ctx, payload, source, source_is_html=source_is_html)
         llm_artifact = _llm_artifact_payload(
             payload,
             ctx=ctx,
@@ -519,7 +538,7 @@ async def publish_artifact(
         raise ToolError(f"artifact storage path is unavailable: {exc}") from exc
 
     payload = artifact_payload(ref)
-    ctx.published_artifacts.append(payload)
+    _record_publication_source(ctx, payload, source, source_is_html=source_is_html)
     llm_artifact = _llm_artifact_payload(
         payload,
         ctx=ctx,

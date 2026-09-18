@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 from urllib.parse import urlparse
 
+from opensquilla.asyncio_utils import reset_contextvar_token
 from opensquilla.sandbox.backend import Backend, NoopBackend, UnavailableBackend, select_backend
 from opensquilla.sandbox.capability_profile import capability_profile_for_command
 from opensquilla.sandbox.config import EffectiveMode, SandboxSettings
@@ -160,7 +161,7 @@ def sandbox_policy_scope(policy: StoredSandboxPolicy):
     try:
         yield
     finally:
-        _ACTIVE_SANDBOX_POLICY.reset(token)
+        reset_contextvar_token(_ACTIVE_SANDBOX_POLICY, token)
 
 
 # ─── Approval queue / context protocols ──────────────────────────────────
@@ -221,6 +222,7 @@ def configure_runtime(
     stale_cache: StaleOutputCache | None = None,
     workspace: Path | None = None,
     default_run_mode: RunMode | str | None = None,
+    defer_backend: bool = False,
 ) -> SandboxRuntime:
     """Build the process-wide :class:`SandboxRuntime`.
 
@@ -244,6 +246,11 @@ def configure_runtime(
     backend: Backend
     if not effective.sandbox_enabled:
         backend = NoopBackend()
+    elif defer_backend:
+        from opensquilla.sandbox.setup_runtime import mark_sandbox_startup_pending
+
+        backend = UnavailableBackend("Sandbox initialization has not completed.")
+        mark_sandbox_startup_pending()
     else:
         try:
             backend = select_backend(settings)
@@ -305,6 +312,26 @@ def get_runtime() -> SandboxRuntime | None:
     than relying on the ``None`` branch.
     """
     return _runtime
+
+
+async def initialize_runtime_backend() -> Backend:
+    """Initialize without blocking the event loop or publishing after teardown."""
+    runtime = _runtime
+    if runtime is None:
+        raise SandboxBackendError("Sandbox runtime is not configured.")
+    if not runtime.effective.sandbox_enabled:
+        raise SandboxBackendError("Sandbox execution is disabled.")
+    if not isinstance(runtime.backend, UnavailableBackend):
+        return runtime.backend
+
+    backend = await asyncio.to_thread(select_backend, runtime.settings, verify_runtime=False)
+    if _runtime is not runtime:
+        raise SandboxBackendError("Sandbox runtime was replaced during initialization.")
+    if isinstance(backend, (NoopBackend, UnavailableBackend)):
+        raise SandboxBackendError("No real sandbox backend became available.")
+    runtime.backend = backend
+    log.info("sandbox.runtime_backend_initialized: backend=%s", backend.name)
+    return backend
 
 
 def refresh_runtime_backend_after_setup() -> Backend | None:
@@ -1847,6 +1874,89 @@ async def _run_in_process_with_managed_network(
         await proxy.stop()
 
 
+def effective_network_mode(
+    action_kind: str,
+    *,
+    hints: LevelHints | None = None,
+    runtime: SandboxRuntime | None = None,
+) -> NetworkMode | None:
+    """Resolve the network mode :func:`gate_action` would pick for this action.
+
+    Level selection and policy construction are the pure half of gating, so a
+    caller that only needs to know the posture can run them directly instead of
+    restating the rule. Restating it is what lets a readiness surface drift from
+    the runtime: the mode depends on the resolved :class:`SecurityLevel`, not on
+    the configured run mode, so deriving it from configuration alone gets the
+    answer wrong exactly when grading has promoted or demoted an action.
+
+    ``None`` means the question has no answer here — no runtime is configured, or
+    resolution did not complete. This is a reporting path feeding status surfaces,
+    so it degrades to "unknown" rather than raising: a probe that cannot describe
+    the posture must not take down the endpoint that asked, and answering "no
+    answer" leaves the caller exactly where it was before the probe existed.
+    """
+    rt = runtime or get_runtime()
+    if rt is None:
+        return None
+    try:
+        level = (
+            select_level(action_kind, hints)
+            if rt.effective.grading_enabled
+            else rt.effective.default_level
+        )
+        policy = build_policy(
+            level,
+            action_kind,
+            rt.workspace,
+            rt.settings,
+            trusted=(hints is None or hints.trusted_source),
+            hints=hints,
+        )
+    except Exception:  # noqa: BLE001 - a status probe never fails its caller
+        log.debug("sandbox.effective_network_mode_unavailable", exc_info=True)
+        return None
+    return policy.network
+
+
+def in_process_network_precondition(
+    action_kind: str = "web.fetch",
+    *,
+    runtime: SandboxRuntime | None = None,
+) -> str | None:
+    """Explain why an in-process network tool would be denied from here, or None.
+
+    Readiness surfaces answer whether a tool is *configured*. This answers the
+    other half — whether the posture in the current calling context lets it reach
+    the network — so a surface cannot report a tool ready and then have the very
+    next query refused.
+
+    Only the preconditions :func:`run_in_process_network_action` settles before
+    any approval machinery are reported, so this stays a pure read: a readiness
+    poll must not enqueue approvals or write denial-ledger entries. A ``None``
+    result therefore means nothing known blocks the call, not that a particular
+    host will be allowed.
+    """
+    mode = effective_network_mode(action_kind, runtime=runtime)
+    if mode is None:
+        return None
+    context = _current_run_context_for_network_proxy()
+    if (
+        mode == NetworkMode.NONE
+        and _is_in_process_network_action(action_kind)
+        and context is None
+    ):
+        return (
+            "Network-disabled in-process tools require Run Context grants before "
+            "they can request or use network approvals."
+        )
+    if mode == NetworkMode.PROXY_ALLOWLIST and context is None:
+        return (
+            "NetworkMode.PROXY_ALLOWLIST requires Run Context grants to run "
+            "in-process network tools through the managed proxy."
+        )
+    return None
+
+
 async def guard_in_process_network_action(
     *,
     action_kind: str,
@@ -2230,6 +2340,7 @@ __all__ = [
     "gate_action",
     "get_runtime",
     "guard_in_process_network_action",
+    "initialize_runtime_backend",
     "managed_network_httpx_kwargs",
     "ManagedNetworkSubprocess",
     "preflight_subprocess_managed_network",

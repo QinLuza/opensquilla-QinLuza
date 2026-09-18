@@ -1,0 +1,680 @@
+"""Real Gateway/WebSocket regression for silent Goal continuations.
+
+The Gateway runs in a separate process with a deterministic offline provider.
+This crosses the public WebSocket RPC boundary and then verifies both public
+history and the raw SQLite transcript after shutdown.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import ctypes
+import datetime
+import json
+import os
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+import uuid
+from collections.abc import AsyncIterator
+from ctypes import wintypes
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import httpx
+import pytest
+
+from opensquilla.cli.gateway_client import GatewayClient
+from opensquilla.gateway.boot import start_gateway_server
+from opensquilla.gateway.config import AuthConfig, GatewayConfig, GoalConfig
+from opensquilla.gateway.websocket import SubscriptionManager
+from opensquilla.provider import ChatConfig, DoneEvent, Message, ModelInfo, TextDeltaEvent
+
+_MODEL = "e2e/silent-reply"
+_FIRST_VISIBLE = "VISIBLE_FIRST"
+_SILENT_SENTINEL = "NO_REPLY"
+_THIRD_VISIBLE = "VISIBLE_THIRD"
+_OBJECTIVE = "Exercise automatic Goal continuation."
+_SERVER_MODE_ENV = "OPENSQUILLA_SILENT_REPLY_E2E_SERVER"
+_DEFAULT_SAMPLE_ENV = "OPENSQUILLA_DEFAULT_TURN_TIMING_SAMPLE"
+_SAMPLE_SOURCE_ENV = "OPENSQUILLA_DEFAULT_TURN_TIMING_SOURCE"
+
+
+def _verify_source_imports(source_root: Path) -> None:
+    import opensquilla
+    import opensquilla.gateway.boot as boot_module
+
+    expected_module = source_root / "src/opensquilla/gateway/boot.py"
+    expected_package = source_root / "src/opensquilla/__init__.py"
+    if (
+        Path(boot_module.__file__).resolve() != expected_module.resolve()
+        or Path(opensquilla.__file__).resolve() != expected_package.resolve()
+    ):
+        raise ValueError("Gateway import does not match the requested source root")
+
+
+def _message_text(message: Message) -> str:
+    content = message.content
+    return content if isinstance(content, str) else repr(content)
+
+
+class _ScriptedProvider:
+    """Three Goal tasks: visible, silent, then visible for history proof."""
+
+    provider_name = "e2e"
+
+    def __init__(self, event_log: Path) -> None:
+        self.calls = 0
+        self.model = _MODEL
+        self._event_log = event_log
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,  # noqa: ARG002
+        config: ChatConfig | None = None,  # noqa: ARG002
+    ) -> AsyncIterator[Any]:
+        self.calls += 1
+        call = self.calls
+        assistant_history = [
+            _message_text(message)
+            for message in messages
+            if message.role == "assistant"
+        ]
+        self._event_log.parent.mkdir(parents=True, exist_ok=True)
+        with self._event_log.open("a", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "call": call,
+                        "assistant_history": assistant_history,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+        return self._stream(call)
+
+    async def _stream(self, call: int) -> AsyncIterator[Any]:
+        replies = {
+            1: _FIRST_VISIBLE,
+            2: _SILENT_SENTINEL,
+            3: _THIRD_VISIBLE,
+        }
+        reply = _FIRST_VISIBLE if os.environ.get(_DEFAULT_SAMPLE_ENV) == "1" else replies[call]
+        yield TextDeltaEvent(text=reply)
+        yield DoneEvent(
+            stop_reason="end_turn",
+            input_tokens=3,
+            output_tokens=1,
+            model=self.model,
+        )
+
+    async def list_models(self) -> list[ModelInfo]:
+        return []
+
+
+class _ScriptedSelector:
+    active_provider_id = "e2e"
+
+    def __init__(self, provider: _ScriptedProvider) -> None:
+        self.provider = provider
+        self.current_config = SimpleNamespace(model=provider.model)
+
+    def clone(self) -> _ScriptedSelector:
+        # Every clone must share the call counter and evidence log.
+        return self
+
+    def override_model(self, model: str) -> None:
+        self.provider.model = model
+        self.current_config = SimpleNamespace(model=model)
+
+    def override_model_with_fallback_chain(
+        self,
+        model: str,
+        fallback_chain: list[object],  # noqa: ARG002
+    ) -> None:
+        self.override_model(model)
+
+    def resolve(self) -> _ScriptedProvider:
+        return self.provider
+
+    async def list_models(self) -> list[dict[str, Any]]:
+        return []
+
+
+async def _serve_gateway() -> None:
+    if os.environ.get(_DEFAULT_SAMPLE_ENV) == "1":
+        _verify_source_imports(Path(os.environ[_SAMPLE_SOURCE_ENV]))
+    port = int(os.environ["OPENSQUILLA_SILENT_REPLY_E2E_PORT"])
+    state_dir = Path(os.environ["OPENSQUILLA_SILENT_REPLY_E2E_STATE"])
+    provider_log = Path(os.environ["OPENSQUILLA_SILENT_REPLY_E2E_PROVIDER_LOG"])
+    state_dir.mkdir(parents=True, exist_ok=True)
+    workspace_dir = state_dir / "workspace"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    config = GatewayConfig(
+        host="127.0.0.1",
+        port=port,
+        auth=AuthConfig(mode="none"),
+        goal=GoalConfig(
+            execution_enabled=True,
+            max_turns=3,
+            runtime_budget_seconds=3600,
+        ),
+        agent_max_provider_retries=0,
+    )
+    config.state_dir = str(state_dir)
+    config.workspace_dir = str(workspace_dir)
+    config.attachments.media_root = str(state_dir / "media")
+    config.control_ui.enabled = False
+    config.squilla_router.enabled = False
+    config.naming.enabled = False
+    config.compaction.enabled = False
+    config.memory.retrieval_mode = "fts_only"
+    config.memory.auto_capture_enabled = False
+    config.memory.capture_mode = "off"
+    config.memory.ttl_sweep_interval_minutes = 0
+    config.meta_skill.enabled = False
+    config.heartbeat.enabled = False
+    config.task_runtime.max_concurrency = 1
+    config.task_runtime.max_pending_per_session = 4
+    config.subagents.subagent_reserved_slots = 0
+    config.llm.provider = "e2e"
+    config.llm.model = _MODEL
+    config.llm.api_key = ""
+
+    provider = _ScriptedProvider(provider_log)
+    await start_gateway_server(
+        config=config,
+        provider_selector=_ScriptedSelector(provider),
+        subscription_manager=SubscriptionManager(),
+        run=True,
+    )
+    # start_gateway_server schedules uvicorn and returns its handle. Keep the
+    # owning loop alive until the parent test terminates this process.
+    await asyncio.Event().wait()
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+async def _wait_for_health(
+    port: int,
+    process: subprocess.Popen[bytes],
+    gateway_log: Path,
+) -> None:
+    deadline = time.monotonic() + 45.0
+    last_error = ""
+    async with httpx.AsyncClient(timeout=1.0, trust_env=False) as client:
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                output = gateway_log.read_text(encoding="utf-8", errors="replace")
+                raise AssertionError(
+                    f"Gateway exited before health check (code={process.returncode}):\n"
+                    f"{output}"
+                )
+            try:
+                response = await client.get(f"http://127.0.0.1:{port}/health")
+                if response.status_code == 200 and response.json().get("ok") is True:
+                    return
+            except Exception as exc:  # noqa: BLE001 - included in timeout evidence
+                last_error = str(exc)
+            await asyncio.sleep(0.1)
+    output = gateway_log.read_text(encoding="utf-8", errors="replace")
+    raise AssertionError(
+        f"Gateway did not become healthy: {last_error}\nprocess_output={output}"
+    )
+
+
+def _open_gateway_process_handle(state_dir: Path) -> tuple[Any, int] | None:
+    """Capture the actual Windows writer before terminating its venv launcher."""
+    if os.name != "nt":
+        return None
+    try:
+        identity = json.loads((state_dir / "gateway.pid").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        # Boot publishes this identity before opening any database.
+        return None
+    pid = identity["pid"]
+    started = datetime.datetime.fromisoformat(identity["start_ts"])
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or started.tzinfo is None:
+        raise AssertionError("invalid Gateway process identity")
+    kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE, *[ctypes.POINTER(wintypes.FILETIME)] * 4]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(0x00100000 | 0x1000, False, pid)
+    if not handle:
+        if int(getattr(ctypes, "get_last_error")()) == 87:  # Process already gone.
+            return None
+        raise getattr(ctypes, "WinError")()
+    try:
+        timestamps = [wintypes.FILETIME() for _ in range(4)]
+        if not kernel32.GetProcessTimes(handle, *(ctypes.byref(value) for value in timestamps)):
+            raise getattr(ctypes, "WinError")()
+        created = (timestamps[0].dwHighDateTime << 32) | timestamps[0].dwLowDateTime
+        recorded = int(started.timestamp() * 10_000_000) + 116_444_736_000_000_000
+        if created > recorded:
+            # The original process exited and its numeric PID was reused.
+            kernel32.CloseHandle(handle)
+            return None
+        return kernel32, int(handle)
+    except BaseException:
+        kernel32.CloseHandle(handle)
+        raise
+
+
+def _stop_process(process: subprocess.Popen[bytes], state_dir: Path) -> None:
+    identity = None
+    deadline = time.monotonic() + 10.0
+    try:
+        try:
+            identity = _open_gateway_process_handle(state_dir)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=max(0.0, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    deadline = time.monotonic() + 10.0
+                    process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        if identity is not None:
+            kernel32, handle = identity
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            result = kernel32.WaitForSingleObject(handle, remaining_ms)
+            if result == 258:
+                raise AssertionError("Gateway writer remained alive after launcher shutdown")
+            if result != 0:
+                raise getattr(ctypes, "WinError")()
+    finally:
+        if identity is not None:
+            kernel32, handle = identity
+            kernel32.CloseHandle(handle)
+
+
+def _isolated_gateway_env(
+    *,
+    tmp_path: Path,
+    port: int,
+    state_dir: Path,
+    provider_log: Path,
+    source_root: Path | None = None,
+) -> dict[str, str]:
+    # Start from a minimal platform allowlist instead of trying to enumerate
+    # credential spellings. This keeps non-standard secrets such as
+    # DATABASE_URL and cloud-specific environment variables out of the child.
+    inherited_keys = (
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+    )
+    env = {key: os.environ[key] for key in inherited_keys if key in os.environ}
+    project_root = source_root or Path(__file__).resolve().parents[2]
+    home_dir = tmp_path / "home"
+    app_data_dir = tmp_path / "appdata"
+    local_app_data_dir = tmp_path / "local-appdata"
+    xdg_config_dir = tmp_path / "xdg-config"
+    xdg_cache_dir = tmp_path / "xdg-cache"
+    xdg_data_dir = tmp_path / "xdg-data"
+    temp_dir = tmp_path / "tmp"
+    opensquilla_home = tmp_path / "opensquilla-home"
+    log_dir = tmp_path / "logs"
+    for directory in (
+        home_dir,
+        app_data_dir,
+        local_app_data_dir,
+        xdg_config_dir,
+        xdg_cache_dir,
+        xdg_data_dir,
+        temp_dir,
+        opensquilla_home,
+        state_dir,
+        log_dir,
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+    env.update(
+        {
+            _SERVER_MODE_ENV: "1",
+            "OPENSQUILLA_SILENT_REPLY_E2E_PORT": str(port),
+            "OPENSQUILLA_SILENT_REPLY_E2E_STATE": str(state_dir),
+            "OPENSQUILLA_SILENT_REPLY_E2E_PROVIDER_LOG": str(provider_log),
+            "OPENSQUILLA_HOME": str(opensquilla_home),
+            "OPENSQUILLA_STATE_DIR": str(state_dir),
+            "OPENSQUILLA_LOG_DIR": str(log_dir),
+            "OPENSQUILLA_OPENROUTER_LIVE_PRICING": "0",
+            "OPENSQUILLA_MEMORY_DREAM_DISABLED": "1",
+            "OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY": "true",
+            "HOME": str(home_dir),
+            "USERPROFILE": str(home_dir),
+            "APPDATA": str(app_data_dir),
+            "LOCALAPPDATA": str(local_app_data_dir),
+            "XDG_CONFIG_HOME": str(xdg_config_dir),
+            "XDG_CACHE_HOME": str(xdg_cache_dir),
+            "XDG_DATA_HOME": str(xdg_data_dir),
+            "TMPDIR": str(temp_dir),
+            "TEMP": str(temp_dir),
+            "TMP": str(temp_dir),
+            "NO_PROXY": "127.0.0.1,localhost",
+            "no_proxy": "127.0.0.1,localhost",
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONPATH": str(project_root / "src"),
+        }
+    )
+    return env
+
+
+async def _drain_available_frames(
+    subscription: Any,
+    frames: list[dict[str, Any]],
+) -> None:
+    while True:
+        try:
+            frames.append(await asyncio.wait_for(subscription.get(), timeout=0.2))
+        except TimeoutError:
+            return
+
+
+# Fresh-profile migrations can exhaust the health deadline under CI worker load.
+@pytest.mark.ci_serial
+@pytest.mark.asyncio
+async def test_real_gateway_suppresses_goal_sentinel_everywhere(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Keep both the health probe and WebSocket upgrade off operator proxies.
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://example.invalid/e2e")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "synthetic-e2e-access-key")
+    port = _free_port()
+    state_dir = tmp_path / "state"
+    provider_log = tmp_path / "provider.jsonl"
+    gateway_log = tmp_path / "gateway.log"
+    env = _isolated_gateway_env(
+        tmp_path=tmp_path,
+        port=port,
+        state_dir=state_dir,
+        provider_log=provider_log,
+    )
+    assert "DATABASE_URL" not in env
+    assert "AWS_ACCESS_KEY_ID" not in env
+    gateway_stream = gateway_log.open("wb")
+    process = subprocess.Popen(
+        [sys.executable, "-u", str(Path(__file__).resolve())],
+        cwd=tmp_path,
+        env=env,
+        stdout=gateway_stream,
+        stderr=subprocess.STDOUT,
+    )
+    client = GatewayClient()
+    subscription = None
+    frames: list[dict[str, Any]] = []
+    history: dict[str, Any] = {}
+    try:
+        await _wait_for_health(port, process, gateway_log)
+        await client.connect(f"ws://127.0.0.1:{port}/ws")
+        session_key = await client.create_session(
+            model=_MODEL,
+            display_name="Silent Goal process E2E",
+        )
+        changed = await client.call("plans.setMode", {
+            "sessionKey": session_key, "mode": "plan", "expectedRevision": 0,
+        })
+        assert changed["collaboration"]["mode"] == "plan"
+        await client.close()
+        client = GatewayClient()
+        await client.connect(f"ws://127.0.0.1:{port}/ws")
+        snapshot = await client.call("sessions.messages.hydrate", {"key": session_key})
+        assert snapshot["collaboration"]["mode"] == "plan"
+        assert snapshot["collaboration"]["revision"] == changed["collaboration"]["revision"]
+        assert snapshot["pendingUserInputs"] == []
+        assert not provider_log.exists()
+        await client.call("plans.setMode", {
+            "sessionKey": session_key, "mode": "default",
+            "expectedRevision": changed["collaboration"]["revision"],
+        })
+        # Goal ownership requires a live session-message subscription. Opening
+        # it before goals.set also proves the exact pushed wire events.
+        subscription = await client.subscribe_session_events(session_key)
+        await client.call(
+            "goals.set",
+            {
+                "sessionKey": session_key,
+                "objective": _OBJECTIVE,
+                "clientRequestId": str(uuid.uuid4()),
+                "clientMessageId": str(uuid.uuid4()),
+            },
+        )
+
+        deadline = time.monotonic() + 45.0
+        status: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            try:
+                frames.append(await asyncio.wait_for(subscription.get(), timeout=0.1))
+            except TimeoutError:
+                pass
+            status = await client.call("goals.status", {"sessionKey": session_key})
+            goal = status.get("goal") if isinstance(status, dict) else None
+            if (
+                isinstance(goal, dict)
+                and goal.get("status") == "paused"
+                and goal.get("terminalReason") == "turn_limit"
+                and not goal.get("activeTaskId")
+            ):
+                break
+        else:
+            raise AssertionError(f"Goal did not reach the deterministic limit: {status!r}")
+
+        goal_snapshot = status["goal"]
+        assert goal_snapshot["turnsSettled"] == 3
+        # Every scripted turn reports 3 input + 1 output token. The silent
+        # middle turn is still a successful, billable AgentTask even though it
+        # has no assistant transcript row.
+        assert goal_snapshot["usage"]["inputTokens"] == 9
+        assert goal_snapshot["usage"]["outputTokens"] == 3
+        assert goal_snapshot["usage"]["totalTokens"] == 12
+
+        await _drain_available_frames(subscription, frames)
+        history = await client.session_history(
+            session_key,
+            include_canonical=True,
+            include_summaries=False,
+        )
+    finally:
+        if subscription is not None:
+            await subscription.close()
+        await client.close()
+        _stop_process(process, state_dir)
+        gateway_stream.close()
+
+    done_payloads = [
+        frame.get("payload") or {}
+        for frame in frames
+        if frame.get("event") == "session.event.done"
+    ]
+    assert len(done_payloads) == 3
+    visible_done_by_text = {
+        payload.get("text_snapshot"): payload
+        for payload in done_payloads
+        if payload.get("delivery") == "visible"
+    }
+    assert set(visible_done_by_text) == {_FIRST_VISIBLE, _THIRD_VISIBLE}
+    for expected_text, payload in visible_done_by_text.items():
+        assert payload["text"] == expected_text
+        assert payload["suppression_reason"] is None
+
+        task_id = payload["task_id"]
+        text_delta_indexes = [
+            index
+            for index, frame in enumerate(frames)
+            if frame.get("event") == "session.event.text_delta"
+            and (frame.get("payload") or {}).get("task_id") == task_id
+            and (frame.get("payload") or {}).get("text") == expected_text
+        ]
+        done_index = next(
+            index
+            for index, frame in enumerate(frames)
+            if frame.get("event") == "session.event.done"
+            and (frame.get("payload") or {}).get("task_id") == task_id
+        )
+        assert len(text_delta_indexes) == 1
+        assert text_delta_indexes[0] < done_index
+
+    suppressed = [
+        payload
+        for payload in done_payloads
+        if payload.get("delivery") == "suppressed"
+    ]
+    assert len(suppressed) == 1
+    silent_done = suppressed[0]
+    assert silent_done["text"] == ""
+    assert silent_done["text_snapshot"] == ""
+    assert silent_done["suppression_reason"] == "no_reply"
+    assert silent_done["input_mode"] == "system_event"
+    assert silent_done["run_kind"] == "goal"
+    silent_task_id = silent_done["task_id"]
+    assert not any(
+        frame.get("event") == "session.event.text_delta"
+        and (frame.get("payload") or {}).get("task_id") == silent_task_id
+        for frame in frames
+    )
+
+    public_messages = history.get("messages")
+    assert isinstance(public_messages, list)
+    assert _SILENT_SENTINEL not in json.dumps(public_messages, ensure_ascii=False)
+    public_assistant_text = [
+        message.get("text")
+        for message in public_messages
+        if isinstance(message, dict) and message.get("role") == "assistant"
+    ]
+    assert public_assistant_text == [_FIRST_VISIBLE, _THIRD_VISIBLE]
+
+    provider_calls = [
+        json.loads(line)
+        for line in provider_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [call["call"] for call in provider_calls] == [1, 2, 3]
+    third_history = "\n".join(provider_calls[2]["assistant_history"])
+    assert _FIRST_VISIBLE in third_history
+    assert _SILENT_SENTINEL not in third_history
+
+    db_path = state_dir / "sessions.db"
+    with sqlite3.connect(db_path) as connection:
+        raw_rows = connection.execute(
+            "SELECT role, content, tool_calls FROM transcript_entries ORDER BY id"
+        ).fetchall()
+    assert _SILENT_SENTINEL not in json.dumps(raw_rows, ensure_ascii=False)
+    raw_assistant_text = [content for role, content, _tools in raw_rows if role == "assistant"]
+    assert raw_assistant_text == [_FIRST_VISIBLE, _THIRD_VISIBLE]
+
+    # Public delivery and canonical persistence keep their full content, but
+    # ordinary diagnostics must not create a second copy of the conversation.
+    logs = tmp_path / "logs"
+    assert list(logs.glob("decisions-*.jsonl"))
+    assert (logs / "debug.log").is_file()
+    assert not list(logs.glob("turn-calls-*.jsonl"))
+    for path in (gateway_log, *logs.glob("*.log*"), *logs.glob("*.jsonl")):
+        text = path.read_text(encoding="utf-8")
+        for content in (_OBJECTIVE, _FIRST_VISIBLE, _THIRD_VISIBLE):
+            assert content not in text, f"conversation content leaked through {path.name}"
+
+
+async def _sample_default_turn(*, sample_dir: Path, source_root: Path) -> dict[str, float | int]:
+    """Measure cold Gateway readiness and a complete offline Default turn, not TTFT."""
+    _verify_source_imports(source_root)
+    sample_dir.mkdir(parents=True, exist_ok=False)
+    port = _free_port()
+    state_dir = sample_dir / "state"
+    provider_log = sample_dir / "provider.jsonl"
+    gateway_log = sample_dir / "gateway.log"
+    env = _isolated_gateway_env(
+        tmp_path=sample_dir, port=port, state_dir=state_dir,
+        provider_log=provider_log, source_root=source_root,
+    )
+    env[_DEFAULT_SAMPLE_ENV] = "1"
+    env[_SAMPLE_SOURCE_ENV] = str(source_root)
+    client = GatewayClient()
+    with gateway_log.open("wb") as stream:
+        started = time.monotonic()
+        process = subprocess.Popen(
+            [sys.executable, "-u", str(Path(__file__).resolve())],
+            cwd=sample_dir, env=env, stdout=stream, stderr=subprocess.STDOUT,
+        )
+        try:
+            await _wait_for_health(port, process, gateway_log)
+            startup_ms = (time.monotonic() - started) * 1000
+            await client.connect(f"ws://127.0.0.1:{port}/ws")
+            session_key = await client.create_session(model=_MODEL, display_name="Timing sample")
+            started = time.monotonic()
+            async with asyncio.timeout(45):
+                frames = [frame async for frame in client.send_message(
+                    session_key, "Return the synthetic timing response.",
+                )]
+            first_turn_ms = (time.monotonic() - started) * 1000
+            done = [frame for frame in frames if frame.get("event") == "session.event.done"]
+            assert len(done) == 1
+            assert done[0].get("run_kind") != "goal"
+            assert done[0].get("text_snapshot", done[0].get("text")) == _FIRST_VISIBLE
+            status = await client.call("goals.status", {"sessionKey": session_key})
+            assert status.get("goal") is None
+            calls = [json.loads(line) for line in provider_log.read_text().splitlines()]
+            assert [call["call"] for call in calls] == [1]
+            return {
+                "startup_to_health_ms": round(startup_ms, 3),
+                "default_first_turn_ms": round(first_turn_ms, 3),
+                "provider_calls": len(calls),
+                "terminal_events": len(done),
+                "goals": 0,
+            }
+        finally:
+            await client.close()
+            _stop_process(process, state_dir)
+
+
+@pytest.mark.ci_serial
+async def test_default_timing_sample_has_one_provider_call_and_no_goal(tmp_path: Path) -> None:
+    result = await _sample_default_turn(
+        sample_dir=tmp_path / "sample", source_root=Path(__file__).resolve().parents[2],
+    )
+    assert result["provider_calls"] == result["terminal_events"] == 1
+    assert result["goals"] == 0
+    assert result["startup_to_health_ms"] > 0
+    assert result["default_first_turn_ms"] > 0
+
+
+def test_timing_rejects_imports_from_another_checkout(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="requested source root"):
+        _verify_source_imports(tmp_path)
+
+
+if __name__ == "__main__":
+    if os.environ.get(_SERVER_MODE_ENV) == "1":
+        asyncio.run(_serve_gateway())
+    else:
+        parser = argparse.ArgumentParser(description="Opt-in offline Gateway timing sample")
+        parser.add_argument("--sample-dir", type=Path, required=True)
+        parser.add_argument("--source-root", type=Path, required=True)
+        args = parser.parse_args()
+        result = asyncio.run(_sample_default_turn(
+            sample_dir=args.sample_dir, source_root=args.source_root.resolve(),
+        ))
+        print(json.dumps(result, sort_keys=True))

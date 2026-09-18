@@ -1,47 +1,17 @@
+import type {
+  Channel,
+  ChannelCapabilityEvidence,
+} from '@/modules/channelAdministration'
+
+export type { Channel, ProbeResult } from '@/modules/channelAdministration'
+
 // Shared channel presentation facts: the row types the gateway's
 // channels.status returns plus the pure formatting helpers the dashboard
 // cards and the drill-in page both render from. Extracted from ChannelsView
 // so the card grid and the full-page detail cannot drift on how a channel's
 // identity, transport, uptime, or delivery health is derived.
 
-export interface CapabilityEvidence {
-  declared?: boolean
-  implemented?: boolean
-  effective?: boolean
-  evidence_kind?: string
-  methods?: string[]
-  proof_status?: string
-}
-
-export interface Channel {
-  name?: string
-  id?: string
-  type?: string
-  status?: string
-  connected?: boolean
-  connected_since?: string | number | null
-  restart_attempts?: number
-  pendingPairings?: number
-  bot_user_id?: string | null
-  enabled?: boolean
-  configured?: boolean
-  capabilities?: string[]
-  capability_profile?: {
-    transports?: string[]
-    maturity?: string
-    evidence?: Record<string, CapabilityEvidence>
-  } | null
-  diagnostics?: Record<string, unknown>
-  [key: string]: unknown
-}
-
-export interface ProbeResult {
-  status: string
-  connected: boolean
-  latencyMs?: number | null
-  detail?: string
-  result?: Record<string, unknown>
-}
+export type CapabilityEvidence = ChannelCapabilityEvidence
 
 export function channelKey(ch: Channel): string {
   return String(ch.name || ch.id || ch.type || 'unknown')
@@ -54,9 +24,13 @@ const CURATED_LABELS: Record<string, string> = {
   slack: 'Slack', telegram: 'Telegram', discord: 'Discord', feishu: 'Feishu / Lark',
   dingtalk: 'DingTalk', wecom: 'WeCom', qq: 'QQ Bot', matrix: 'Matrix', msteams: 'Microsoft Teams',
 }
+// Transport values are backend tokens ('polling', 'http_sync', …) held in one
+// vocabulary so locales can overlay console.channels.transport.*. Callers that
+// have an i18n context pass a translate callback; without one the label
+// degrades to the humanized token.
 const STATIC_TRANSPORT: Record<string, string> = {
-  slack: 'Mixed', telegram: 'Polling', discord: 'WebSocket', feishu: 'Mixed',
-  dingtalk: 'WebSocket', wecom: 'Mixed', qq: 'WebSocket', matrix: 'HTTP sync', msteams: 'Webhook',
+  slack: 'mixed', telegram: 'polling', discord: 'websocket', feishu: 'mixed',
+  dingtalk: 'websocket', wecom: 'mixed', qq: 'websocket', matrix: 'http_sync', msteams: 'webhook',
 }
 
 export function humanize(value: string): string {
@@ -68,10 +42,27 @@ export function providerLabel(type?: string, unknownLabel = 'Unknown'): string {
   return CURATED_LABELS[key] || humanize(type || unknownLabel)
 }
 
-export function transportLabel(ch: Channel, notReported = ''): string {
-  const live = (ch.capability_profile?.transports || []).map(humanize).join(' / ')
-  if (live) return live
-  return STATIC_TRANSPORT[String(ch.type || '').toLowerCase()] || notReported
+export function normalizeTransportToken(value: string): string {
+  return value.trim().toLowerCase().replace(/[\s-]+/g, '_')
+}
+
+export function transportTokens(ch: Channel): string[] {
+  const live = (ch.capability_profile?.transports || [])
+    .map(normalizeTransportToken)
+    .filter(Boolean)
+  if (live.length) return [...new Set(live)]
+  const stat = STATIC_TRANSPORT[String(ch.type || '').toLowerCase()]
+  return stat ? [stat] : []
+}
+
+export function transportLabel(
+  ch: Channel,
+  notReported = '',
+  translate?: (token: string) => string,
+): string {
+  const tokens = transportTokens(ch)
+  if (!tokens.length) return notReported
+  return tokens.map(translate || humanize).join(' / ')
 }
 
 export function formatSince(

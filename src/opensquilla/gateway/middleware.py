@@ -32,6 +32,7 @@ _ARTIFACT_PREVIEW_CONTROL_PATH_RE = re.compile(
 )
 
 
+
 def _is_artifact_preview_capability_path(path: str) -> bool:
     """Identify bearer resource URLs without matching lease control routes."""
     return _ARTIFACT_PREVIEW_CAPABILITY_PATH_RE.match(path) is not None
@@ -40,6 +41,10 @@ def _is_artifact_preview_capability_path(path: str) -> bool:
 def _is_artifact_preview_control_path(path: str) -> bool:
     """Identify preview lease controls whose high-entropy ids must stay out of logs."""
     return _ARTIFACT_PREVIEW_CONTROL_PATH_RE.fullmatch(path) is not None
+
+
+
+
 
 
 _CONTROL_PLANE_PATHS = frozenset({"/health", "/healthz", "/ready", "/readyz"})
@@ -279,7 +284,9 @@ class ErrorHandlingMiddleware(BaseHTTPMiddleware):
                     {"error": "Internal Server Error", "code": "INTERNAL_ERROR"},
                     status_code=500,
                 )
-            if _is_artifact_preview_control_path(request.url.path):
+            if (
+                _is_artifact_preview_control_path(request.url.path)
+            ):
                 log.error(
                     "http.request_failed",
                     path_class="artifact_preview_control",

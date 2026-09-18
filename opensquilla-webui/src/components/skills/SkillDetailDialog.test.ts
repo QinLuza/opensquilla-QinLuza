@@ -39,6 +39,7 @@ function mountDialog(initial: Skill | null, initialProposal: Proposal | null = n
     proposal.value = null
   })
   const installDeps = vi.fn()
+  const setEnabled = vi.fn()
   const host = document.createElement('div')
   document.body.appendChild(host)
   const app = createApp({
@@ -52,15 +53,28 @@ function mountDialog(initial: Skill | null, initialProposal: Proposal | null = n
       uninstallingName: null,
       onClose: close,
       onInstallDeps: installDeps,
+      canSetEnabled: true,
+      onSetEnabled: setEnabled,
     }),
   })
   app.use(createI18n({ legacy: false, locale: 'en', messages: { en } }))
   app.mount(host)
   apps.push(app)
-  return { skill, proposal, close, installDeps, host, dialog: host.querySelector('dialog')! }
+  return { skill, proposal, close, installDeps, setEnabled, host, dialog: host.querySelector('dialog')! }
 }
 
 describe('SkillDetailDialog behavior contract', () => {
+  it('allows a disabled skill without implicitly installing its dependencies', async () => {
+    const mounted = mountDialog({ name: 'synthetic', disabled: true, missing_bins: ['synthetic-bin'] })
+    await nextTick()
+    const toggle = mounted.dialog.querySelector<HTMLButtonElement>('[role="switch"]')!
+    expect(toggle.getAttribute('aria-checked')).toBe('false')
+    toggle.click()
+    expect(mounted.setEnabled).toHaveBeenCalledExactlyOnceWith('synthetic', true)
+    expect(mounted.installDeps).not.toHaveBeenCalled()
+    expect(mounted.dialog.textContent).toContain('Use is disabled')
+  })
+
   it('routes native cancel through the parent close path and can reopen', async () => {
     const alpha = { name: 'alpha', description: 'Alpha skill' }
     const mounted = mountDialog(alpha)
@@ -117,6 +131,36 @@ describe('SkillDetailDialog behavior contract', () => {
 
     expect(mounted.host.textContent).toContain('Current FFmpeg')
     expect(mounted.host.textContent).not.toContain('Stale ImageMagick')
+  })
+
+  it.each([
+    ['shadowed', 'loaded'],
+    ['disabled', 'loaded'],
+    ['hidden', 'loaded'],
+    ['active', 'not_discovered'],
+  ] as const)('hides dependency mutations for a %s/%s lifecycle candidate', async (
+    selectionState,
+    loadState,
+  ) => {
+    const mounted = mountDialog({
+      name: 'shared',
+      active: false,
+      status: 'needs_setup',
+      missing_bins: ['ffmpeg'],
+      install: [{ id: 'ffmpeg', kind: 'brew', label: 'Install candidate FFmpeg', bins: ['ffmpeg'] }],
+      lifecycle: {
+        install_state: 'tracked',
+        load_state: loadState,
+        selection_state: selectionState,
+        compatibility_state: 'instruction_only',
+        readiness_state: 'needs_setup',
+      },
+    })
+    await nextTick()
+
+    expect(mounted.dialog.textContent).not.toContain('Install candidate FFmpeg')
+    expect(mounted.dialog.querySelector('.sk-detail__install-row button')).toBeNull()
+    expect(mounted.installDeps).not.toHaveBeenCalled()
   })
 
   it('updates its accessible name for the selected skill or proposal', async () => {

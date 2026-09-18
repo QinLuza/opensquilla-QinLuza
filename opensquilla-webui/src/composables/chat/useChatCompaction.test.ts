@@ -62,6 +62,41 @@ describe('useChatCompaction replay compatibility', () => {
     }
   })
 
+  it('distinguishes within-budget skips from compaction vetoes', () => {
+    const benign = createHarness()
+    const vetoed = createHarness()
+    try {
+      benign.api.showCompactionToast({
+        status: 'skipped',
+        source: 'manual',
+        reason: 'within_compaction_budget',
+      })
+      vetoed.api.showCompactionToast({
+        status: 'skipped',
+        source: 'manual',
+        reason: 'no_safe_turn_boundary',
+      })
+
+      expect(benign.api.compactStatus.value).toMatchObject({
+        status: 'skipped',
+        tone: 'info',
+        message: 'No organization needed; context has enough space',
+        reason: 'within_compaction_budget',
+      })
+      expect(vetoed.api.compactStatus.value).toMatchObject({
+        status: 'skipped',
+        tone: 'warn',
+        message: 'Context organization was not applied',
+        reason: 'no_safe_turn_boundary',
+      })
+    } finally {
+      benign.api.cleanup()
+      benign.stop()
+      vetoed.api.cleanup()
+      vetoed.stop()
+    }
+  })
+
   it('settles optimistic busy from a replayed terminal before the id acknowledgement', () => {
     const h = createHarness()
     try {
@@ -168,24 +203,45 @@ describe('useChatCompaction replay compatibility', () => {
     }
   })
 
-  it('settles emergency_ephemeral without claiming durable completion in state', () => {
+  it.each([false, true])('settles emergency_ephemeral truthfully after replay=%s', replayed => {
     const h = createHarness()
     try {
-      h.api.showCompactionToast({ status: 'started', source: 'manual' })
+      h.api.showCompactionToast({ status: 'started', source: 'manual', compaction_id: 'cmp-temporary' })
       h.api.showCompactionToast({
         status: 'emergency_ephemeral',
         source: 'automatic',
-      })
+        compaction_id: 'cmp-temporary',
+      }, { replayed })
 
       expect(h.api.compactStatus.value).toMatchObject({
         visible: true,
         status: 'emergency_ephemeral',
+        message: 'History temporarily reduced; continuing',
+        durability: 'request_scoped',
         tone: 'warn',
         detail: 'Request-scoped; session history was not rewritten',
         isBusy: false,
       })
       expect(h.api.isCompactInFlightForCurrentSession()).toBe(false)
       expect(h.schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
+    } finally {
+      h.api.cleanup()
+      h.stop()
+    }
+  })
+
+  it('labels a committed summary as saved', () => {
+    const h = createHarness()
+    try {
+      h.api.showCompactionToast({ status: 'started', source: 'manual' })
+      h.api.showCompactionToast({ status: 'completed', source: 'manual', durability: 'durable' })
+
+      expect(h.api.compactStatus.value).toMatchObject({
+        message: 'Summary saved',
+        status: 'completed',
+        durability: 'durable',
+        isBusy: false,
+      })
     } finally {
       h.api.cleanup()
       h.stop()

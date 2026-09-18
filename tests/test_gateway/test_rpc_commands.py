@@ -18,6 +18,42 @@ async def _list_for_surface(surface: str) -> dict:
     return result.payload
 
 
+def test_meta_choices_use_supported_meta_domain() -> None:
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.gateway.rpc_commands import _meta_skill_argument_choices
+    from opensquilla.skills.types import SkillInvocation, SkillLayer, SkillSpec, SkillVisibility
+
+    supported = SkillSpec(
+        "supported-meta", "Visible Meta", SkillLayer.PERSONAL, False, [], "",
+        kind="meta", visibility=SkillVisibility.META, invocation=SkillInvocation.META_ONLY,
+    )
+    experimental = SkillSpec(
+        "experimental-meta", "Internal Meta", SkillLayer.PERSONAL, False, [], "",
+        kind="meta", visibility=SkillVisibility.INTERNAL,
+        invocation=SkillInvocation.EXPERIMENTAL_INTERNAL,
+    )
+    disabled = SkillSpec(
+        "disabled-meta", "Disabled Meta", SkillLayer.PERSONAL, False, [], "",
+        kind="meta", visibility=SkillVisibility.META, invocation=SkillInvocation.META_ONLY,
+        disable_model_invocation=True,
+    )
+    loader = SimpleNamespace(load_all=lambda: [experimental, supported, disabled])
+    config = GatewayConfig()
+    config.meta_skill.enabled = True
+    choices = asyncio.run(_meta_skill_argument_choices(loader, config))
+    assert [choice["value"] for choice in choices] == ["supported-meta"]
+    assert choices[0]["status"] == "ready"
+
+    config.skills.disabled = ["supported-meta"]
+    assert asyncio.run(_meta_skill_argument_choices(loader, config)) == []
+    config.skills.disabled = []
+    choices = asyncio.run(_meta_skill_argument_choices(loader, config))
+    assert [choice["value"] for choice in choices] == ["supported-meta"]
+
+    config.meta_skill.enabled = False
+    assert asyncio.run(_meta_skill_argument_choices(loader, config)) == []
+
+
 def test_commands_list_for_surface_accepts_legacy_web_alias() -> None:
     payload = asyncio.run(_list_for_surface("web"))
 
@@ -34,6 +70,14 @@ def test_web_catalog_includes_usage_rpc_execution() -> None:
         "action": "usage.status",
         "rpc_method": "usage.status",
     }
+
+
+def test_web_new_creates_a_task_instead_of_resetting_the_current_session() -> None:
+    payload = asyncio.run(_list_for_surface("web_chat"))
+    command = next(cmd for cmd in payload["commands"] if cmd["name"] == "/new")
+    assert command["execution"] == {"kind": "local", "action": "new_chat"}
+    reset = next(cmd for cmd in payload["commands"] if cmd["name"] == "/reset")
+    assert reset["execution"]["action"] == "sessions.reset"
 
 
 def test_cli_gateway_catalog_serializes_argument_choices() -> None:
@@ -143,6 +187,10 @@ def test_cli_gateway_catalog_exposes_strategy_and_hides_compatibility_entries() 
         "kind": "local",
         "action": "model.routing.strategy",
     }
+    assert by_name["/routing"]["execution"] == {
+        "kind": "local",
+        "action": "session.routing",
+    }
     assert [choice["value"] for choice in by_name["/strategy"]["argument_choices"]] == [
         "direct",
         "router",
@@ -169,6 +217,11 @@ def test_cli_gateway_catalog_exposes_strategy_and_hides_compatibility_entries() 
 
     standalone = asyncio.run(_list_for_surface("cli_standalone"))
     assert "/strategy" not in {cmd["name"] for cmd in standalone["commands"]}
+    standalone_by_name = {cmd["name"]: cmd for cmd in standalone["commands"]}
+    assert standalone_by_name["/routing"]["execution"] == {
+        "kind": "local",
+        "action": "session.routing",
+    }
 
 
 def test_dynamic_meta_choices_refresh_once_then_use_one_snapshot() -> None:
